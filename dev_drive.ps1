@@ -67,6 +67,15 @@ function Read-StrongPassword {
     }
 }
 
+$windows_build = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -Name CurrentBuild).CurrentBuild -as [int]
+
+if ($windows_build -ge 26100) {
+    Write-Host "Windows Build $windows_build detected" -ForegroundColor Green
+} else {
+    Write-Error "Your Windows build $windows_build is lower than 26100. Please update before using the script."
+    Show-Usage
+}
+
 # Validate DriveLetter
 if (-not $DriveLetter -or $DriveLetter.Length -ne 1 -or $DriveLetter -notmatch '^[A-Z]$') {
     Write-Error "Invalid or missing -DriveLetter parameter."
