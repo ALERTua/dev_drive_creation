@@ -21,6 +21,9 @@
 
 .PARAMETER RunInitialJob
  Boolean: run initial optimization/dedup job immediately (defaults to True).
+
+.PARAMETER SkipVersionCheck
+ Skip Windows version check (use at your own risk).
 #>
 param(
     [string] $DriveLetter,
@@ -31,7 +34,8 @@ param(
     $CompressionFormat = 'LZ4',
     [ValidateRange(1,9)][int] $CompressionLevel = 5,
     [bool]   $RunInitialJob = $true,
-    [switch]$Debug
+    [switch]$Debug,
+    [switch]$SkipWindowsVersionCheck
 )
 
 function Show-Usage {
@@ -67,13 +71,17 @@ function Read-StrongPassword {
     }
 }
 
-$windows_build = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -Name CurrentBuild).CurrentBuild -as [int]
+if (-not $SkipWindowsVersionCheck) {
+    $windows_build = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -Name CurrentBuild).CurrentBuild -as [int]
 
-if ($windows_build -ge 26100) {
-    Write-Host "Windows Build $windows_build detected" -ForegroundColor Green
+    if ($windows_build -ge 26100) {
+        Write-Host "Windows Build $windows_build detected" -ForegroundColor Green
+    } else {
+        Write-Error "Your Windows build $windows_build is lower than 26100. Please update before using the script."
+        Show-Usage
+    }
 } else {
-    Write-Error "Your Windows build $windows_build is lower than 26100. Please update before using the script."
-    Show-Usage
+    Write-Host "Skipping Windows version check" -ForegroundColor Yellow
 }
 
 # Validate DriveLetter
