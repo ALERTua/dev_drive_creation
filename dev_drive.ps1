@@ -29,7 +29,7 @@ param(
     [string] $DriveLetter,
     [int]    $ShrinkGB,
     [ValidateSet('Dedup','Compress','DedupAndCompress')]
-    $DedupMode = 'DedupAndCompress',
+    $DedupMode = 'Dedup',
     [ValidateSet('LZ4','ZSTD')]
     $CompressionFormat = 'LZ4',
     [ValidateRange(1,9)][int] $CompressionLevel = 5,
@@ -180,11 +180,15 @@ try {
         Volume            = "$devLetterColon"
         Days              = "Monday,Tuesday,Wednesday,Thursday,Friday"
         Duration          = New-TimeSpan -Hours 2
-        CompressionFormat = $CompressionFormat
         CpuPercentage = 60
     }
-    if ($CompressionFormat -eq 'ZSTD') {
-        $baseScheduleParams.CompressionLevel = [uint16]$CompressionLevel
+
+    # Add compression parameters only if not Dedup-only mode
+    if ($DedupMode -ne 'Dedup') {
+        $baseScheduleParams.CompressionFormat = $CompressionFormat
+        if ($CompressionFormat -eq 'ZSTD') {
+            $baseScheduleParams.CompressionLevel = [uint16]$CompressionLevel
+        }
     }
 
     # Define start times
@@ -211,17 +215,27 @@ try {
     if ($RunInitialJob) {
         $jobParams = @{
             Volume            = "$devLetterColon"
-            CompressionFormat = $CompressionFormat
             Duration          = (New-TimeSpan -Hours 5)
             CpuPercentage     = 60
         }
-        if ($CompressionFormat -eq 'ZSTD') {
-            $jobParams.CompressionLevel = $CompressionLevel
+
+        # Add compression parameters only if not Dedup-only mode
+        if ($DedupMode -ne 'Dedup') {
+            $jobParams.CompressionFormat = $CompressionFormat
+            if ($CompressionFormat -eq 'ZSTD') {
+                $jobParams.CompressionLevel = $CompressionLevel
+            }
         }
+
         Write-Host "Running initial Deduplication Job for $devLetterColon" -ForegroundColor Green
         if ($Debug) {Write-Host "Start-ReFSDedupJob";pause}
         Start-ReFSDedupJob @jobParams -FullRun -ErrorAction Stop
-        Write-Host "Triggered initial dedup job: Format=$CompressionFormat, Level=$CompressionLevel" -ForegroundColor Green
+
+        if ($DedupMode -eq 'Dedup') {
+            Write-Host "Triggered initial dedup job (deduplication only)" -ForegroundColor Green
+        } else {
+            Write-Host "Triggered initial dedup job: Format=$CompressionFormat, Level=$CompressionLevel" -ForegroundColor Green
+        }
     }
 
     Write-Host "All done. Dev Drive $devLetterColon ready." -ForegroundColor Green
