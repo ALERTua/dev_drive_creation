@@ -213,7 +213,7 @@ try {
     Write-Host "Scheduled daily dedup jobs" -ForegroundColor Green
 
     Write-Host "Scheduling deduplication scrub jobs" -ForegroundColor Green
-    Set-ReFSDedupScrubSchedule -Volume "$devLetterColon" -Days "Monday" -Start "12:00" -Duration (New-TimeSpan -Hours 4) -CpuPercentage 30 -ErrorAction Stop
+    Set-ReFSDedupScrubSchedule -Volume "$devLetterColon" -Days "Monday" -Start "17:30" -WeeksInterval 1 -ErrorAction Stop
     Write-Host "Scheduled weekly scrub job on Monday at 12:00 (4h)" -ForegroundColor Green
 
     if ($RunInitialJob) {
