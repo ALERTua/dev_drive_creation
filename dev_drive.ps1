@@ -22,7 +22,7 @@
 .PARAMETER RunInitialJob
  Boolean: run initial optimization/dedup job immediately (defaults to True).
 
-.PARAMETER SkipVersionCheck
+.PARAMETER SkipWindowsVersionCheck
  Skip Windows version check (use at your own risk).
 #>
 param(
