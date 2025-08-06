@@ -233,11 +233,12 @@ try {
 
         Write-Host "Running initial Deduplication Job for $devLetterColon" -ForegroundColor Green
         if ($Debug) {Write-Host "Start-ReFSDedupJob";pause}
-        Start-ReFSDedupJob @jobParams -FullRun -ErrorAction Stop
 
         if ($DedupMode -eq 'Dedup') {
+            Start-ReFSDedupJob @jobParams -FullRun -ErrorAction Stop
             Write-Host "Triggered initial dedup job (deduplication only)" -ForegroundColor Green
         } else {
+            Start-ReFSDedupJob @jobParams -ErrorAction Stop
             Write-Host "Triggered initial dedup job: Format=$CompressionFormat, Level=$CompressionLevel" -ForegroundColor Green
         }
     }
