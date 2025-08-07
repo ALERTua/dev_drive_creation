@@ -81,7 +81,7 @@ if (-not $SkipWindowsVersionCheck) {
         Show-Usage
     }
 } else {
-    Write-Host "Skipping Windows version check" -ForegroundColor Yellow
+    Write-Host "Skipping Windows version check. Note that ealier builds might not support ReFS Deduplication" -ForegroundColor Yellow
 }
 
 # Validate DriveLetter
