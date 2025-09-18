@@ -519,7 +519,7 @@ try {
             Volume            = "$devLetterColon"
             Days              = "Monday,Tuesday,Wednesday,Thursday,Friday"
             Duration          = New-TimeSpan -Hours 2
-            CpuPercentage = 60
+            CpuPercentage     = 60
         }
 
         # Add compression parameters only if not Dedup-only mode
@@ -543,6 +543,39 @@ try {
 
         Write-Host "Scheduled daily dedup jobs" -ForegroundColor Green
 
+        # Configure deduplication tasks to run only on AC power
+        Write-Host "Configuring deduplication tasks to run only on AC power..." -ForegroundColor Green
+        try {
+            # Find all ReFS deduplication tasks
+            $dedupTasks = Get-ScheduledTask | Where-Object {$_.TaskPath -Like "\Microsoft\Windows\ReFsDedupSvc\" -And $_.TaskName -ne "Initialization" -And $_.State -ne "Disabled"}
+
+            $configuredTasks = 0
+            foreach ($task in $dedupTasks) {
+                try {
+                    $task.Settings.DisallowStartIfOnBatteries = $true
+                    $task.Settings.StopIfGoingOnBatteries = $true
+                    $task | Set-ScheduledTask | Out-Null
+                    $lec = $LASTEXITCODE
+                    # Write-Host "$task.TaskName change result: $lec"
+                    if ($lec -eq 0) {
+                        $configuredTasks++
+                    }
+                }
+                catch {
+                    # Continue with other tasks if one fails
+                }
+            }
+
+            if ($configuredTasks -gt 0) {
+                Write-Host "Successfully configured $configuredTasks deduplication task(s) to run only on AC power" -ForegroundColor Green
+            } else {
+                Write-Host "No deduplication tasks were found to configure. Tasks will run on any power source." -ForegroundColor Yellow
+            }
+        }
+        catch {
+            Write-Host "Could not configure AC power condition for deduplication tasks. Tasks will run on any power source." -ForegroundColor Yellow
+        }
+
         Write-Host "Scheduling deduplication scrub jobs" -ForegroundColor Green
         Set-ReFSDedupScrubSchedule -Volume "$devLetterColon" -Days "Monday" -Start "17:30" -WeeksInterval 1 -ErrorAction Stop
         Write-Host "Scheduled weekly scrub job on Monday at 12:00 (4h)" -ForegroundColor Green
@@ -565,10 +598,10 @@ try {
             Write-Host "Running initial Deduplication Job for $devLetterColon" -ForegroundColor Green
 
             if ($DedupMode -eq 'Dedup') {
-                Start-ReFSDedupJob @jobParams -FullRun -ErrorAction Stop
+                Start-ReFSDedupJob @jobParams -FullRun -ErrorAction Stop | Out-Null
                 Write-Host "Triggered initial dedup job (deduplication only)" -ForegroundColor Green
             } else {
-                Start-ReFSDedupJob @jobParams -ErrorAction Stop
+                Start-ReFSDedupJob @jobParams -ErrorAction Stop | Out-Null
                 Write-Host "Triggered initial dedup job: Format=$CompressionFormat, Level=$CompressionLevel" -ForegroundColor Green
             }
         }
