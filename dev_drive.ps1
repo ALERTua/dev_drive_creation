@@ -25,6 +25,63 @@ function Prompt-BitLockerChoice {
     }
 }
 
+function Prompt-DeduplicationChoice {
+    Write-Host "`nDo you want to enable ReFS deduplication for the Dev Drive?" -ForegroundColor Cyan
+    Write-Host "Deduplication saves disk space by eliminating duplicate data." -ForegroundColor White
+    Write-Host "1. Yes, enable deduplication only (recommended for most users)" -ForegroundColor White
+    Write-Host "2. Yes, enable deduplication + compression (configure compression settings)" -ForegroundColor White
+    Write-Host "3. No, skip deduplication (maximum performance, less space savings)" -ForegroundColor White
+    Write-Host ""
+
+    while ($true) {
+        $choice = Read-Host "Enter your choice (1, 2 or 3)"
+        if ($choice -eq "1") {
+            return "Dedup"
+        } elseif ($choice -eq "2") {
+            return "DedupAndCompress"
+        } elseif ($choice -eq "3") {
+            return "None"
+        } else {
+            Write-Host "Invalid choice. Please enter 1, 2 or 3." -ForegroundColor Red
+        }
+    }
+}
+
+function Prompt-CompressionFormat {
+    Write-Host "`nChoose compression format:" -ForegroundColor Cyan
+    Write-Host "1. LZ4: Fast compression with good balance of speed and compression ratio" -ForegroundColor White
+    Write-Host "2. ZSTD: Better compression ratio but uses more CPU (allows custom compression level)" -ForegroundColor White
+    Write-Host ""
+
+    while ($true) {
+        $choice = Read-Host "Enter your choice (1 or 2)"
+        if ($choice -eq "1") {
+            return "LZ4"
+        } elseif ($choice -eq "2") {
+            return "ZSTD"
+        } else {
+            Write-Host "Invalid choice. Please enter 1 or 2." -ForegroundColor Red
+        }
+    }
+}
+
+function Prompt-CompressionLevel {
+    Write-Host "`nChoose ZSTD compression level (1-9):" -ForegroundColor Cyan
+    Write-Host "Lower levels (1-3): Faster compression, less CPU usage" -ForegroundColor White
+    Write-Host "Medium levels (4-6): Balanced speed and compression" -ForegroundColor White
+    Write-Host "Higher levels (7-9): Better compression, more CPU usage" -ForegroundColor White
+    Write-Host ""
+
+    while ($true) {
+        $level = Read-Host "Enter compression level (1-9)"
+        if ($level -match '^[1-9]$') {
+            return [int]$level
+        } else {
+            Write-Host "Invalid level. Please enter a number between 1 and 9." -ForegroundColor Red
+        }
+    }
+}
+
 function Read-StrongPassword {
     while ($true) {
         $secure = Read-Host "Enter password (min 8 chars, incl. upper, lower, digit, special)" -AsSecureString
@@ -107,15 +164,16 @@ function Select-DriveMode {
     }
 }
 
-Write-Host "Dev Drive creation script that guides users through creating a Dev Drive with BitLocker encryption and ReFS deduplication." -ForegroundColor Green
+Write-Host "Dev Drive creation script with BitLocker encryption and ReFS deduplication." -ForegroundColor Green
 
 # Check Windows version
 $windows_build = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -Name CurrentBuild).CurrentBuild -as [int]
+$windows_build_min = 26100
 
-if ($windows_build -ge 26100) {
-    Write-Host "Windows Build $windows_build detected" -ForegroundColor Green
+if ($windows_build -ge $windows_build_min) {
+    Write-Host "Windows Build $windows_build is OK" -ForegroundColor Gray
 } else {
-    Write-Error "Your Windows build $windows_build is lower than 26100. Please update before using the script."
+    Write-Error "Your Windows build $windows_build is lower than $windows_build_min. Please update before using the script."
     exit 0
 }
 
@@ -273,6 +331,28 @@ if (-not $enableBitLocker) {
     $SkipBitLocker = $true
 }
 
+# Ask about deduplication
+$dedupChoice = Prompt-DeduplicationChoice
+if ($dedupChoice -eq "None") {
+    $SkipDeduplication = $true
+} elseif ($dedupChoice -eq "DedupAndCompress") {
+    $DedupMode = $dedupChoice
+
+    # Ask for compression format
+    $CompressionFormat = Prompt-CompressionFormat
+
+    # Ask for compression level if ZSTD is selected
+    if ($CompressionFormat -eq "ZSTD") {
+        $CompressionLevel = Prompt-CompressionLevel
+        Write-Host "Selected ZSTD compression with level $CompressionLevel" -ForegroundColor Green
+    } else {
+        Write-Host "Selected LZ4 compression" -ForegroundColor Green
+    }
+} else {
+    $DedupMode = $dedupChoice
+    Write-Host "Selected deduplication only (no compression)" -ForegroundColor Green
+}
+
 try {
     if ($mode -eq "FreeSpace") {
         # Check disk and free space
@@ -428,68 +508,72 @@ try {
     }
 
 
-    # Enable Deduplication + Compression
-    Write-Host "Enabling Deduplication mode $DedupMode for $devLetterColon" -ForegroundColor Green
-    Enable-ReFSDedup -Volume "$devLetterColon" -Type $DedupMode -ErrorAction Stop
-    Write-Host "Enabled ReFS Dedup mode: $DedupMode" -ForegroundColor Green
+    # Enable Deduplication + Compression (conditional)
+    if (-not $SkipDeduplication) {
+        Write-Host "Enabling Deduplication mode $DedupMode for $devLetterColon" -ForegroundColor Green
+        Enable-ReFSDedup -Volume "$devLetterColon" -Type $DedupMode -ErrorAction Stop
+        Write-Host "Enabled ReFS Dedup mode: $DedupMode" -ForegroundColor Green
 
-    # Define common schedule parameters
-    $baseScheduleParams = @{
-        Volume            = "$devLetterColon"
-        Days              = "Monday,Tuesday,Wednesday,Thursday,Friday"
-        Duration          = New-TimeSpan -Hours 2
-        CpuPercentage = 60
-    }
-
-    # Add compression parameters only if not Dedup-only mode
-    if ($DedupMode -ne 'Dedup') {
-        $baseScheduleParams.CompressionFormat = $CompressionFormat
-        if ($CompressionFormat -eq 'ZSTD') {
-            $baseScheduleParams.CompressionLevel = [uint16]$CompressionLevel
-        }
-    }
-
-    # Define start times
-    $startTimes = @("11:00", "17:00")
-
-    foreach ($time in $startTimes) {
-        $scheduleParams = $baseScheduleParams.Clone()
-        $scheduleParams.Start = $time
-
-        Write-Host "Scheduling deduplication job at $time (2h)" -ForegroundColor Green
-        Set-ReFSDedupSchedule @scheduleParams -ErrorAction Stop
-    }
-
-    Write-Host "Scheduled daily dedup jobs" -ForegroundColor Green
-
-    Write-Host "Scheduling deduplication scrub jobs" -ForegroundColor Green
-    Set-ReFSDedupScrubSchedule -Volume "$devLetterColon" -Days "Monday" -Start "17:30" -WeeksInterval 1 -ErrorAction Stop
-    Write-Host "Scheduled weekly scrub job on Monday at 12:00 (4h)" -ForegroundColor Green
-
-    if ($RunInitialJob) {
-        $jobParams = @{
+        # Define common schedule parameters
+        $baseScheduleParams = @{
             Volume            = "$devLetterColon"
-            Duration          = (New-TimeSpan -Hours 5)
-            CpuPercentage     = 60
+            Days              = "Monday,Tuesday,Wednesday,Thursday,Friday"
+            Duration          = New-TimeSpan -Hours 2
+            CpuPercentage = 60
         }
 
         # Add compression parameters only if not Dedup-only mode
         if ($DedupMode -ne 'Dedup') {
-            $jobParams.CompressionFormat = $CompressionFormat
+            $baseScheduleParams.CompressionFormat = $CompressionFormat
             if ($CompressionFormat -eq 'ZSTD') {
-                $jobParams.CompressionLevel = $CompressionLevel
+                $baseScheduleParams.CompressionLevel = [uint16]$CompressionLevel
             }
         }
 
-        Write-Host "Running initial Deduplication Job for $devLetterColon" -ForegroundColor Green
+        # Define start times
+        $startTimes = @("11:00", "17:00")
 
-        if ($DedupMode -eq 'Dedup') {
-            Start-ReFSDedupJob @jobParams -FullRun -ErrorAction Stop
-            Write-Host "Triggered initial dedup job (deduplication only)" -ForegroundColor Green
-        } else {
-            Start-ReFSDedupJob @jobParams -ErrorAction Stop
-            Write-Host "Triggered initial dedup job: Format=$CompressionFormat, Level=$CompressionLevel" -ForegroundColor Green
+        foreach ($time in $startTimes) {
+            $scheduleParams = $baseScheduleParams.Clone()
+            $scheduleParams.Start = $time
+
+            Write-Host "Scheduling deduplication job at $time (2h)" -ForegroundColor Green
+            Set-ReFSDedupSchedule @scheduleParams -ErrorAction Stop
         }
+
+        Write-Host "Scheduled daily dedup jobs" -ForegroundColor Green
+
+        Write-Host "Scheduling deduplication scrub jobs" -ForegroundColor Green
+        Set-ReFSDedupScrubSchedule -Volume "$devLetterColon" -Days "Monday" -Start "17:30" -WeeksInterval 1 -ErrorAction Stop
+        Write-Host "Scheduled weekly scrub job on Monday at 12:00 (4h)" -ForegroundColor Green
+
+        if ($RunInitialJob) {
+            $jobParams = @{
+                Volume            = "$devLetterColon"
+                Duration          = (New-TimeSpan -Hours 5)
+                CpuPercentage     = 60
+            }
+
+            # Add compression parameters only if not Dedup-only mode
+            if ($DedupMode -ne 'Dedup') {
+                $jobParams.CompressionFormat = $CompressionFormat
+                if ($CompressionFormat -eq 'ZSTD') {
+                    $jobParams.CompressionLevel = $CompressionLevel
+                }
+            }
+
+            Write-Host "Running initial Deduplication Job for $devLetterColon" -ForegroundColor Green
+
+            if ($DedupMode -eq 'Dedup') {
+                Start-ReFSDedupJob @jobParams -FullRun -ErrorAction Stop
+                Write-Host "Triggered initial dedup job (deduplication only)" -ForegroundColor Green
+            } else {
+                Start-ReFSDedupJob @jobParams -ErrorAction Stop
+                Write-Host "Triggered initial dedup job: Format=$CompressionFormat, Level=$CompressionLevel" -ForegroundColor Green
+            }
+        }
+    } else {
+        Write-Host "Skipping deduplication as requested." -ForegroundColor Yellow
     }
 
     Write-Host "All done. Dev Drive $devLetterColon ready." -ForegroundColor Green
