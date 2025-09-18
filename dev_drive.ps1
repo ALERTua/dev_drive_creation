@@ -2,72 +2,15 @@
 
 <#
 .SYNOPSIS
- Creates a Dev Drive from existing free space on a physical drive or by shrinking a logical drive, and enables ReFS deduplication + compression.
-
-.PARAMETER DiskNumber
- Physical disk number to use for creating the Dev Drive from free space.
-
-.PARAMETER DriveLetter
- Drive letter to shrink (A-Z) for creating the Dev Drive.
-
-.PARAMETER SizeGB
- Size in GB for the new Dev Drive.
-
-.PARAMETER ShrinkGB
- Amount in GB to shrink from the selected drive (alternative to SizeGB).
-
-.PARAMETER Interactive
- Show interactive drive selection menu.
-
-.PARAMETER DedupMode
- 'Dedup', 'Compress', or 'DedupAndCompress'.
-
-.PARAMETER CompressionFormat
- 'LZ4' (default) or 'ZSTD'.
-
-.PARAMETER CompressionLevel
- Integer 1–9 (for ZSTD), ignored for LZ4.
-
-.PARAMETER RunInitialJob
- Boolean: run initial optimization/dedup job immediately (defaults to True).
-
-.PARAMETER SkipWindowsVersionCheck
- Skip Windows version check (use at your own risk).
-
-.PARAMETER SkipBitLocker
- Skip BitLocker encryption setup.
+ Dev Drive creation script that guides users through creating a Dev Drive with BitLocker encryption and ReFS deduplication.
 #>
-param(
-    [int]    $DiskNumber,
-    [string] $DriveLetter,
-    [int]    $SizeGB,
-    [int]    $ShrinkGB,
-    [switch] $Interactive,
-    [ValidateSet('Dedup','Compress','DedupAndCompress')]
-    $DedupMode = 'Dedup',
-    [ValidateSet('LZ4','ZSTD')]
-    $CompressionFormat = 'LZ4',
-    [ValidateRange(1,9)][int] $CompressionLevel = 5,
-    [bool]   $RunInitialJob = $true,
-    [switch]$Debug,
-    [switch]$SkipWindowsVersionCheck,
-    [switch]$SkipBitLocker
-)
-
-function Show-Usage {
-    Write-Host "Usage:"
-    Write-Host "  Interactive mode: .\dev_drive.ps1 -Interactive"
-    Write-Host "  Free space mode: .\dev_drive.ps1 -DiskNumber <0-9> -SizeGB <GB> [-DedupMode <...>]"
-    Write-Host "  Shrink mode: .\dev_drive.ps1 -DriveLetter <A-Z> -ShrinkGB <GB> [-DedupMode <...>]"
-    Write-Host "  [-CompressionFormat <LZ4|ZSTD>] [-CompressionLevel <1-9>] [-RunInitialJob <$true|$false>] [-SkipBitLocker]"
-    exit 1
-}
+param()
 
 function Prompt-BitLockerChoice {
     Write-Host "`nDo you want to enable BitLocker encryption for the Dev Drive?" -ForegroundColor Cyan
     Write-Host "BitLocker provides security but may impact performance." -ForegroundColor White
-    Write-Host "1. Yes, enable BitLocker encryption (recommended for security)" -ForegroundColor White
-    Write-Host "2. No, skip BitLocker encryption (better performance)" -ForegroundColor White
+    Write-Host "1. Yes, enable BitLocker encryption" -ForegroundColor White
+    Write-Host "2. No, skip BitLocker encryption" -ForegroundColor White
     Write-Host ""
 
     while ($true) {
@@ -110,8 +53,7 @@ function Read-StrongPassword {
 }
 
 function Show-DriveSelection {
-    Write-Host "`n=== MODE 1: USING UNALLOCATED PHYSICAL DRIVE SPACE ===" -ForegroundColor Cyan
-    Write-Host "Select a drive for Dev Drive creation:`n" -ForegroundColor White
+    Write-Host "`nSelect the physical drive where you want to create your Dev Drive:`n" -ForegroundColor Cyan
 
     $disks = Get-Disk | Where-Object { $_.BusType -ne 'Unknown' } | Sort-Object Number
 
@@ -122,73 +64,26 @@ function Show-DriveSelection {
         # Calculate allocated space more accurately
         $partitions = Get-Partition -DiskNumber $diskNumber
         $allocatedSize = 0
-        $hiddenPartitions = @()
-
-        Write-Host "  Detailed partition analysis:" -ForegroundColor Gray
         foreach ($partition in $partitions) {
-            $partitionInfo = "    $($partition.PartitionNumber): $($partition.Type) - $([math]::Round($partition.Size / 1GB, 2)) GB"
-            if ($partition.DriveLetter) {
-                $partitionInfo += " (Drive $($partition.DriveLetter):)"
+            # Only count actual data partitions, not system/reserved
+            if ($partition.Type -eq 'Basic' -or $partition.Type -eq 'Dynamic' -or $partition.DriveLetter) {
                 $allocatedSize += $partition.Size
-            } elseif ($partition.Type -eq 'Basic' -or $partition.Type -eq 'Dynamic') {
-                $partitionInfo += " (No drive letter)"
-                $allocatedSize += $partition.Size
-            } else {
-                $partitionInfo += " (System/Reserved - excluded from free space calc)"
-                $hiddenPartitions += $partition
             }
-            Write-Host $partitionInfo -ForegroundColor Gray
-        }
-
-        if ($hiddenPartitions.Count -gt 0) {
-            Write-Host "  System/Reserved partitions: $($hiddenPartitions.Count) found" -ForegroundColor Gray
         }
 
         $freeSpaceGB = [math]::Round(($disk.Size - $allocatedSize) / 1GB, 2)
 
         Write-Host "Disk $diskNumber`: $($disk.FriendlyName)" -ForegroundColor Yellow
-        Write-Host "  Total Size: $diskSizeGB GB" -ForegroundColor White
+        Write-Host "  Size: $diskSizeGB GB" -ForegroundColor White
         Write-Host "  Free Space: $freeSpaceGB GB" -ForegroundColor Green
-        Write-Host "  Bus Type: $($disk.BusType)" -ForegroundColor White
 
-        # Show partitions
-        $partitions = $disk | Get-Partition | Where-Object { $_.DriveLetter }
-        if ($partitions) {
-            Write-Host "  Partitions:" -ForegroundColor White
-            foreach ($part in $partitions) {
-                $partSizeGB = [math]::Round($part.Size / 1GB, 2)
-                $partLetter = $part.DriveLetter
-                $partType = if ($part.Type -eq 'Basic') { 'Basic' } else { $part.Type }
-                Write-Host "    $partLetter`: $partSizeGB GB ($partType)" -ForegroundColor Gray
-            }
+        # Show drive letters on this disk
+        $driveLetters = ($disk | Get-Partition | Where-Object { $_.DriveLetter } | Select-Object -ExpandProperty DriveLetter) -join ", "
+        if ($driveLetters) {
+            Write-Host "  Drives: $driveLetters" -ForegroundColor Gray
         }
         Write-Host ""
     }
-
-    Write-Host "=== MODE 2: SHRINKING EXISTING LOGICAL DRIVES ===" -ForegroundColor Cyan
-    Write-Host "Available drives for shrinking (shows free space INSIDE each drive):`n" -ForegroundColor White
-
-    $volumes = Get-Volume | Where-Object { $_.DriveLetter -and $_.DriveType -eq 'Fixed' } | Sort-Object DriveLetter
-    foreach ($vol in $volumes) {
-        $letter = $vol.DriveLetter
-        $sizeGB = [math]::Round($vol.Size / 1GB, 2)
-        $freeGB = [math]::Round($vol.SizeRemaining / 1GB, 2)
-        $usedPercent = [math]::Round((($vol.Size - $vol.SizeRemaining) / $vol.Size) * 100, 1)
-
-        # Calculate estimated shrinkable space (accounting for system overhead and fragmentation)
-        $shrinkableGB = [math]::Max(0, $freeGB - 5)  # Conservative 5GB buffer for system stability
-
-        Write-Host "Drive $letter`: $($vol.FileSystemLabel)" -ForegroundColor Yellow
-        Write-Host "  Total: $sizeGB GB | Free: $freeGB GB | Used: $usedPercent%" -ForegroundColor White
-        Write-Host "  Estimated Shrinkable: $shrinkableGB GB" -ForegroundColor Green
-        Write-Host "  File System: $($vol.FileSystem)" -ForegroundColor Gray
-        Write-Host ""
-    }
-    Write-Host "The real shrinkable size may differ!" -ForegroundColor White
-    Write-Host "Windows allows shrinking a logical drive onmy by the size of starting from the end of the logical drive disk space to the nearest written file block." -ForegroundColor White
-    Write-Host "Disk Fragmentation can affect unmovable file parts. Try defragmenting the drive if Windows does not allow it to shrink more." -ForegroundColor White
-    Write-Host "Otherwise, try using third-party tools (e.g. AOMEI)." -ForegroundColor White
-    Write-Host ""
 }
 
 function Select-DriveMode {
@@ -212,109 +107,171 @@ function Select-DriveMode {
     }
 }
 
-if (-not $SkipWindowsVersionCheck) {
-    $windows_build = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -Name CurrentBuild).CurrentBuild -as [int]
+Write-Host "Dev Drive creation script that guides users through creating a Dev Drive with BitLocker encryption and ReFS deduplication." -ForegroundColor Green
 
-    if ($windows_build -ge 26100) {
-        Write-Host "Windows Build $windows_build detected" -ForegroundColor Green
-    } else {
-        Write-Error "Your Windows build $windows_build is lower than 26100. Please update before using the script."
-        Show-Usage
-    }
+# Check Windows version
+$windows_build = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -Name CurrentBuild).CurrentBuild -as [int]
+
+if ($windows_build -ge 26100) {
+    Write-Host "Windows Build $windows_build detected" -ForegroundColor Green
 } else {
-    Write-Host "Skipping Windows version check. Note that ealier builds might not support ReFS Deduplication" -ForegroundColor Yellow
+    Write-Error "Your Windows build $windows_build is lower than 26100. Please update before using the script."
+    exit 0
 }
 
-# Interactive mode or parameter validation
-if ($Interactive) {
-    Show-DriveSelection
-    $mode = Select-DriveMode
+# Set default values for deduplication and compression settings
+$DedupMode = 'Dedup'
+$CompressionFormat = 'LZ4'
+$CompressionLevel = 5
+$RunInitialJob = $true
+$SkipBitLocker = $false
 
-    if ($mode -eq "FreeSpace") {
-        while ($true) {
-            $selectedDisk = Read-Host "Enter disk number for free space creation"
-            if ($selectedDisk -match '^\d+$' -and [int]$selectedDisk -ge 0) {
-                $DiskNumber = [int]$selectedDisk
-                break
-            } else {
-                Write-Host "Invalid disk number. Please enter a non-negative integer." -ForegroundColor Red
-            }
-        }
+# Interactive mode only
+# Step 1: Show drive information and let user select a drive
+Show-DriveSelection
 
-        while ($true) {
-            $selectedSize = Read-Host "Enter Dev Drive size in GB"
-            if ($selectedSize -match '^\d+$' -and [int]$selectedSize -ge 1) {
-                $SizeGB = [int]$selectedSize
-                break
-            } else {
-                Write-Host "Invalid size. Please enter a positive integer." -ForegroundColor Red
-            }
+# Step 2: Ask user to select a physical drive
+Write-Host "`n=== SELECT PHYSICAL DRIVE ===" -ForegroundColor Cyan
+Write-Host "Enter the disk number you want to use for Dev Drive creation:" -ForegroundColor White
+
+while ($true) {
+    $selectedDiskInput = Read-Host "Disk number"
+    if ($selectedDiskInput -match '^\d+$') {
+        $selectedDiskNumber = [int]$selectedDiskInput
+        # Validate that the disk exists
+        $diskExists = Get-Disk -Number $selectedDiskNumber -ErrorAction SilentlyContinue
+        if ($diskExists) {
+            $DiskNumber = $selectedDiskNumber
+            Write-Host "Selected Disk $DiskNumber`: $($diskExists.FriendlyName)" -ForegroundColor Green
+            break
+        } else {
+            Write-Host "Disk $selectedDiskNumber does not exist. Please select a valid disk number." -ForegroundColor Red
         }
-    } else { # ShrinkDrive
-        while ($true) {
-            $selectedDrive = Read-Host "Enter drive letter to shrink (A-Z)"
-            if ($selectedDrive -match '^[A-Z]$') {
+    } else {
+        Write-Host "Invalid input. Please enter a number (0, 1, 2, etc.)." -ForegroundColor Red
+    }
+}
+
+# Step 3: Ask user to select the creation mode
+$mode = Select-DriveMode
+
+# Step 4: Get mode-specific parameters
+if ($mode -eq "FreeSpace") {
+    # Get disk info for free space calculation
+    $selectedDisk = Get-Disk -Number $DiskNumber
+    $partitions = Get-Partition -DiskNumber $DiskNumber
+    $allocatedSize = 0
+    foreach ($partition in $partitions) {
+        if ($partition.Type -eq 'Basic' -or $partition.Type -eq 'Dynamic' -or $partition.DriveLetter) {
+            $allocatedSize += $partition.Size
+        }
+    }
+    $freeSpaceGB = [math]::Round(($selectedDisk.Size - $allocatedSize) / 1GB, 2)
+
+    Write-Host "`nDisk $DiskNumber has $freeSpaceGB GB of free space available." -ForegroundColor Cyan
+
+    while ($true) {
+        $selectedSize = Read-Host "Enter Dev Drive size in GB (max: $freeSpaceGB, press Enter for max)"
+        if ([string]::IsNullOrWhiteSpace($selectedSize)) {
+            # User pressed Enter, use maximum available space
+            $SizeGB = [int]$freeSpaceGB
+            Write-Host "Using maximum available space: $SizeGB GB" -ForegroundColor Green
+            break
+        } elseif ($selectedSize -match '^\d+$' -and [int]$selectedSize -ge 1 -and [int]$selectedSize -le $freeSpaceGB) {
+            $SizeGB = [int]$selectedSize
+            break
+        } elseif ([int]$selectedSize -gt $freeSpaceGB) {
+            Write-Host "Size cannot exceed available free space ($freeSpaceGB GB). Please enter a smaller size." -ForegroundColor Red
+        } else {
+            Write-Host "Invalid size. Please enter a positive integer." -ForegroundColor Red
+        }
+    }
+} else { # ShrinkDrive
+    Write-Host "`n=== SELECT DRIVE TO SHRINK ===" -ForegroundColor Cyan
+    Write-Host "Available drives on Disk $DiskNumber for shrinking:" -ForegroundColor White
+
+    # Show only drives on the selected disk
+    $volumesOnDisk = Get-Volume | Where-Object {
+        $_.DriveLetter -and $_.DriveType -eq 'Fixed' -and
+        (Get-Partition -DriveLetter $_.DriveLetter).DiskNumber -eq $DiskNumber
+    } | Sort-Object DriveLetter
+
+    if ($volumesOnDisk.Count -eq 0) {
+        Write-Host "No shrinkable drives found on Disk $DiskNumber." -ForegroundColor Red
+        Write-Host "Please select a different disk or use free space mode." -ForegroundColor Yellow
+        exit 1
+    }
+
+    foreach ($vol in $volumesOnDisk) {
+        $letter = $vol.DriveLetter
+        $sizeGB = [math]::Round($vol.Size / 1GB, 2)
+        $freeGB = [math]::Round($vol.SizeRemaining / 1GB, 2)
+        $shrinkableGB = [math]::Max(0, $freeGB - 5)
+
+        Write-Host "  Drive $letter`: $($vol.FileSystemLabel)" -ForegroundColor Yellow
+        Write-Host "    Total: $sizeGB GB | Free: $freeGB GB | Shrinkable: ~$shrinkableGB GB" -ForegroundColor White
+    }
+
+    while ($true) {
+        $selectedDrive = Read-Host "Enter drive letter to shrink"
+        if ($selectedDrive -match '^[A-Z]$') {
+            # Validate that the drive exists on the selected disk
+            $driveOnDisk = $volumesOnDisk | Where-Object { $_.DriveLetter -eq $selectedDrive }
+            if ($driveOnDisk) {
                 $DriveLetter = $selectedDrive
+                $driveFreeGB = [math]::Round($driveOnDisk.SizeRemaining / 1GB, 2)
+                Write-Host "Selected Drive $DriveLetter`: $($driveOnDisk.FileSystemLabel) ($driveFreeGB GB free)" -ForegroundColor Green
+
+                # Get the real shrinkable size from Windows
+                Write-Host "Getting Partition information..." -ForegroundColor Cyan
+                try {
+                    $partitionInfo = Get-Partition -DriveLetter $DriveLetter -ErrorAction Stop
+                    $supportedSizes = $partitionInfo | Get-PartitionSupportedSize -ErrorAction Stop
+                    $minSizeGB = [math]::Round($supportedSizes.SizeMin / 1GB, 2)
+                    $realMaxShrinkableGB = [math]::Round(($partitionInfo.Size - $supportedSizes.SizeMin) / 1GB, 2)
+
+                    Write-Host "Shrinkable size information:" -ForegroundColor Yellow
+                    Write-Host "  Current partition size: $([math]::Round($partitionInfo.Size / 1GB, 2)) GB" -ForegroundColor White
+                    Write-Host "  Minimum partition size: $minSizeGB GB" -ForegroundColor White
+                    Write-Host "  Maximum shrinkable: $realMaxShrinkableGB GB" -ForegroundColor Green
+                    Write-Host "Note: Windows allows shrinking by the size of starting from the end of the drive disk space to the nearest written file block. Disk Fragmentation can affect this. If Windows does not allow for a drive to be shrunk, please use third-party tools (e.g. AOMEI)." -ForegroundColor Gray
+                    Write-Host ""
+                }
+                catch {
+                    Write-Host "Could not determine real shrinkable size. Using estimated values." -ForegroundColor Yellow
+                    $realMaxShrinkableGB = [math]::Round(($driveOnDisk.SizeRemaining / 1GB), 2) - 5
+                    Write-Host "Estimated maximum shrinkable: $realMaxShrinkableGB GB" -ForegroundColor Green
+                    # Set partitionInfo to null so we know to get it again later
+                    $partitionInfo = $null
+                }
+
                 break
             } else {
-                Write-Host "Invalid drive letter. Please enter a single letter A-Z." -ForegroundColor Red
+                Write-Host "Drive $selectedDrive is not on Disk $DiskNumber. Please select a drive from the list above." -ForegroundColor Red
             }
-        }
-
-        while ($true) {
-            $selectedShrink = Read-Host "Enter amount to shrink in GB"
-            if ($selectedShrink -match '^\d+$' -and [int]$selectedShrink -ge 1) {
-                $ShrinkGB = [int]$selectedShrink
-                break
-            } else {
-                Write-Host "Invalid shrink amount. Please enter a positive integer." -ForegroundColor Red
-            }
+        } else {
+            Write-Host "Invalid drive letter. Please enter a single letter A-Z." -ForegroundColor Red
         }
     }
 
-    # Ask about BitLocker encryption
-    $enableBitLocker = Prompt-BitLockerChoice
-    if (-not $enableBitLocker) {
-        $SkipBitLocker = $true
-    }
-} else {
-    # Parameter validation for non-interactive mode
-    $hasFreeSpaceParams = ($PSBoundParameters.ContainsKey('DiskNumber') -and $PSBoundParameters.ContainsKey('SizeGB'))
-    $hasShrinkParams = ($PSBoundParameters.ContainsKey('DriveLetter') -and $PSBoundParameters.ContainsKey('ShrinkGB'))
-
-    if (-not $hasFreeSpaceParams -and -not $hasShrinkParams) {
-        Write-Error "Either specify -DiskNumber and -SizeGB for free space creation, or -DriveLetter and -ShrinkGB for shrinking, or use -Interactive for guided setup."
-        Show-Usage
-    }
-
-    if ($hasFreeSpaceParams -and $hasShrinkParams) {
-        Write-Error "Cannot specify both free space and shrink parameters. Choose one method."
-        Show-Usage
-    }
-
-    if ($hasFreeSpaceParams) {
-        if ($DiskNumber -lt 0) {
-            Write-Error "Invalid DiskNumber. Must be a non-negative integer."
-            Show-Usage
+    while ($true) {
+        $selectedShrink = Read-Host "Enter amount to shrink in GB (max: $realMaxShrinkableGB GB)"
+        if ($selectedShrink -match '^\d+$' -and [int]$selectedShrink -ge 1 -and [int]$selectedShrink -le $realMaxShrinkableGB) {
+            $ShrinkGB = [int]$selectedShrink
+            break
+        } elseif ([int]$selectedShrink -gt $realMaxShrinkableGB) {
+            Write-Host "Shrink amount cannot exceed the maximum shrinkable size ($realMaxShrinkableGB GB). Please enter a smaller amount." -ForegroundColor Red
+        } else {
+            Write-Host "Invalid shrink amount. Please enter a positive integer." -ForegroundColor Red
         }
-        if (-not $SizeGB -or $SizeGB -lt 1) {
-            Write-Error "Invalid SizeGB. Must be at least 1 GB."
-            Show-Usage
-        }
-        $mode = "FreeSpace"
-    } else {
-        if (-not $DriveLetter -or $DriveLetter.Length -ne 1 -or $DriveLetter -notmatch '^[A-Z]$') {
-            Write-Error "Invalid DriveLetter. Must be a single letter A-Z."
-            Show-Usage
-        }
-        if (-not $ShrinkGB -or $ShrinkGB -lt 1) {
-            Write-Error "Invalid ShrinkGB. Must be at least 1 GB."
-            Show-Usage
-        }
-        $mode = "ShrinkDrive"
     }
 }
 
+# Ask about BitLocker encryption
+$enableBitLocker = Prompt-BitLockerChoice
+if (-not $enableBitLocker) {
+    $SkipBitLocker = $true
+}
 
 try {
     if ($mode -eq "FreeSpace") {
@@ -352,28 +309,36 @@ try {
         Write-Host "Creating Dev Drive with $SizeGB GB from free space on disk $DiskNumber" -ForegroundColor Green
 
         # Create Dev Drive
-        if ($Debug) {Write-Host "Create Dev Drive";pause}
         Write-Host "Creating a new partition with $SizeGB GB on disk $DiskNumber" -ForegroundColor Green
         $newPart = New-Partition -DiskNumber $DiskNumber -Size $requestedSizeBytes -AssignDriveLetter -ErrorAction Stop
     } else { # ShrinkDrive
-        # Shrink Partition
-        Write-Host "Getting partition details for drive $DriveLetter. This may take a minute." -ForegroundColor Green
-        $part = Get-Partition -DriveLetter $DriveLetter -ErrorAction Stop
-        $diskNum = $part.DiskNumber
-        $maxSize = ($part | Get-PartitionSupportedSize).SizeMax
-        Write-Host "Maximum size for $DriveLetter`: $([math]::Round($maxSize / 1GB, 2)) GB"
+        # Use stored partition information to avoid redundant API calls
+        if ($partitionInfo) {
+            # We already have the partition info from the shrinkable size check
+            $diskNum = $partitionInfo.DiskNumber
+            $maxSize = $supportedSizes.SizeMax
+            Write-Host "Using previously retrieved partition information for drive $DriveLetter" -ForegroundColor Green
+        } else {
+            # Fallback: get partition info if we couldn't get it earlier
+            Write-Host "Getting partition details for drive $DriveLetter. This may take a minute." -ForegroundColor Green
+            $partitionInfo = Get-Partition -DriveLetter $DriveLetter -ErrorAction Stop
+            $diskNum = $partitionInfo.DiskNumber
+            $supportedSizes = $partitionInfo | Get-PartitionSupportedSize -ErrorAction Stop
+            $maxSize = $supportedSizes.SizeMax
+        }
+
+        Write-Host "Maximum size for $DriveLetter`: $([math]::Round($maxSize / 1GB, 2)) GB" -ForegroundColor Green
         $targetSize = $maxSize - ($ShrinkGB * 1GB)
-        Write-Host "Target size after shrinking: $([math]::Round($targetSize / 1GB, 2)) GB"
+        Write-Host "Target size after shrinking: $([math]::Round($targetSize / 1GB, 2)) GB" -ForegroundColor Green
         if ($targetSize -lt 0) {
             throw "Cannot shrink drive $DriveLetter by $ShrinkGB GB; insufficient space."
         }
 
-        Write-Host "Resizing Partition $($part.PartitionNumber) of disk $diskNum to $([math]::Round($targetSize / 1GB, 2)) GB" -ForegroundColor Green
-        Resize-Partition -DiskNumber $diskNum -PartitionNumber $part.PartitionNumber -Size $targetSize -ErrorAction Stop
+        Write-Host "Resizing Partition $($partitionInfo.PartitionNumber) of disk $diskNum to $([math]::Round($targetSize / 1GB, 2)) GB ..." -ForegroundColor Green
+        Resize-Partition -DiskNumber $diskNum -PartitionNumber $partitionInfo.PartitionNumber -Size $targetSize -ErrorAction Stop
         Write-Host "Shrunk drive $DriveLetter by $ShrinkGB GB" -ForegroundColor Green
 
         # Create Dev Drive from the freed space
-        if ($Debug) {Write-Host "Create Dev Drive";pause}
         Write-Host "Creating a new partition from the freed space on disk $diskNum" -ForegroundColor Green
         $newPart = New-Partition -DiskNumber $diskNum -UseMaximumSize -AssignDriveLetter -ErrorAction Stop
     }
@@ -399,8 +364,6 @@ try {
 
     # BitLocker (conditional)
     if (-not $SkipBitLocker) {
-        if ($Debug) {Write-Host "Bitlocker";pause}
-
         # Loop for BitLocker password entry and setup
         $bitLockerSuccess = $false
         $retryCount = 0
@@ -416,13 +379,11 @@ try {
                 Add-BitLockerKeyProtector -MountPoint $devLetterColon -PasswordProtector -Password $SecurePassword -ErrorAction Stop
                 Write-Host "Adding BitLockerKeyProtector RecoveryPasswordProtector"
                 Add-BitLockerKeyProtector -MountPoint $devLetterColon -RecoveryPasswordProtector -ErrorAction Stop
-                pause
 
                 Write-Host "Enabling Bitlocker"
                 Enable-BitLocker -MountPoint $devLetterColon -AdAccountOrGroup $domain_user -AdAccountOrGroupProtector -SkipHardwareTest -UsedSpaceOnly -ErrorAction Stop
 
                 # Backup recovery key to Azure AD (works for AAD-joined devices only)
-                if ($Debug) {Write-Host "Bitlocker Azure AD";pause}
                 Write-Host "Getting Bitlocker Volume Data"
                 $bitlocker_volume = Get-BitLockerVolume -MountPoint $devLetterColon
                 Write-Host "Getting Bitlocker Protector ID"
@@ -469,7 +430,6 @@ try {
 
     # Enable Deduplication + Compression
     Write-Host "Enabling Deduplication mode $DedupMode for $devLetterColon" -ForegroundColor Green
-    if ($Debug) {Write-Host "Deduplication";pause}
     Enable-ReFSDedup -Volume "$devLetterColon" -Type $DedupMode -ErrorAction Stop
     Write-Host "Enabled ReFS Dedup mode: $DedupMode" -ForegroundColor Green
 
@@ -497,14 +457,6 @@ try {
         $scheduleParams.Start = $time
 
         Write-Host "Scheduling deduplication job at $time (2h)" -ForegroundColor Green
-        if ($Debug) {
-            Write-Host "Deduplication Schedule:"
-            $scheduleParams.GetEnumerator() | ForEach-Object {
-               Write-Host ("  {0,-20} : {1}" -f $_.Key, $_.Value)
-            }
-            pause
-        }
-
         Set-ReFSDedupSchedule @scheduleParams -ErrorAction Stop
     }
 
@@ -530,7 +482,6 @@ try {
         }
 
         Write-Host "Running initial Deduplication Job for $devLetterColon" -ForegroundColor Green
-        if ($Debug) {Write-Host "Start-ReFSDedupJob";pause}
 
         if ($DedupMode -eq 'Dedup') {
             Start-ReFSDedupJob @jobParams -FullRun -ErrorAction Stop
@@ -542,9 +493,7 @@ try {
     }
 
     Write-Host "All done. Dev Drive $devLetterColon ready." -ForegroundColor Green
-    if ($Debug) {Write-Host "Done";pause}
 }
 catch {
     Write-Error "Error: $_"
-    Show-Usage
 }
