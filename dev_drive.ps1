@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 #Requires -RunAsAdministrator
 
 <#
@@ -184,7 +185,11 @@ $CompressionLevel = 5
 $RunInitialJob = $true
 $SkipBitLocker = $false
 
-# Interactive mode only
+# Interactive mode only - Gather all information first
+Write-Host "`n=== GATHERING CONFIGURATION ===" -ForegroundColor Cyan
+Write-Host "Let's collect all the information needed to create your Dev Drive." -ForegroundColor White
+Write-Host "No changes will be made until you confirm the plan.`n" -ForegroundColor White
+
 # Step 1: Show drive information and let user select a drive
 Show-DriveSelection
 
@@ -200,7 +205,8 @@ while ($true) {
         $diskExists = Get-Disk -Number $selectedDiskNumber -ErrorAction SilentlyContinue
         if ($diskExists) {
             $DiskNumber = $selectedDiskNumber
-            Write-Host "Selected Disk $DiskNumber`: $($diskExists.FriendlyName)" -ForegroundColor Green
+            $selectedDiskName = $diskExists.FriendlyName
+            Write-Host "Selected Disk $DiskNumber`: $selectedDiskName" -ForegroundColor Green
             break
         } else {
             Write-Host "Disk $selectedDiskNumber does not exist. Please select a valid disk number." -ForegroundColor Red
@@ -244,6 +250,8 @@ if ($mode -eq "FreeSpace") {
             Write-Host "Invalid size. Please enter a positive integer." -ForegroundColor Red
         }
     }
+
+    $creationMethod = "Use $SizeGB GB of free space from Disk $DiskNumber ($selectedDiskName)"
 } else { # ShrinkDrive
     Write-Host "`n=== SELECT DRIVE TO SHRINK ===" -ForegroundColor Cyan
     Write-Host "Available drives on Disk $DiskNumber for shrinking:" -ForegroundColor White
@@ -278,10 +286,11 @@ if ($mode -eq "FreeSpace") {
             if ($driveOnDisk) {
                 $DriveLetter = $selectedDrive
                 $driveFreeGB = [math]::Round($driveOnDisk.SizeRemaining / 1GB, 2)
-                Write-Host "Selected Drive $DriveLetter`: $($driveOnDisk.FileSystemLabel) ($driveFreeGB GB free)" -ForegroundColor Green
+                $driveLabel = $driveOnDisk.FileSystemLabel
+                Write-Host "Selected Drive $DriveLetter`: $driveLabel ($driveFreeGB GB free)" -ForegroundColor Green
 
                 # Get the real shrinkable size from Windows
-                Write-Host "Getting Partition information..." -ForegroundColor Cyan
+                Write-Host "Getting Partition shrinkable size information..." -ForegroundColor Cyan
                 try {
                     $partitionInfo = Get-Partition -DriveLetter $DriveLetter -ErrorAction Stop
                     $supportedSizes = $partitionInfo | Get-PartitionSupportedSize -ErrorAction Stop
@@ -292,6 +301,7 @@ if ($mode -eq "FreeSpace") {
                     Write-Host "  Current partition size: $([math]::Round($partitionInfo.Size / 1GB, 2)) GB" -ForegroundColor White
                     Write-Host "  Minimum partition size: $minSizeGB GB" -ForegroundColor White
                     Write-Host "  Maximum shrinkable: $realMaxShrinkableGB GB" -ForegroundColor Green
+                    Write-Host ""
                     Write-Host "Note: Windows allows shrinking by the size of starting from the end of the drive disk space to the nearest written file block. Disk Fragmentation can affect this. If Windows does not allow for a drive to be shrunk, please use third-party tools (e.g. AOMEI)." -ForegroundColor Gray
                     Write-Host ""
                 }
@@ -316,6 +326,7 @@ if ($mode -eq "FreeSpace") {
         $selectedShrink = Read-Host "Enter amount to shrink in GB (max: $realMaxShrinkableGB GB)"
         if ($selectedShrink -match '^\d+$' -and [int]$selectedShrink -ge 1 -and [int]$selectedShrink -le $realMaxShrinkableGB) {
             $ShrinkGB = [int]$selectedShrink
+            $SizeGB = $ShrinkGB  # Set the Dev Drive size to match the shrink amount
             break
         } elseif ([int]$selectedShrink -gt $realMaxShrinkableGB) {
             Write-Host "Shrink amount cannot exceed the maximum shrinkable size ($realMaxShrinkableGB GB). Please enter a smaller amount." -ForegroundColor Red
@@ -323,18 +334,20 @@ if ($mode -eq "FreeSpace") {
             Write-Host "Invalid shrink amount. Please enter a positive integer." -ForegroundColor Red
         }
     }
+
+    $creationMethod = "Shrink Drive $DriveLetter ($driveLabel) by $ShrinkGB GB to create $ShrinkGB GB Dev Drive"
 }
 
 # Ask about BitLocker encryption
 $enableBitLocker = Prompt-BitLockerChoice
-if (-not $enableBitLocker) {
-    $SkipBitLocker = $true
-}
+$SkipBitLocker = -not $enableBitLocker
+$bitLockerChoice = if ($enableBitLocker) { "Enable BitLocker encryption" } else { "Skip BitLocker encryption" }
 
 # Ask about deduplication
 $dedupChoice = Prompt-DeduplicationChoice
 if ($dedupChoice -eq "None") {
     $SkipDeduplication = $true
+    $deduplicationChoice = "Skip deduplication"
 } elseif ($dedupChoice -eq "DedupAndCompress") {
     $DedupMode = $dedupChoice
 
@@ -344,14 +357,60 @@ if ($dedupChoice -eq "None") {
     # Ask for compression level if ZSTD is selected
     if ($CompressionFormat -eq "ZSTD") {
         $CompressionLevel = Prompt-CompressionLevel
+        $deduplicationChoice = "Enable deduplication with ZSTD compression (level $CompressionLevel)"
         Write-Host "Selected ZSTD compression with level $CompressionLevel" -ForegroundColor Green
     } else {
+        $deduplicationChoice = "Enable deduplication with LZ4 compression"
         Write-Host "Selected LZ4 compression" -ForegroundColor Green
     }
 } else {
     $DedupMode = $dedupChoice
+    $deduplicationChoice = "Enable deduplication only (no compression)"
     Write-Host "Selected deduplication only (no compression)" -ForegroundColor Green
 }
+
+# Display summary and ask for confirmation
+Write-Host "`n"
+Write-Host "===============================================================================" -ForegroundColor Cyan
+Write-Host "                        DEV DRIVE CREATION PLAN" -ForegroundColor Cyan
+Write-Host "===============================================================================" -ForegroundColor Cyan
+Write-Host "" -ForegroundColor Cyan
+
+# Unified action list with all details
+if ($mode -eq "ShrinkDrive") {
+    Write-Host "* Shrink Drive $DriveLetter ($driveLabel) by $ShrinkGB GB to free up space" -ForegroundColor White
+}
+Write-Host "* Create $SizeGB GB Dev Drive on Disk $DiskNumber ($selectedDiskName) using ReFS" -ForegroundColor White
+
+if (-not $SkipBitLocker) {
+    Write-Host "* Enable BitLocker encryption with Azure AD recovery key backup" -ForegroundColor White
+}
+
+if (-not $SkipDeduplication) {
+    if ($DedupMode -eq "DedupAndCompress") {
+        Write-Host "* Enable ReFS deduplication with $CompressionFormat compression (level $CompressionLevel)" -ForegroundColor White
+    } else {
+        Write-Host "* Enable ReFS deduplication only (no compression)" -ForegroundColor White
+    }
+    Write-Host "* Schedule daily optimization jobs at 11:00 and 17:00 (AC power only)" -ForegroundColor White
+    Write-Host "* Schedule weekly maintenance job every Monday at 17:30" -ForegroundColor White
+} else {
+    Write-Host "* Skip deduplication and compression setup" -ForegroundColor White
+}
+
+Write-Host "* Mark Dev Drive as trusted for Windows Defender performance" -ForegroundColor White
+Write-Host "* Run initial optimization job to prepare the drive" -ForegroundColor White
+
+Write-Host "" -ForegroundColor Cyan
+Write-Host "===============================================================================" -ForegroundColor Cyan
+
+$confirmation = Read-Host "Are you ready to proceed with Dev Drive creation? (yes/no)"
+if ($confirmation -notmatch "^(yes|y)$") {
+    Write-Host "`nDev Drive creation cancelled. No changes were made." -ForegroundColor Yellow
+    exit 0
+}
+
+Write-Host "`nStarting Dev Drive creation..." -ForegroundColor Green
 
 try {
     if ($mode -eq "FreeSpace") {
@@ -488,7 +547,7 @@ try {
                     Write-Host "BitLocker rejected the password due to complexity requirements." -ForegroundColor Red
                     if ($retryCount -lt $maxRetries) {
                         Write-Host "Please try a different password. Attempt $retryCount of $maxRetries." -ForegroundColor Yellow
-                        Write-Host "" -ForegroundColor Yellow
+                        Write-Host ""
                     } else {
                         Write-Host "Maximum retry attempts reached. BitLocker setup failed." -ForegroundColor Red
                         throw "BitLocker password complexity requirements not met after $maxRetries attempts."
@@ -612,5 +671,8 @@ try {
     Write-Host "All done. Dev Drive $devLetterColon ready." -ForegroundColor Green
 }
 catch {
-    Write-Error "Error: $_"
+    Write-Host "An error occurred during Dev Drive creation:" -ForegroundColor Red
+    Write-Host $_.Exception.Message -ForegroundColor Yellow
+    Write-Host "Please check the error message and try again." -ForegroundColor Yellow
+    exit 1
 }
