@@ -291,7 +291,7 @@ if ($mode -eq "FreeSpace") {
                 Write-Host "Selected Drive $DriveLetter`: $driveLabel ($driveFreeGB GB free)" -ForegroundColor Green
 
                 # Get the real shrinkable size from Windows
-                Write-Host "Getting Partition shrinkable size information..." -ForegroundColor Cyan
+                Write-Host "Getting Partition shrinkable size information (this may take ~30 seconds)..." -ForegroundColor Cyan
                 try {
                     $partitionInfo = Get-Partition -DriveLetter $DriveLetter -ErrorAction Stop
                     $supportedSizes = $partitionInfo | Get-PartitionSupportedSize -ErrorAction Stop
