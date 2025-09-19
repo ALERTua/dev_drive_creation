@@ -277,6 +277,7 @@ if ($mode -eq "FreeSpace") {
         Write-Host "  Drive $letter`: $($vol.FileSystemLabel)" -ForegroundColor Yellow
         Write-Host "    Total: $sizeGB GB | Free: $freeGB GB | Shrinkable: ~$shrinkableGB GB" -ForegroundColor White
     }
+    Write-Host ""
 
     while ($true) {
         $selectedDrive = Read-Host "Enter drive letter to shrink"
