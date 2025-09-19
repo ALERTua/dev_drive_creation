@@ -17,10 +17,8 @@ An interactive PowerShell script that guides users through creating Windows Dev 
 
 ## Requirements
 
-- Windows 11 (Dev Drive support)
-- Administrator privileges
-- Azure AD-joined device (for BitLocker key backup)
-- PowerShell 5.1 or later
+- **Windows 11 26100 or newer**
+- **Administrator privileges** - Script must be run as administrator (elevated)
 
 ## Basic Usage
 
@@ -28,6 +26,8 @@ An interactive PowerShell script that guides users through creating Windows Dev 
 .\dev_drive.ps1
 ```
 This script runs in interactive mode and will guide you through the entire Dev Drive creation process.
+
+**Important**: The script performs disk operations and must be run with administrator privileges. Right-click the script and select "Run as administrator" or use an elevated PowerShell session.
 
 ### What the Interactive Process Includes:
 
