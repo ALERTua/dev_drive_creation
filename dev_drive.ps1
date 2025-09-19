@@ -507,7 +507,7 @@ try {
         # Loop for BitLocker password entry and setup
         $bitLockerSuccess = $false
         $retryCount = 0
-        $maxRetries = 3
+        $maxRetries = 10
 
         while (-not $bitLockerSuccess -and $retryCount -lt $maxRetries) {
             try {
