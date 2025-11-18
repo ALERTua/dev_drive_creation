@@ -15,6 +15,8 @@ An interactive PowerShell script that guides users through creating Windows Dev 
 - **Smart Defaults**: Press Enter for maximum sizes, sensible defaults throughout
 - **Robust Error Handling**: Comprehensive validation and user-friendly error messages
 
+![](/media/devdrive_interactive.mp4)
+
 ## Requirements
 
 - **Windows 11 26100 or newer**
