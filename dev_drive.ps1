@@ -238,7 +238,7 @@ if ($mode -eq "FreeSpace") {
         $selectedSize = Read-Host "Enter Dev Drive size in GB (max: $freeSpaceGB, press Enter for max)"
         if ([string]::IsNullOrWhiteSpace($selectedSize)) {
             # User pressed Enter, use maximum available space
-            $SizeGB = [int]$freeSpaceGB
+            $SizeGB = $freeSpaceGB
             Write-Host "Using maximum available space: $SizeGB GB" -ForegroundColor Green
             break
         } elseif ($selectedSize -match '^\d+$' -and [int]$selectedSize -ge 1 -and [int]$selectedSize -le $freeSpaceGB) {
