@@ -15,7 +15,7 @@ An interactive PowerShell script that guides users through creating Windows Dev 
 - **Smart Defaults**: Press Enter for maximum sizes, sensible defaults throughout
 - **Robust Error Handling**: Comprehensive validation and user-friendly error messages
 
-<iframe width="560" height="315" src="https://www.youtube.com/embed/7WqRmNFrXiE?si=XEJHNscr0wEUzxPj" title="YouTube video player" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" referrerpolicy="strict-origin-when-cross-origin" allowfullscreen></iframe>
+https://github.com/user-attachments/assets/e5e97018-6966-4c64-8aaf-08764670f31f
 
 ## Requirements
 
