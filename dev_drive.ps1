@@ -238,16 +238,16 @@ if ($mode -eq "FreeSpace") {
         $selectedSize = Read-Host "Enter Dev Drive size in GB (max: $freeSpaceGB, press Enter for max)"
         if ([string]::IsNullOrWhiteSpace($selectedSize)) {
             # User pressed Enter, use maximum available space
-            $SizeGB = $freeSpaceGB
+            $SizeGB = [decimal]$freeSpaceGB
             Write-Host "Using maximum available space: $SizeGB GB" -ForegroundColor Green
             break
-        } elseif ($selectedSize -match '^\d+$' -and [int]$selectedSize -ge 1 -and [int]$selectedSize -le $freeSpaceGB) {
-            $SizeGB = [int]$selectedSize
+        } elseif ($selectedSize -match '^\d+\.?\d*$' -and [decimal]$selectedSize -ge 0.1 -and [decimal]$selectedSize -le $freeSpaceGB) {
+            $SizeGB = [decimal]$selectedSize
             break
-        } elseif ([int]$selectedSize -gt $freeSpaceGB) {
+        } elseif ([decimal]$selectedSize -gt $freeSpaceGB) {
             Write-Host "Size cannot exceed available free space ($freeSpaceGB GB). Please enter a smaller size." -ForegroundColor Red
         } else {
-            Write-Host "Invalid size. Please enter a positive integer." -ForegroundColor Red
+            Write-Host "Invalid size. Please enter a positive decimal number (minimum 0.1 GB)." -ForegroundColor Red
         }
     }
 
@@ -325,14 +325,14 @@ if ($mode -eq "FreeSpace") {
 
     while ($true) {
         $selectedShrink = Read-Host "Enter amount to shrink in GB (max: $realMaxShrinkableGB GB)"
-        if ($selectedShrink -match '^\d+$' -and [int]$selectedShrink -ge 1 -and [int]$selectedShrink -le $realMaxShrinkableGB) {
-            $ShrinkGB = [int]$selectedShrink
+        if ($selectedShrink -match '^\d+\.?\d*$' -and [decimal]$selectedShrink -ge 0.1 -and [decimal]$selectedShrink -le $realMaxShrinkableGB) {
+            $ShrinkGB = [decimal]$selectedShrink
             $SizeGB = $ShrinkGB  # Set the Dev Drive size to match the shrink amount
             break
-        } elseif ([int]$selectedShrink -gt $realMaxShrinkableGB) {
+        } elseif ([decimal]$selectedShrink -gt $realMaxShrinkableGB) {
             Write-Host "Shrink amount cannot exceed the maximum shrinkable size ($realMaxShrinkableGB GB). Please enter a smaller amount." -ForegroundColor Red
         } else {
-            Write-Host "Invalid shrink amount. Please enter a positive integer." -ForegroundColor Red
+            Write-Host "Invalid shrink amount. Please enter a positive decimal number (minimum 0.1 GB)." -ForegroundColor Red
         }
     }
 
@@ -441,7 +441,7 @@ try {
         Write-Host "Disk $DiskNumber free space: $freeSpaceGB GB" -ForegroundColor Green
 
         # Check if requested size is available
-        $requestedSizeBytes = $SizeGB * 1GB
+        $requestedSizeBytes = [math]::Round($ShrinkGB * 1GB, 2)
         if ($freeSpace -lt $requestedSizeBytes) {
             throw "Insufficient free space on disk $DiskNumber. Requested: $SizeGB GB, Available: $freeSpaceGB GB"
         }
@@ -468,7 +468,7 @@ try {
         }
 
         Write-Host "Maximum size for $DriveLetter`: $([math]::Round($maxSize / 1GB, 2)) GB" -ForegroundColor Green
-        $targetSize = $maxSize - ($ShrinkGB * 1GB)
+        $targetSize = $maxSize - [math]::Round($ShrinkGB * 1GB, 2)
         Write-Host "Target size after shrinking: $([math]::Round($targetSize / 1GB, 2)) GB" -ForegroundColor Green
         if ($targetSize -lt 0) {
             throw "Cannot shrink drive $DriveLetter by $ShrinkGB GB; insufficient space."
