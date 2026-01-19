@@ -664,6 +664,7 @@ try {
                 Start-ReFSDedupJob @jobParams -ErrorAction Stop | Out-Null
                 Write-Host "Triggered initial dedup job: Format=$CompressionFormat, Level=$CompressionLevel" -ForegroundColor Green
             }
+            Write-Host "You should wait for it to complete for the deduplication to properly work" -ForegroundColor Yellow
         }
     } else {
         Write-Host "Skipping deduplication as requested." -ForegroundColor Yellow
