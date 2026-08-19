@@ -22,7 +22,7 @@ https://github.com/user-attachments/assets/e5e97018-6966-4c64-8aaf-08764670f31f
 
 - **Windows 11 26100 or newer**
 - **Administrator privileges** - Script must be run as administrator (elevated)
-- **50 GB minimum** - The selected disk's free space, the drive's shrinkable space, or the requested `.vhdx` size must be at least 50 GB, the documented Dev Drive minimum; the script exits if it is not
+- **50 GB minimum** - The selected disk's free space, the drive's shrinkable space, or the requested `.vhdx` size must be at least 50 GB, the documented Dev Drive minimum. The script stops when a disk or drive cannot offer that much, and re-asks when a size you type is too small
 
 ## Basic Usage
 
@@ -37,7 +37,7 @@ This script runs in interactive mode and will guide you through the entire Dev D
 
 1. **Creation Method**: Free space on a disk, shrinking an existing drive, or a `.vhdx` file
 2. **Drive Selection**: Shows all physical drives with size and free space information
-3. **Size Configuration**: Enter Dev Drive size (minimum 50 GB, press Enter for maximum available)
+3. **Size Configuration**: Enter Dev Drive size (minimum 50 GB; in free-space mode press Enter for the maximum)
 4. **BitLocker Setup**: Optional encryption with automatic password retry
 5. **Deduplication Options**: Choose deduplication level and compression settings
 6. **Compression Configuration**: Select format (LZ4/ZSTD) and level (1-9 for ZSTD)
@@ -92,7 +92,7 @@ Available drives on Disk 1 for shrinking:
     Total: 112.69 GB | Free: 76.89 GB | Shrinkable: ~72 GB
 Enter drive letter to shrink: D
 Selected Drive D: ALERT (842.78 GB free)
-Getting Partition information...
+Getting Partition shrinkable size information (this may take ~30 seconds)...
 Shrinkable size information:
   Current partition size: 3613.28 GB                                                                         
   Minimum partition size: 2796.92 GB                                                                         
@@ -100,7 +100,7 @@ Shrinkable size information:
                                                                                                              
 Note: Windows allows shrinking by the size of starting from the end of the drive disk space to the nearest written file block. Disk Fragmentation can affect this. If Windows does not allow for a drive to be shrunk, please use third-party tools (e.g. AOMEI).                                                                      
                                                                                                              
-Enter amount to shrink in GB (min: 50 GB, max: 816.36 GB): 199                                                
+Enter Shrink amount in GB (min: 50, max: 816.36): 199                                                
                                                                                                              
 Do you want to enable BitLocker encryption for the Dev Drive?                                                
 BitLocker provides security but may impact performance.
@@ -199,7 +199,7 @@ E           DevDrive     ReFS           Fixed     Healthy      OK               
 
 3. **Size Configuration**
    - Prompts for Dev Drive size with real limits shown
-   - Press Enter to use maximum available space, except in virtual hard disk mode
+   - Press Enter to use the maximum, in free-space mode only
    - Validates input against actual Windows constraints, including the 50 GB Dev Drive minimum
 
 4. **Security Configuration**
@@ -243,7 +243,7 @@ The script asks for four things:
   *Fixed size* claims the whole file up front, which takes minutes rather than seconds and cannot be
   interrupted once started.
 - **Size**, at least 50 GB. That is Microsoft's documented minimum for any Dev Drive. For a fixed
-  size disk the size cannot exceed the free space on the host volume; for a dynamically expanding
+  size disk the size cannot exceed the host volume's free space less 1 GB of head-room; for a dynamically expanding
   one a larger limit is allowed with a warning.
 - **Automatic mounting** on startup.
 

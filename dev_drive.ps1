@@ -9,10 +9,8 @@ param()
 
 function Initialize-VirtDiskInterop {
     <#
-        Declares the virtdisk.dll calls used to create and attach a .vhdx; only these can request
+        virtdisk.dll declarations for creating and attaching a .vhdx; only these can request
         ATTACH_VIRTUAL_DISK_FLAG_AT_BOOT. Layouts and constants come from virtdisk.h.
-        Each parameter struct below inlines only the version arm the script asks for, which is safe
-        because virtdisk reads the struct according to its Version field.
     #>
     if (([System.Management.Automation.PSTypeName]'DevDriveInterop.VirtDisk').Type) {
         return
@@ -51,18 +49,27 @@ namespace DevDriveInterop
         public Guid ResiliencyGuid;
     }
 
+    // Both structs below carry every union arm the header declares, not just the one this script
+    // asks for, so the buffer handed to virtdisk is never shorter than the struct it expects.
     [StructLayout(LayoutKind.Sequential)]
     public struct OPEN_VIRTUAL_DISK_PARAMETERS
     {
         public UInt32 Version;
-        public UInt32 RWDepth;
+        public UInt32 RWDepth;          // Version1 arm
+        public Int32 ReadOnly;          // Version2 and Version3 arms from here on
+        public Guid ResiliencyGuid;
+        public Guid SnapshotId;
     }
 
     [StructLayout(LayoutKind.Sequential)]
     public struct ATTACH_VIRTUAL_DISK_PARAMETERS
     {
         public UInt32 Version;
-        public UInt32 Reserved;
+        // The union is 8-byte aligned because its Version2 arm holds ULONGLONGs.
+        public UInt32 UnionAlignmentPadding;
+        public UInt32 Reserved;         // Version1 arm
+        public UInt32 ReservedTail;
+        public UInt64 RestrictedLength; // Version2 arm reaches this far
     }
 
     public static class VirtDisk
@@ -136,6 +143,12 @@ function Get-Win32ErrorText {
     return "$([System.ComponentModel.Win32Exception]::new($Code).Message) (error $Code)"
 }
 
+function ConvertTo-FlooredGB {
+    # Floor, never round: a displayed maximum must never exceed the real one.
+    param([Parameter(Mandatory)][double]$Bytes)
+    return [math]::Floor($Bytes / 1GB * 100) / 100
+}
+
 function Get-VhdxAlignedSize {
     # A .vhdx virtual size must be a whole number of sectors, so a fractional GB has to be trimmed.
     param([Parameter(Mandatory)][uint64]$SizeBytes)
@@ -152,6 +165,7 @@ function New-VirtualDiskFile {
     Initialize-VirtDiskInterop
     $storageType = Get-VhdxStorageType
     $SizeBytes = Get-VhdxAlignedSize -SizeBytes $SizeBytes
+    $pathExisted = Test-Path -LiteralPath $Path
 
     $createParams = New-Object DevDriveInterop.CREATE_VIRTUAL_DISK_PARAMETERS
     $createParams.Version = [DevDriveInterop.VirtDisk]::CREATE_VIRTUAL_DISK_VERSION_2
@@ -181,8 +195,11 @@ function New-VirtualDiskFile {
     }
 
     if ($result -ne 0) {
-        # A failed allocation can leave a partial file behind, which would block the next run.
-        Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+        # Clean up a partial file so it does not block the next run, but never delete a file that
+        # appeared between the path question and now.
+        if (-not $pathExisted) {
+            Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+        }
         throw "Could not create $Path`: $(Get-Win32ErrorText -Code $result)"
     }
 }
@@ -368,7 +385,8 @@ function Resolve-DevDriveSizeInput {
         return $result
     }
 
-    if ($Answer -notmatch '^\d+\.?\d*$') {
+    # The length cap keeps a very long run of digits from overflowing the cast below.
+    if ($Answer -notmatch '^\d+\.?\d*$' -or $Answer.Length -gt 20) {
         $result.Rejection = 'NotANumber'
         return $result
     }
@@ -398,6 +416,7 @@ function Prompt-DevDriveSizeGB {
     param(
         [Parameter(Mandatory)][decimal]$MaxGB,
         [Parameter(Mandatory)][string]$Subject,
+        [decimal]$MinGB = $script:DevDriveMinSizeGB,
         [switch]$AllowMaxOnEmpty,
         [switch]$MaxIsAdvisory
     )
@@ -405,9 +424,9 @@ function Prompt-DevDriveSizeGB {
     $maxHint = if ($AllowMaxOnEmpty) { "max: $MaxGB, press Enter for max" } else { "max: $MaxGB" }
 
     while ($true) {
-        $answer = Read-Host "Enter $Subject in GB (min: $DevDriveMinSizeGB, $maxHint)"
+        $answer = Read-Host "Enter $Subject in GB (min: $MinGB, $maxHint)"
 
-        $verdict = Resolve-DevDriveSizeInput -Answer $answer -MinGB $DevDriveMinSizeGB -MaxGB $MaxGB `
+        $verdict = Resolve-DevDriveSizeInput -Answer $answer -MinGB $MinGB -MaxGB $MaxGB `
             -AllowEmpty:$AllowMaxOnEmpty -MaxIsAdvisory:$MaxIsAdvisory
 
         if ($verdict.Rejection -eq 'NotANumber') {
@@ -415,7 +434,7 @@ function Prompt-DevDriveSizeGB {
             continue
         }
         if ($verdict.Rejection -eq 'BelowMinimum') {
-            Write-Host "$Subject must be at least $DevDriveMinSizeGB GB. Please enter a larger value." -ForegroundColor Red
+            Write-Host "$Subject must be at least $MinGB GB. Please enter a larger value." -ForegroundColor Red
             continue
         }
         if ($verdict.Rejection -eq 'AboveMaximum') {
@@ -536,12 +555,26 @@ function Resolve-VhdxPathInput {
 
     # A network path or a drive-relative one like D:file.vhdx would pass IsPathRooted and then
     # resolve somewhere the user never named, so require a drive letter and a separator.
-    if ($Answer -notmatch '^[A-Za-z]:\\') {
+    if ($Answer -notmatch '^[A-Za-z]:[\\/]') {
         $result.Rejection = 'NotALocalPath'
         return $result
     }
 
-    $full = [System.IO.Path]::GetFullPath($Answer)
+    # Windows PowerShell throws from GetFullPath on characters Windows forbids while PowerShell 7
+    # passes them through, so they are rejected here explicitly and the call is guarded as well.
+    if ($Answer.Substring(2) -match '[<>":|?*]') {
+        $result.Rejection = 'InvalidPath'
+        return $result
+    }
+
+    try {
+        $full = [System.IO.Path]::GetFullPath($Answer)
+    }
+    catch {
+        $result.Rejection = 'InvalidPath'
+        return $result
+    }
+
     $full = $full.Substring(0, 1).ToUpper() + $full.Substring(1)
 
     if ([System.IO.Path]::GetExtension($full) -ne '.vhdx') {
@@ -572,6 +605,10 @@ function Prompt-VhdxPath {
         }
         if ($verdict.Rejection -eq 'WrongExtension') {
             Write-Host "The file name must end with .vhdx" -ForegroundColor Red
+            continue
+        }
+        if ($verdict.Rejection -eq 'InvalidPath') {
+            Write-Host "Windows does not accept that path. Check for characters like | < > or a very long name." -ForegroundColor Red
             continue
         }
 
@@ -630,12 +667,13 @@ function Prompt-VhdxSize {
     )
 
     $hostLetter = [char]$VhdxPath[0]
-    # Keep a gigabyte spare so a fixed size disk cannot fill the host volume to the last byte.
-    $hostUsableBytes = (Get-Volume -DriveLetter $hostLetter).SizeRemaining - 1GB
-    $hostFreeGB = [math]::Floor($hostUsableBytes / 1GB * 100) / 100
+    $hostUsableBytes = (Get-Volume -DriveLetter $hostLetter).SizeRemaining - $VhdxHostSpareBytes
+    $hostFreeGB = ConvertTo-FlooredGB -Bytes $hostUsableBytes
 
     if ($DiskType -eq 'Fixed' -and $hostUsableBytes -lt ($DevDriveMinSizeGB * 1GB)) {
-        throw "Drive $hostLetter`: has $hostFreeGB GB to spare, less than the $DevDriveMinSizeGB GB a fixed size Dev Drive needs. Choose a dynamically expanding disk or another drive."
+        Write-Host "Drive $hostLetter`: has $hostFreeGB GB to spare, below the $DevDriveMinSizeGB GB minimum required for a Dev Drive." -ForegroundColor Red
+        Write-Host "Exiting. Choose a dynamically expanding disk or another drive, then run the script again." -ForegroundColor Yellow
+        exit 1
     }
 
     Write-Host "`nDrive $hostLetter`: has $hostFreeGB GB to spare." -ForegroundColor Cyan
@@ -684,6 +722,9 @@ if ($windows_build -ge $windows_build_min) {
 
 # Microsoft's documented minimum size for a Dev Drive volume (https://learn.microsoft.com/en-us/windows/dev-drive/)
 $DevDriveMinSizeGB = 50
+
+# Head-room kept on the volume hosting a fixed size .vhdx, so it is never filled to the last byte.
+$VhdxHostSpareBytes = 1GB
 
 # Set default values for deduplication and compression settings
 $DedupMode = 'Dedup'
@@ -740,7 +781,7 @@ if ($mode -eq "FreeSpace") {
     }
     $freeSpace = $selectedDisk.Size - $allocatedSize
     # Floor (not round) so the displayed/accepted maximum is never above the real free space
-    $freeSpaceGB = [math]::Floor($freeSpace / 1GB * 100) / 100
+    $freeSpaceGB = ConvertTo-FlooredGB -Bytes $freeSpace
 
     Write-Host "`nDisk $DiskNumber has $freeSpaceGB GB of free space available." -ForegroundColor Cyan
 
@@ -799,7 +840,7 @@ if ($mode -eq "FreeSpace") {
                     $minSizeGB = [math]::Round($supportedSizes.SizeMin / 1GB, 2)
                     $realMaxShrinkableBytes = $partitionInfo.Size - $supportedSizes.SizeMin
                     # Floor (not round) so the displayed/accepted maximum is never above the real shrinkable size
-                    $realMaxShrinkableGB = [math]::Floor($realMaxShrinkableBytes / 1GB * 100) / 100
+                    $realMaxShrinkableGB = ConvertTo-FlooredGB -Bytes $realMaxShrinkableBytes
 
                     Write-Host "Shrinkable size information:" -ForegroundColor Yellow
                     Write-Host "  Current partition size: $([math]::Round($partitionInfo.Size / 1GB, 2)) GB" -ForegroundColor White
@@ -812,7 +853,7 @@ if ($mode -eq "FreeSpace") {
                 catch {
                     Write-Host "Could not determine real shrinkable size. Using estimated values." -ForegroundColor Yellow
                     $realMaxShrinkableBytes = [math]::Max(0, $driveOnDisk.SizeRemaining - (5 * 1GB))
-                    $realMaxShrinkableGB = [math]::Floor($realMaxShrinkableBytes / 1GB * 100) / 100
+                    $realMaxShrinkableGB = ConvertTo-FlooredGB -Bytes $realMaxShrinkableBytes
                     Write-Host "Estimated maximum shrinkable: $realMaxShrinkableGB GB" -ForegroundColor Green
                     # Set partitionInfo to null so we know to get it again later
                     $partitionInfo = $null
@@ -842,6 +883,10 @@ if ($mode -eq "FreeSpace") {
 
     $creationMethod = "Shrink Drive $DriveLetter ($driveLabel) by $ShrinkGB GB to create $ShrinkGB GB Dev Drive"
 } else { # Vhdx
+    # Compile the interop now rather than after every question, so a machine that forbids Add-Type
+    # fails before the user has answered anything.
+    Initialize-VirtDiskInterop
+
     $VhdxPath = Prompt-VhdxPath
     $VhdxDiskType = Prompt-VhdxDiskType
     $SizeGB = Prompt-VhdxSize -VhdxPath $VhdxPath -DiskType $VhdxDiskType
@@ -1228,10 +1273,12 @@ catch {
     Write-Host "An error occurred during Dev Drive creation:" -ForegroundColor Red
     Write-Host $_.Exception.Message -ForegroundColor Yellow
 
-    # A .vhdx that was created before the failure stays attached, and may already be registered
-    # to attach on every startup, so say what is there and how to undo it.
+    # A .vhdx created before the failure stays attached, and may already be set to attach at startup.
     if ($mode -eq "Vhdx" -and $VhdxPath -and (Test-Path -LiteralPath $VhdxPath)) {
-        Write-Host "Left behind: $VhdxPath" -ForegroundColor Yellow
+        Write-Host "Left behind: $VhdxPath, still attached." -ForegroundColor Yellow
+        if ($VhdxAtBootGranted) {
+            Write-Host "It is also registered to attach on every startup. Dismounting clears that." -ForegroundColor Yellow
+        }
         Write-Host "To remove it: Dismount-DiskImage -ImagePath '$VhdxPath'; Remove-Item -LiteralPath '$VhdxPath'" -ForegroundColor Yellow
     }
 

@@ -24,6 +24,11 @@
         # dev_drive.ps1 assigns $creationMethod / $bitLockerChoice / $deduplicationChoice
         # to build a plan description string that is composed but never printed as a
         # single summary. Tracked in issue #17.
-        'PSUseDeclaredVarsMoreThanAssignments'
+        'PSUseDeclaredVarsMoreThanAssignments',
+
+        # New-VirtualDiskFile creates a .vhdx, which the rule wants guarded by ShouldProcess.
+        # The script asks for confirmation once, before any of its steps run; wiring -WhatIf
+        # and -Confirm through every destructive call is tracked in issue #13.
+        'PSUseShouldProcessForStateChangingFunctions'
     )
 }
