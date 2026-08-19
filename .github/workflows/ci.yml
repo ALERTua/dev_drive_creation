@@ -52,7 +52,18 @@ jobs:
         shell: pwsh
         run: |
           Import-Module PSScriptAnalyzer -RequiredVersion $env:PSSCRIPTANALYZER_VERSION
-          $results = Invoke-ScriptAnalyzer -Path . -Recurse -Settings ./PSScriptAnalyzerSettings.psd1
+
+          # Invoke-ScriptAnalyzer has no -ExcludePath, and -Path takes one string, not
+          # an array - so .claude is pruned by resolving the file list ourselves and
+          # analyzing each file individually. Same worktree trap as the Pester step
+          # below: this repo keeps git worktrees under .claude/worktrees/, and a plain
+          # recursive walk goes into them, so a local run from the repo root would
+          # otherwise also report stale findings from other worktrees' copies of
+          # dev_drive.ps1, each checked out at a possibly different commit.
+          $claudePath = Join-Path (Resolve-Path '.').Path '.claude'
+          $targets = Get-ChildItem -Path . -Recurse -Include '*.ps1', '*.psm1', '*.psd1' -ErrorAction SilentlyContinue |
+              Where-Object { $_.FullName -notlike "$claudePath\*" }
+          $results = $targets | ForEach-Object { Invoke-ScriptAnalyzer -Path $_.FullName -Settings ./PSScriptAnalyzerSettings.psd1 }
           if ($results) {
               $results | Format-Table -AutoSize | Out-String | Write-Host
               foreach ($r in $results) {
