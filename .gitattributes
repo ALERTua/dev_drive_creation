@@ -1,3 +1,23 @@
+# Normalise text files to LF in the repository so a contributor whose editor
+# or tool writes CRLF does not rewrite every line of a file on a small edit.
+# eol=lf (not just text=auto) forces LF on checkout too, independent of each
+# contributor's core.autocrlf setting.
+* text=auto eol=lf
+
+# dev_drive.ps1 is already committed with CRLF and PowerShell scripts are
+# conventionally edited on Windows, so keep it CRLF instead of normalising
+# it to LF: normalising would rewrite the whole file on the very next edit,
+# which is the churn this file exists to prevent.
+*.ps1 text eol=crlf
+
+# Common binary types: never touched by line-ending normalisation, even
+# though none are currently committed in this repository.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.zip binary
 
 # Batch files must keep CRLF: cmd.exe mishandles LF-only files, notably around goto labels.
 *.cmd text eol=crlf
