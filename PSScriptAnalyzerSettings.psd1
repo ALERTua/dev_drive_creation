@@ -4,12 +4,6 @@
     # each comment explains why it is excluded and, where the fix is a code
     # change tracked elsewhere, which issue owns that fix.
     ExcludeRules = @(
-        # Prompt-BitLockerChoice / Prompt-DeduplicationChoice / Prompt-CompressionFormat /
-        # Prompt-CompressionLevel use the unapproved verb "Prompt". Renaming them is
-        # tracked in issue #11; excluded here so CI does not fail on work already scoped
-        # to that issue.
-        'PSUseApprovedVerbs',
-
         # dev_drive.ps1 is an interactive console script the user runs directly at a
         # terminal (#Requires -RunAsAdministrator, Read-Host prompts throughout). Its
         # colored Write-Host output IS the UI, not diagnostic noise competing with a
