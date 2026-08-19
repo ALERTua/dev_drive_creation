@@ -304,6 +304,16 @@ The script creates two daily deduplication jobs that run **only on AC power**:
 
 Jobs run Monday-Friday with 60% CPU limit to preserve battery life on laptops.
 
+## Development
+
+Run `install-hooks.cmd` once to turn on a tracked `git` pre-commit hook (`.githooks/pre-commit`).
+It runs the same three checks as `.github/workflows/ci.yml` against your working tree before each
+commit - parsing `dev_drive.ps1`, PSScriptAnalyzer with `PSScriptAnalyzerSettings.psd1`, and the
+Pester suite - and refuses the commit if any of them fails, saying which one and why. A single
+commit can still skip it with `git commit --no-verify`; to remove the hook entirely, run
+`git config --unset core.hooksPath`. Unlike CI, it uses whichever PSScriptAnalyzer/Pester versions
+are already installed locally rather than CI's pinned ones.
+
 ## Troubleshooting
 
 - Ensure sufficient free space exists on the selected physical disk
