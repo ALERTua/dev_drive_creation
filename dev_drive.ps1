@@ -7,8 +7,7 @@
 #>
 param()
 
-# Reading an unassigned variable or a missing property is a terminating error, not a silent $null:
-# a script that repartitions disks must stop on a typo rather than act on an empty value.
+# Strict mode: a script that repartitions disks must stop on a typo, not act on an empty value.
 Set-StrictMode -Version Latest
 
 function Initialize-VirtDiskInterop {
@@ -714,8 +713,9 @@ function Prompt-AutoAttachChoice {
 
 Write-Host "Dev Drive creation script with BitLocker encryption and ReFS deduplication." -ForegroundColor Green
 
-# Check Windows version
-$windows_build = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -Name CurrentBuild).CurrentBuild -as [int]
+# Check Windows version. Read in two steps: a missing value leaves nothing to take CurrentBuild off.
+$buildKey = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -Name CurrentBuild -ErrorAction SilentlyContinue
+$windows_build = if ($buildKey) { $buildKey.CurrentBuild -as [int] } else { $null }
 $windows_build_min = 26100
 
 if ($windows_build -ge $windows_build_min) {
@@ -802,8 +802,7 @@ if ($mode -eq "FreeSpace") {
     Write-Host "`n=== SELECT DRIVE TO SHRINK ===" -ForegroundColor Cyan
     Write-Host "Available drives on Disk $DiskNumber for shrinking:" -ForegroundColor White
 
-    # Show only drives on the selected disk. @() so a single match still answers .Count, and
-    # a volume Get-Partition cannot map to a partition drops out of the list instead of failing it.
+    # Drives on the selected disk only. @() so one match still answers .Count; an unmappable volume drops out.
     $volumesOnDisk = @(Get-Volume | Where-Object {
         if (-not ($_.DriveLetter -and $_.DriveType -eq 'Fixed')) { return $false }
         $volumePartition = Get-Partition -DriveLetter $_.DriveLetter -ErrorAction SilentlyContinue
@@ -818,12 +817,13 @@ if ($mode -eq "FreeSpace") {
 
     foreach ($vol in $volumesOnDisk) {
         $letter = $vol.DriveLetter
-        $sizeGB = [math]::Round($vol.Size / 1GB, 2)
+        # Not $sizeGB: names are case-insensitive here, and $SizeGB is the Dev Drive size.
+        $volSizeGB = [math]::Round($vol.Size / 1GB, 2)
         $freeGB = [math]::Round($vol.SizeRemaining / 1GB, 2)
         $shrinkableGB = [math]::Max(0, $freeGB - 5)
 
         Write-Host "  Drive $letter`: $($vol.FileSystemLabel)" -ForegroundColor Yellow
-        Write-Host "    Total: $sizeGB GB | Free: $freeGB GB | Shrinkable: ~$shrinkableGB GB" -ForegroundColor White
+        Write-Host "    Total: $volSizeGB GB | Free: $freeGB GB | Shrinkable: ~$shrinkableGB GB" -ForegroundColor White
     }
     Write-Host ""
 
@@ -979,7 +979,7 @@ if ($confirmation -notmatch "^(yes|y)$") {
 
 Write-Host "`nStarting Dev Drive creation..." -ForegroundColor Green
 
-# Set before the try so the error handler below can read it even when the run fails before the attach.
+# The catch below reads this even when the run fails before the attach.
 $VhdxAtBootGranted = $false
 
 try {
@@ -1124,7 +1124,7 @@ try {
 
                 # Backup recovery key to Azure AD (works for AAD-joined devices only)
                 Write-Host "Getting Bitlocker Volume Data"
-                $bitlocker_volume = Get-BitLockerVolume -MountPoint $devLetterColon
+                $bitlocker_volume = Get-BitLockerVolume -MountPoint $devLetterColon -ErrorAction Stop
                 Write-Host "Getting Bitlocker Protector ID"
                 $protectorId = $bitlocker_volume.KeyProtector | Where-Object { $_.KeyProtectorType -eq "RecoveryPassword" } | Select-Object -ExpandProperty KeyProtectorId
                 Write-Host "Backing Up Bitlocker Key Protector to Azure AD"
@@ -1219,7 +1219,7 @@ try {
                 }
                 catch {
                     # One task's failure must not stop the others, but it must not pass unseen either.
-                    $taskFailures += "$($task.TaskName): $($_.Exception.Message)"
+                    $taskFailures += "Could not configure $($task.TaskName) to run only on AC power: $($_.Exception.Message)"
                 }
             }
 
@@ -1227,14 +1227,15 @@ try {
                 Write-Host "Successfully configured $configuredTasks deduplication task(s) to run only on AC power" -ForegroundColor Green
             }
             foreach ($failure in $taskFailures) {
-                Write-Host "Could not set AC power only on task $failure" -ForegroundColor Yellow
+                Write-Host $failure -ForegroundColor Yellow
             }
-            if ($configuredTasks -eq 0 -and $taskFailures.Count -eq 0) {
+            if (-not $dedupTasks) {
                 Write-Host "No deduplication tasks were found to configure. Tasks will run on any power source." -ForegroundColor Yellow
             }
         }
         catch {
-            Write-Host "Could not configure AC power condition for deduplication tasks. Tasks will run on any power source." -ForegroundColor Yellow
+            Write-Host "Could not configure AC power condition for deduplication tasks: $($_.Exception.Message)" -ForegroundColor Yellow
+            Write-Host "Tasks will run on any power source." -ForegroundColor Yellow
         }
 
         Write-Host "Scheduling deduplication scrub jobs" -ForegroundColor Green

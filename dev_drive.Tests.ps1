@@ -34,6 +34,13 @@ Describe 'The script itself' {
         $errors | Should -BeNullOrEmpty
     }
 
+    # The suite lifts functions out of the syntax tree and never runs the linear part, so the only
+    # thing that can guard a top-level statement is its presence in the file.
+    It 'turns on strict mode' {
+        Select-String -Path $script:ScriptPath -Pattern '^Set-StrictMode -Version Latest' |
+            Should -Not -BeNullOrEmpty
+    }
+
     It 'declares the Dev Drive minimum exactly once' {
         (Select-String -Path $script:ScriptPath -Pattern '^\$DevDriveMinSizeGB\s*=' ).Count | Should -Be 1
     }
