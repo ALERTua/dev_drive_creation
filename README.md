@@ -5,14 +5,15 @@ An interactive PowerShell script that guides users through creating Windows Dev 
 ## Features
 
 - **Interactive Setup**: Step-by-step guided creation process
-- **Flexible Creation Methods**: Use free space or shrink existing drives
+- **Flexible Creation Methods**: Use free space, shrink an existing drive, or create a `.vhdx` file
+- **Virtual Hard Disk Mode**: Puts the Dev Drive in a `.vhdx` file that Windows can mount on every startup
 - **Smart Drive Selection**: Shows detailed drive information for informed choices
 - **Optional BitLocker**: Choose encryption with automatic retry on password rejection
 - **Advanced Deduplication**: Configure deduplication with optional compression
 - **Compression Options**: Choose LZ4 or ZSTD with customizable compression levels
 - **Real Size Limits**: Shows actual Windows shrinkable limits, not estimates
 - **Power-Aware Scheduling**: Deduplication jobs run only on AC power to preserve battery
-- **Smart Defaults**: Press Enter for maximum sizes, sensible defaults throughout
+- **Smart Defaults**: Press Enter for maximum partition sizes, sensible defaults throughout
 - **Robust Error Handling**: Comprehensive validation and user-friendly error messages
 
 https://github.com/user-attachments/assets/e5e97018-6966-4c64-8aaf-08764670f31f
@@ -21,7 +22,7 @@ https://github.com/user-attachments/assets/e5e97018-6966-4c64-8aaf-08764670f31f
 
 - **Windows 11 26100 or newer**
 - **Administrator privileges** - Script must be run as administrator (elevated)
-- **50 GB minimum** - The selected disk's free space (or drive's shrinkable space) must be at least 50 GB, the documented Dev Drive minimum; the script exits if it is not
+- **50 GB minimum** - The selected disk's free space, the drive's shrinkable space, or the requested `.vhdx` size must be at least 50 GB, the documented Dev Drive minimum. The script stops when a disk or drive cannot offer that much, and re-asks when a size you type is too small
 
 ## Basic Usage
 
@@ -34,12 +35,17 @@ This script runs in interactive mode and will guide you through the entire Dev D
 
 ### What the Interactive Process Includes:
 
-1. **Drive Selection**: Shows all physical drives with size and free space information
-2. **Creation Method**: Choose between using free space or shrinking an existing drive
-3. **Size Configuration**: Enter Dev Drive size (minimum 50 GB, press Enter for maximum available)
+1. **Creation Method**: Free space on a disk, shrinking an existing drive, or a `.vhdx` file
+2. **Drive Selection**: Shows all physical drives with size and free space information
+3. **Size Configuration**: Enter Dev Drive size (minimum 50 GB; in free-space mode press Enter for the maximum)
 4. **BitLocker Setup**: Optional encryption with automatic password retry
 5. **Deduplication Options**: Choose deduplication level and compression settings
 6. **Compression Configuration**: Select format (LZ4/ZSTD) and level (1-9 for ZSTD)
+
+In virtual hard disk mode, step 2 is skipped; instead you are asked for the file path, the disk
+type, the size and whether to mount the file automatically on startup. There is no press-Enter-for-
+maximum there, and the size has a 50 GB floor.
+See [Virtual hard disk mode](#virtual-hard-disk-mode).
 
 ### Interactive Flow:
 
@@ -51,6 +57,14 @@ Windows Build 26100 is OK
 Let's collect all the information needed to create your Dev Drive.
 No changes will be made until you confirm the plan.
                                                                                                              
+
+Choose Dev Drive creation method:                                                                            
+1. Use UNALLOCATED FREE SPACE on a physical drive
+2. SHRINK an existing logical drive to create space
+3. Create a VIRTUAL HARD DISK (.vhdx file) on an existing drive
+4. Exit
+
+Enter your choice (1, 2, 3 or 4): 2
 
 Select the physical drive where you want to create your Dev Drive:                                           
                                                                                                              
@@ -70,13 +84,6 @@ Enter the disk number you want to use for Dev Drive creation:
 Disk number: 1
 Selected Disk 1: CT4000P3PSSD8
 
-Choose Dev Drive creation method:                                                                            
-1. Use UNALLOCATED FREE SPACE on a physical drive
-2. SHRINK an existing logical drive to create space
-3. Exit
-
-Enter your choice (1 or 2): 2
-
 === SELECT DRIVE TO SHRINK ===                                                                               
 Available drives on Disk 1 for shrinking:
   Drive D: ALERT
@@ -85,7 +92,7 @@ Available drives on Disk 1 for shrinking:
     Total: 112.69 GB | Free: 76.89 GB | Shrinkable: ~72 GB
 Enter drive letter to shrink: D
 Selected Drive D: ALERT (842.78 GB free)
-Getting Partition information...
+Getting Partition shrinkable size information (this may take ~30 seconds)...
 Shrinkable size information:
   Current partition size: 3613.28 GB                                                                         
   Minimum partition size: 2796.92 GB                                                                         
@@ -93,7 +100,7 @@ Shrinkable size information:
                                                                                                              
 Note: Windows allows shrinking by the size of starting from the end of the drive disk space to the nearest written file block. Disk Fragmentation can affect this. If Windows does not allow for a drive to be shrunk, please use third-party tools (e.g. AOMEI).                                                                      
                                                                                                              
-Enter amount to shrink in GB (min: 50 GB, max: 816.36 GB): 199                                                
+Enter Shrink amount in GB (min: 50, max: 816.36): 199                                                
                                                                                                              
 Do you want to enable BitLocker encryption for the Dev Drive?                                                
 BitLocker provides security but may impact performance.
@@ -179,19 +186,20 @@ E           DevDrive     ReFS           Fixed     Healthy      OK               
 
 ### Interactive Dev Drive Creation Process:
 
-1. **Drive Discovery & Selection**
+1. **Creation Method Selection**
+   - **Free Space Mode**: Uses unallocated space on a physical drive
+   - **Shrink Mode**: Shrinks an existing logical drive to create space
+   - **Virtual Hard Disk Mode**: Creates a `.vhdx` file on an existing volume
+
+2. **Drive Discovery & Selection**
    - Scans all physical drives and shows size, free space, and existing partitions
    - User selects target physical drive for Dev Drive creation
    - Displays real Windows partition limits (not estimates)
-
-2. **Creation Method Selection**
-   - **Free Space Mode**: Uses unallocated space on the selected drive
-   - **Shrink Mode**: Shrinks an existing logical drive to create space
-   - Shows available options based on selected drive
+   - Skipped in virtual hard disk mode, which asks for a file path instead
 
 3. **Size Configuration**
    - Prompts for Dev Drive size with real limits shown
-   - Press Enter to use maximum available space
+   - Press Enter to use the maximum, in free-space mode only
    - Validates input against actual Windows constraints, including the 50 GB Dev Drive minimum
 
 4. **Security Configuration**
@@ -218,6 +226,68 @@ E           DevDrive     ReFS           Fixed     Healthy      OK               
 - **Power Management**: Deduplication jobs only run on AC power
 - **Error Recovery**: Handles password rejection and API failures gracefully
 - **User-Friendly**: Clear prompts with helpful explanations throughout
+
+## Virtual hard disk mode
+
+Instead of repartitioning a physical disk, this mode puts the Dev Drive inside a `.vhdx` file on a
+volume you already have. It is the same thing Windows Settings offers as **Create new VHD**, which
+is useful when the Settings app is not an option — for example on machines where elevation comes
+from a tool that cannot launch Settings elevated.
+
+The script asks for four things:
+
+- **Path** of the `.vhdx` file. The folder must already exist, the file must not, and the volume
+  hosting it must be a fixed disk — Windows does not support a Dev Drive inside a `.vhdx` on a
+  removable disk. A per-user directory keeps the Dev Drive from being shared unintentionally.
+- **Disk type**. *Dynamically expanding* grows as data is written and is what Microsoft recommends.
+  *Fixed size* claims the whole file up front, which takes minutes rather than seconds and cannot be
+  interrupted once started.
+- **Size**, at least 50 GB. That is Microsoft's documented minimum for any Dev Drive. For a fixed
+  size disk the size cannot exceed the host volume's free space less 1 GB of head-room; for a dynamically expanding
+  one a larger limit is allowed with a warning.
+- **Automatic mounting** on startup.
+
+The file is created and attached through `virtdisk.dll` directly, not with `diskpart` or
+`Mount-DiskImage`. The reason is automatic mounting, described below. Everything after that — ReFS
+formatting, the trusted flag, BitLocker, deduplication — is identical to the other two modes.
+
+### Automatic mounting
+
+A `.vhdx` attached the ordinary way does not survive a restart, and no PowerShell cmdlet can change
+that. Automatic mounting has to be requested when the disk is attached, by passing
+`ATTACH_VIRTUAL_DISK_FLAG_AT_BOOT` to
+[`AttachVirtualDisk`](https://learn.microsoft.com/en-us/windows/win32/api/virtdisk/nf-virtdisk-attachvirtualdisk).
+Neither `diskpart` nor `Mount-DiskImage` passes it; until now only the Windows Settings **Disks &
+volumes** page did, which is why a Dev Drive created there comes back after a restart and one
+created from a script does not.
+
+The script calls that API itself. Windows then records the file under
+`HKLM\SYSTEM\CurrentControlSet\Control\AutoAttachVirtualDisks` on its own and reattaches it on every
+startup, with the same drive letter and its trusted Dev Drive status intact. That registry entry is
+Windows's own bookkeeping — writing it by hand does not enable anything.
+
+Older Windows builds may reject the flag. If that happens the script says so, attaches the disk
+anyway, and you get a working Dev Drive that needs mounting by hand after each restart:
+
+```powershell
+Mount-DiskImage -ImagePath 'D:\DevDrive.vhdx' -StorageType VHDX -Access ReadWrite
+```
+
+### BitLocker inside a virtual hard disk
+
+Microsoft's documentation states that a `.vhdx` is already covered by BitLocker on the volume that
+hosts it, and that enabling BitLocker on the mounted virtual disk is unnecessary. The script says so
+before asking, but leaves the choice to you.
+
+### Deduplication inside a virtual hard disk
+
+Deduplication works on the ReFS volume inside the file and frees space there as it does on a
+partition. The `.vhdx` file itself does **not** shrink — it keeps the largest size it has ever
+reached, and a deduplication run adds a little to it for its own bookkeeping.
+
+Reclaiming that space on the host means compacting the file, and there are reports of data
+corruption when compacting a `.vhdx` whose contents are deduplicated. Do not run `compact vdisk`
+against a deduplicated Dev Drive without a backup.
 
 ## Security Notes
 
