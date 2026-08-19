@@ -441,7 +441,7 @@ try {
         Write-Host "Disk $DiskNumber free space: $freeSpaceGB GB" -ForegroundColor Green
 
         # Check if requested size is available
-        $requestedSizeBytes = [math]::Round($ShrinkGB * 1GB, 2)
+        $requestedSizeBytes = [math]::Round($SizeGB * 1GB, 2)
         if ($freeSpace -lt $requestedSizeBytes) {
             throw "Insufficient free space on disk $DiskNumber. Requested: $SizeGB GB, Available: $freeSpaceGB GB"
         }
