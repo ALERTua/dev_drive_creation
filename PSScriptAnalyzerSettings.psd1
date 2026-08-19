@@ -1,8 +1,8 @@
 @{
     # Settings for Invoke-ScriptAnalyzer, used by .github/workflows/ci.yml.
     # Every excluded rule below is a real finding against dev_drive.ps1 today;
-    # each comment explains why it is excluded — either as a settled decision,
-    # or naming the issue tracking a fix planned for later.
+    # each comment explains why it is excluded, either as a settled decision
+    # or by naming the issue tracking a fix planned for later.
     ExcludeRules = @(
         # dev_drive.ps1 is an interactive console script the user runs directly at a
         # terminal (#Requires -RunAsAdministrator, Read-Host prompts throughout). Its
