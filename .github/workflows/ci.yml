@@ -1,0 +1,101 @@
+name: CI
+
+# Safety: no step here may execute dev_drive.ps1, diskpart, Format-Volume, New-Partition,
+# or anything else that touches storage. This workflow only parses, lints, and (once test
+# files exist) unit-tests the script from the outside - it never runs it.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+env:
+  # Pinned so a PowerShell Gallery release cannot silently turn this build red.
+  PSSCRIPTANALYZER_VERSION: '1.25.0'
+  # Matches what contributors run locally, so a suite that passes on a dev machine
+  # cannot fail here (or vice versa) purely from a Pester major-version difference.
+  PESTER_VERSION: '6.1.0'
+
+jobs:
+  validate:
+    runs-on: windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Parse dev_drive.ps1 syntax
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $parseErrors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path 'dev_drive.ps1').Path, [ref]$tokens, [ref]$parseErrors) | Out-Null
+          if ($parseErrors.Count -gt 0) {
+              foreach ($e in $parseErrors) {
+                  Write-Host "::error file=dev_drive.ps1,line=$($e.Extent.StartLineNumber)::$($e.Message)"
+              }
+              throw "dev_drive.ps1 has $($parseErrors.Count) parse error(s)."
+          }
+          Write-Host 'dev_drive.ps1 parsed with no syntax errors.'
+
+      - name: Install PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          # No -SkipPublisherCheck here: unlike Pester (see below), Windows carries no
+          # in-box PSScriptAnalyzer module, so there is no publisher mismatch to suppress
+          # and adding the flag would only weaken verification for no reason.
+          Install-Module -Name PSScriptAnalyzer -RequiredVersion $env:PSSCRIPTANALYZER_VERSION `
+              -Repository PSGallery -Scope CurrentUser -Force
+
+      - name: Run PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          Import-Module PSScriptAnalyzer -RequiredVersion $env:PSSCRIPTANALYZER_VERSION
+          $results = Invoke-ScriptAnalyzer -Path . -Recurse -Settings ./PSScriptAnalyzerSettings.psd1
+          if ($results) {
+              $results | Format-Table -AutoSize | Out-String | Write-Host
+              foreach ($r in $results) {
+                  Write-Host "::error file=$($r.ScriptName),line=$($r.Line)::$($r.RuleName): $($r.Message)"
+              }
+              throw "PSScriptAnalyzer reported $($results.Count) finding(s) not excluded by PSScriptAnalyzerSettings.psd1."
+          }
+          Write-Host 'PSScriptAnalyzer: no findings outside PSScriptAnalyzerSettings.psd1 exclusions.'
+
+      - name: Run Pester tests
+        shell: pwsh
+        run: |
+          # Data-driven, not a manual toggle: this step is a no-op only for as long as
+          # no *.Tests.ps1 file exists. The moment one is added it starts running and
+          # enforcing results, with no further workflow change required.
+          #
+          # .claude is pruned explicitly: this repo keeps git worktrees under
+          # .claude/worktrees/, and a plain Get-ChildItem -Recurse already walks into it
+          # (only .git carries the Windows Hidden attribute here, not .claude) - so a local
+          # run from the repo root would otherwise also count other worktrees' copies of
+          # the suite, each checked out at a possibly different commit.
+          $claudePath = Join-Path (Resolve-Path '.').Path '.claude'
+          $testFiles = Get-ChildItem -Path . -Recurse -Filter '*.Tests.ps1' -ErrorAction SilentlyContinue |
+              Where-Object { $_.FullName -notlike "$claudePath\*" }
+          if (-not $testFiles) {
+              Write-Host '::notice::No *.Tests.ps1 files found yet - Pester step is a no-op for this run.'
+              exit 0
+          }
+
+          # -SkipPublisherCheck: Windows ships an in-box Pester module signed by Microsoft,
+          # while the PSGallery build is signed by the Pester team - this flag suppresses
+          # that specific publisher mismatch. PSScriptAnalyzer above has no in-box copy, so
+          # it has no such mismatch and does not need the flag.
+          Install-Module -Name Pester -RequiredVersion $env:PESTER_VERSION `
+              -Repository PSGallery -Scope CurrentUser -Force -SkipPublisherCheck
+          Import-Module Pester -RequiredVersion $env:PESTER_VERSION
+
+          $config = New-PesterConfiguration
+          $config.Run.Path = '.'
+          # Same worktree trap as the detection gate above, for Pester's own discovery:
+          # Pester 6 discovers with Get-ChildItem -Force, which finds files under any
+          # dot-prefixed folder except .git/.svn/.hg - .claude is not one of those.
+          $config.Run.ExcludePath = $claudePath
+          $config.Run.Exit = $true
+          $config.Output.Verbosity = 'Detailed'
+          Invoke-Pester -Configuration $config
