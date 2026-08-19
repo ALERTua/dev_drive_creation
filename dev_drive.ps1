@@ -283,7 +283,7 @@ function Add-VirtualDiskAttachment {
     return $false
 }
 
-function Prompt-BitLockerChoice {
+function Request-BitLockerChoice {
     param([switch]$VhdxMode)
 
     Write-Host "`nDo you want to enable BitLocker encryption for the Dev Drive?" -ForegroundColor Cyan
@@ -308,7 +308,7 @@ function Prompt-BitLockerChoice {
     }
 }
 
-function Prompt-DeduplicationChoice {
+function Request-DeduplicationChoice {
     Write-Host "`nDo you want to enable ReFS deduplication for the Dev Drive?" -ForegroundColor Cyan
     Write-Host "Deduplication saves disk space by eliminating duplicate data." -ForegroundColor White
     Write-Host "1. Yes, enable deduplication only (recommended for most users)" -ForegroundColor White
@@ -330,7 +330,7 @@ function Prompt-DeduplicationChoice {
     }
 }
 
-function Prompt-CompressionFormat {
+function Request-CompressionFormat {
     Write-Host "`nChoose compression format:" -ForegroundColor Cyan
     Write-Host "1. LZ4: Fast compression with good balance of speed and compression ratio" -ForegroundColor White
     Write-Host "2. ZSTD: Better compression ratio but uses more CPU (allows custom compression level)" -ForegroundColor White
@@ -348,7 +348,7 @@ function Prompt-CompressionFormat {
     }
 }
 
-function Prompt-CompressionLevel {
+function Request-CompressionLevel {
     Write-Host "`nChoose ZSTD compression level (1-9):" -ForegroundColor Cyan
     Write-Host "Lower levels (1-3): Faster compression, less CPU usage" -ForegroundColor White
     Write-Host "Medium levels (4-6): Balanced speed and compression" -ForegroundColor White
@@ -412,7 +412,7 @@ function Resolve-DevDriveSizeInput {
     return $result
 }
 
-function Prompt-DevDriveSizeGB {
+function Request-DevDriveSizeGB {
     <#
         The one size question for all three creation modes. -MaxIsAdvisory warns instead of
         rejecting, for a dynamically expanding disk that is allowed to outgrow its host volume.
@@ -590,7 +590,7 @@ function Resolve-VhdxPathInput {
     return $result
 }
 
-function Prompt-VhdxPath {
+function Request-VhdxPath {
     Write-Host "`n=== VIRTUAL HARD DISK LOCATION ===" -ForegroundColor Cyan
     Write-Host "Enter the full path of the .vhdx file to create, for example D:\DevDrive.vhdx" -ForegroundColor White
     Write-Host "A per-user directory is recommended to avoid sharing the Dev Drive unintentionally." -ForegroundColor Gray
@@ -646,7 +646,7 @@ function Prompt-VhdxPath {
     }
 }
 
-function Prompt-VhdxDiskType {
+function Request-VhdxDiskType {
     Write-Host "`nChoose the virtual hard disk type:" -ForegroundColor Cyan
     Write-Host "1. Dynamically expanding: the file grows as data is written (recommended)" -ForegroundColor White
     Write-Host "2. Fixed size: the file claims its full size immediately, which takes a while" -ForegroundColor White
@@ -664,7 +664,7 @@ function Prompt-VhdxDiskType {
     }
 }
 
-function Prompt-VhdxSize {
+function Request-VhdxSize {
     param(
         [Parameter(Mandatory)][string]$VhdxPath,
         [Parameter(Mandatory)][ValidateSet('Dynamic', 'Fixed')][string]$DiskType
@@ -689,10 +689,10 @@ function Prompt-VhdxSize {
     }
     Write-Host ""
 
-    return Prompt-DevDriveSizeGB -MaxGB $hostFreeGB -Subject 'Dev Drive size' -MaxIsAdvisory:($DiskType -eq 'Dynamic')
+    return Request-DevDriveSizeGB -MaxGB $hostFreeGB -Subject 'Dev Drive size' -MaxIsAdvisory:($DiskType -eq 'Dynamic')
 }
 
-function Prompt-AutoAttachChoice {
+function Request-AutoAttachChoice {
     Write-Host "`nMount this virtual hard disk automatically on every Windows startup?" -ForegroundColor Cyan
     Write-Host "Without this, the Dev Drive disappears after each restart until mounted by hand." -ForegroundColor White
     Write-Host "1. Yes, register it for automatic mounting (recommended)" -ForegroundColor White
@@ -803,7 +803,7 @@ if ($mode -eq "FreeSpace") {
         exit 1
     }
 
-    $SizeGB = Prompt-DevDriveSizeGB -MaxGB $freeSpaceGB -Subject 'Dev Drive size' -AllowMaxOnEmpty
+    $SizeGB = Request-DevDriveSizeGB -MaxGB $freeSpaceGB -Subject 'Dev Drive size' -AllowMaxOnEmpty
 } elseif ($mode -eq "ShrinkDrive") {
     Write-Host "`n=== SELECT DRIVE TO SHRINK ===" -ForegroundColor Cyan
     Write-Host "Available drives on Disk $DiskNumber for shrinking:" -ForegroundColor White
@@ -890,36 +890,36 @@ if ($mode -eq "FreeSpace") {
         exit 1
     }
 
-    $ShrinkGB = Prompt-DevDriveSizeGB -MaxGB $realMaxShrinkableGB -Subject 'Shrink amount'
+    $ShrinkGB = Request-DevDriveSizeGB -MaxGB $realMaxShrinkableGB -Subject 'Shrink amount'
     $SizeGB = $ShrinkGB  # The Dev Drive fills exactly the space that was freed
 } else { # Vhdx
     # Compile the interop now rather than after every question, so a machine that forbids Add-Type
     # fails before the user has answered anything.
     Initialize-VirtDiskInterop
 
-    $VhdxPath = Prompt-VhdxPath
-    $VhdxDiskType = Prompt-VhdxDiskType
-    $SizeGB = Prompt-VhdxSize -VhdxPath $VhdxPath -DiskType $VhdxDiskType
-    $VhdxAutoAttach = Prompt-AutoAttachChoice
+    $VhdxPath = Request-VhdxPath
+    $VhdxDiskType = Request-VhdxDiskType
+    $SizeGB = Request-VhdxSize -VhdxPath $VhdxPath -DiskType $VhdxDiskType
+    $VhdxAutoAttach = Request-AutoAttachChoice
 }
 
 # Ask about BitLocker encryption
-$enableBitLocker = Prompt-BitLockerChoice -VhdxMode:($mode -eq "Vhdx")
+$enableBitLocker = Request-BitLockerChoice -VhdxMode:($mode -eq "Vhdx")
 $SkipBitLocker = -not $enableBitLocker
 
 # Ask about deduplication
-$dedupChoice = Prompt-DeduplicationChoice
+$dedupChoice = Request-DeduplicationChoice
 if ($dedupChoice -eq "None") {
     $SkipDeduplication = $true
 } elseif ($dedupChoice -eq "DedupAndCompress") {
     $DedupMode = $dedupChoice
 
     # Ask for compression format
-    $CompressionFormat = Prompt-CompressionFormat
+    $CompressionFormat = Request-CompressionFormat
 
     # Ask for compression level if ZSTD is selected
     if ($CompressionFormat -eq "ZSTD") {
-        $CompressionLevel = Prompt-CompressionLevel
+        $CompressionLevel = Request-CompressionLevel
         Write-Host "Selected ZSTD compression with level $CompressionLevel" -ForegroundColor Green
     } else {
         Write-Host "Selected LZ4 compression" -ForegroundColor Green
