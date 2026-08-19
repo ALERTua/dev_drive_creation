@@ -191,7 +191,7 @@ E           DevDrive     ReFS           Fixed     Healthy      OK               
 3. **Size Configuration**
    - Prompts for Dev Drive size with real limits shown
    - Press Enter to use maximum available space
-   - Validates input against actual Windows constraints
+   - Validates input against actual Windows constraints, including the 50 GB Dev Drive minimum
 
 4. **Security Configuration**
    - Optional BitLocker encryption with strong password requirements

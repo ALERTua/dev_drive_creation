@@ -178,6 +178,9 @@ if ($windows_build -ge $windows_build_min) {
     exit 0
 }
 
+# Microsoft's documented minimum size for a Dev Drive volume (https://learn.microsoft.com/en-us/windows/dev-drive/)
+$DevDriveMinSizeGB = 50
+
 # Set default values for deduplication and compression settings
 $DedupMode = 'Dedup'
 $CompressionFormat = 'LZ4'
@@ -234,6 +237,12 @@ if ($mode -eq "FreeSpace") {
 
     Write-Host "`nDisk $DiskNumber has $freeSpaceGB GB of free space available." -ForegroundColor Cyan
 
+    if ($freeSpaceGB -lt $DevDriveMinSizeGB) {
+        Write-Host "Disk $DiskNumber only has $freeSpaceGB GB of free space, which is below the $DevDriveMinSizeGB GB minimum required for a Dev Drive." -ForegroundColor Red
+        Write-Host "Please select a different disk or free up more space." -ForegroundColor Yellow
+        exit 1
+    }
+
     while ($true) {
         $selectedSize = Read-Host "Enter Dev Drive size in GB (max: $freeSpaceGB, press Enter for max)"
         if ([string]::IsNullOrWhiteSpace($selectedSize)) {
@@ -241,13 +250,15 @@ if ($mode -eq "FreeSpace") {
             $SizeGB = [decimal]$freeSpaceGB
             Write-Host "Using maximum available space: $SizeGB GB" -ForegroundColor Green
             break
-        } elseif ($selectedSize -match '^\d+\.?\d*$' -and [decimal]$selectedSize -ge 0.1 -and [decimal]$selectedSize -le $freeSpaceGB) {
+        } elseif ($selectedSize -match '^\d+\.?\d*$' -and [decimal]$selectedSize -ge $DevDriveMinSizeGB -and [decimal]$selectedSize -le $freeSpaceGB) {
             $SizeGB = [decimal]$selectedSize
             break
         } elseif ([decimal]$selectedSize -gt $freeSpaceGB) {
             Write-Host "Size cannot exceed available free space ($freeSpaceGB GB). Please enter a smaller size." -ForegroundColor Red
+        } elseif ([decimal]$selectedSize -lt $DevDriveMinSizeGB) {
+            Write-Host "Dev Drive size must be at least $DevDriveMinSizeGB GB. Please enter a larger size." -ForegroundColor Red
         } else {
-            Write-Host "Invalid size. Please enter a positive decimal number (minimum 0.1 GB)." -ForegroundColor Red
+            Write-Host "Invalid size. Please enter a positive decimal number (minimum $DevDriveMinSizeGB GB)." -ForegroundColor Red
         }
     }
 
@@ -323,16 +334,24 @@ if ($mode -eq "FreeSpace") {
         }
     }
 
+    if ($realMaxShrinkableGB -lt $DevDriveMinSizeGB) {
+        Write-Host "Drive $DriveLetter can only be shrunk by $realMaxShrinkableGB GB, which is below the $DevDriveMinSizeGB GB minimum required for a Dev Drive." -ForegroundColor Red
+        Write-Host "Please select a different drive or use free space mode." -ForegroundColor Yellow
+        exit 1
+    }
+
     while ($true) {
         $selectedShrink = Read-Host "Enter amount to shrink in GB (max: $realMaxShrinkableGB GB)"
-        if ($selectedShrink -match '^\d+\.?\d*$' -and [decimal]$selectedShrink -ge 0.1 -and [decimal]$selectedShrink -le $realMaxShrinkableGB) {
+        if ($selectedShrink -match '^\d+\.?\d*$' -and [decimal]$selectedShrink -ge $DevDriveMinSizeGB -and [decimal]$selectedShrink -le $realMaxShrinkableGB) {
             $ShrinkGB = [decimal]$selectedShrink
             $SizeGB = $ShrinkGB  # Set the Dev Drive size to match the shrink amount
             break
         } elseif ([decimal]$selectedShrink -gt $realMaxShrinkableGB) {
             Write-Host "Shrink amount cannot exceed the maximum shrinkable size ($realMaxShrinkableGB GB). Please enter a smaller amount." -ForegroundColor Red
+        } elseif ([decimal]$selectedShrink -lt $DevDriveMinSizeGB) {
+            Write-Host "Dev Drive size must be at least $DevDriveMinSizeGB GB. Please enter a larger amount." -ForegroundColor Red
         } else {
-            Write-Host "Invalid shrink amount. Please enter a positive decimal number (minimum 0.1 GB)." -ForegroundColor Red
+            Write-Host "Invalid shrink amount. Please enter a positive decimal number (minimum $DevDriveMinSizeGB GB)." -ForegroundColor Red
         }
     }
 
