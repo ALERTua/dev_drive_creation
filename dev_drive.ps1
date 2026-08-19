@@ -722,7 +722,7 @@ if ($windows_build -ge $windows_build_min) {
     Write-Host "Windows Build $windows_build is OK" -ForegroundColor Gray
 } else {
     Write-Error "Your Windows build $windows_build is lower than $windows_build_min. Please update before using the script."
-    exit 0
+    exit 1
 }
 
 # Microsoft's documented minimum size for a Dev Drive volume (https://learn.microsoft.com/en-us/windows/dev-drive/)
@@ -738,6 +738,12 @@ $CompressionLevel = 5
 $RunInitialJob = $true
 $SkipBitLocker = $false
 $SkipDeduplication = $false
+
+# Weekly ReFS dedup scrub schedule. Read by both the plan summary and the actual call below, so the
+# two cannot say different things about when the job runs.
+$ScrubDays = "Monday"
+$ScrubStart = "17:30"
+$ScrubWeeksInterval = 1
 
 # Interactive mode only - Gather all information first
 Write-Host "`n=== GATHERING CONFIGURATION ===" -ForegroundColor Cyan
@@ -951,6 +957,8 @@ if ($mode -eq "Vhdx") {
 
 if (-not $SkipBitLocker) {
     Write-Host "* Enable BitLocker encryption with Azure AD recovery key backup" -ForegroundColor White
+} else {
+    Write-Host "* Skip BitLocker encryption" -ForegroundColor White
 }
 
 if (-not $SkipDeduplication) {
@@ -960,7 +968,7 @@ if (-not $SkipDeduplication) {
         Write-Host "* Enable ReFS deduplication only (no compression)" -ForegroundColor White
     }
     Write-Host "* Schedule daily optimization jobs at 11:00 and 17:00 (AC power only)" -ForegroundColor White
-    Write-Host "* Schedule weekly maintenance job every Monday at 17:30" -ForegroundColor White
+    Write-Host "* Schedule weekly maintenance job every $ScrubDays at $ScrubStart" -ForegroundColor White
 } else {
     Write-Host "* Skip deduplication and compression setup" -ForegroundColor White
 }
@@ -1089,7 +1097,17 @@ try {
 
     Write-Host "Marking Dev Drive $devLetterColon as trusted for Defender performance" -ForegroundColor Green
     fsutil devdrv trust "$devLetterColon" | Out-Null
-    Write-Host "Dev Drive marked trusted." -ForegroundColor Green
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "Dev Drive marked trusted." -ForegroundColor Green
+    } else {
+        # fsutil is a native tool: a failure here does not throw, so it must be read from
+        # $LASTEXITCODE instead of the surrounding try/catch. The drive is still a fully
+        # working Dev Drive; it only loses the Defender performance mode that trust grants.
+        Write-Host "Could not mark $devLetterColon as trusted (fsutil exited with code $LASTEXITCODE)." -ForegroundColor Yellow
+        Write-Host "The Dev Drive will still work, but without the Defender performance mode trust enables." -ForegroundColor Yellow
+        Write-Host "Check the current state with: fsutil devdrv query $devLetterColon" -ForegroundColor Yellow
+        Write-Host "Retry by hand with: fsutil devdrv trust $devLetterColon" -ForegroundColor Yellow
+    }
 
 
     if ($env:USERNAME -eq "SYSTEM") {
@@ -1239,8 +1257,8 @@ try {
         }
 
         Write-Host "Scheduling deduplication scrub jobs" -ForegroundColor Green
-        Set-ReFSDedupScrubSchedule -Volume "$devLetterColon" -Days "Monday" -Start "17:30" -WeeksInterval 1 -ErrorAction Stop
-        Write-Host "Scheduled weekly scrub job on Monday at 12:00 (4h)" -ForegroundColor Green
+        Set-ReFSDedupScrubSchedule -Volume "$devLetterColon" -Days $ScrubDays -Start $ScrubStart -WeeksInterval $ScrubWeeksInterval -ErrorAction Stop
+        Write-Host "Scheduled weekly scrub job on $ScrubDays at $ScrubStart" -ForegroundColor Green
 
         if ($RunInitialJob) {
             $jobParams = @{

@@ -49,6 +49,28 @@ Describe 'The script itself' {
         $line = Select-String -Path $script:ScriptPath -Pattern '^\$DevDriveMinSizeGB\s*=\s*(\d+)'
         [int]$line.Matches[0].Groups[1].Value | Should -Be 50
     }
+
+    It 'exits non-zero when the Windows build is too old' {
+        $content = Get-Content -Path $script:ScriptPath -Raw
+        $matched = $content -match '(?ms)Write-Error "Your Windows build.*?\r?\n\s*exit\s+(\d+)'
+        $matched | Should -BeTrue
+        [int]$Matches[1] | Should -Be 1
+    }
+
+    It 'does not claim the weekly scrub job runs at a time it never schedules' {
+        Select-String -Path $script:ScriptPath -Pattern 'Scheduled weekly scrub job on .* at 12:00' |
+            Should -BeNullOrEmpty
+    }
+
+    It 'checks the fsutil devdrv trust exit code before declaring the drive trusted' {
+        $content = Get-Content -Path $script:ScriptPath -Raw
+        $content | Should -Match '(?ms)fsutil devdrv trust "\$devLetterColon" \| Out-Null\s*\r?\n\s*if \(\$LASTEXITCODE'
+    }
+
+    It 'prints a plan summary line when BitLocker is skipped' {
+        Select-String -Path $script:ScriptPath -Pattern '\* Skip BitLocker encryption' |
+            Should -Not -BeNullOrEmpty
+    }
 }
 
 Describe 'Layout of the structures passed to virtdisk.dll' {
