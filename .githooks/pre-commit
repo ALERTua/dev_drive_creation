@@ -1,0 +1,126 @@
+#!/bin/sh
+# Tracked pre-commit hook: runs the same three checks as .github/workflows/ci.yml
+# and refuses the commit if any fails. Installed by install-hooks.cmd via
+# "git config core.hooksPath .githooks". Runs under sh (Git for Windows' hook
+# shell) and calls pwsh, falling back to powershell, like run-tests.cmd does.
+#
+# Checks the working tree, not just staged content - simpler than extracting
+# the index first, and the hook says so in its own output below.
+#
+# Skip this hook for one commit with: git commit --no-verify
+
+repo_root=$(git rev-parse --show-toplevel) || exit 1
+cd "$repo_root" || exit 1
+
+pwsh_cmd=pwsh
+if ! command -v "$pwsh_cmd" >/dev/null 2>&1; then
+    pwsh_cmd=powershell
+fi
+if ! command -v "$pwsh_cmd" >/dev/null 2>&1; then
+    echo "pre-commit: neither pwsh nor powershell was found on PATH."
+    echo "Install PowerShell, or skip this hook once with: git commit --no-verify"
+    exit 1
+fi
+
+tmp_base=$(mktemp "${TMPDIR:-/tmp}/dev-drive-pre-commit.XXXXXX") || exit 1
+tmp_script="$tmp_base.ps1"
+trap 'rm -f "$tmp_base" "$tmp_script"' EXIT
+mv "$tmp_base" "$tmp_script" || exit 1
+
+cat > "$tmp_script" <<'POWERSHELL_EOF'
+$ErrorActionPreference = 'Stop'
+$repoRoot = (Get-Location).Path
+$claudePath = Join-Path $repoRoot '.claude'
+$claudeGlob = "$claudePath\*"
+$failed = New-Object System.Collections.Generic.List[string]
+
+Write-Host 'pre-commit: checking the working tree (not just staged changes) against the three CI checks.'
+
+# 1) Syntax parse of dev_drive.ps1, same as the CI workflow's first step.
+Write-Host ''
+Write-Host '[1/3] Parsing dev_drive.ps1 syntax...'
+$tokens = $null
+$parseErrors = $null
+[System.Management.Automation.Language.Parser]::ParseFile(
+    (Resolve-Path 'dev_drive.ps1').Path, [ref]$tokens, [ref]$parseErrors) | Out-Null
+if ($parseErrors.Count -gt 0) {
+    foreach ($e in $parseErrors) {
+        Write-Host "  Line $($e.Extent.StartLineNumber): $($e.Message)"
+    }
+    $failed.Add("syntax parse: $($parseErrors.Count) error(s) in dev_drive.ps1")
+} else {
+    Write-Host '  OK: no parse errors.'
+}
+
+# 2) PSScriptAnalyzer. Excludes .claude: this repo's own git worktrees live
+# there, and a recursive scan would report findings from other branches.
+Write-Host ''
+Write-Host '[2/3] Running PSScriptAnalyzer...'
+$analyzerModule = Get-Module -ListAvailable -Name PSScriptAnalyzer | Select-Object -First 1
+if (-not $analyzerModule) {
+    Write-Host '  PSScriptAnalyzer is not installed.'
+    Write-Host '  Install it: Install-Module -Name PSScriptAnalyzer -Scope CurrentUser -Force'
+    $failed.Add('PSScriptAnalyzer: module not installed')
+} else {
+    Import-Module PSScriptAnalyzer -MinimumVersion $analyzerModule.Version -ErrorAction Stop
+    $allResults = Invoke-ScriptAnalyzer -Path $repoRoot -Recurse -Settings (Join-Path $repoRoot 'PSScriptAnalyzerSettings.psd1')
+    $results = $allResults | Where-Object { $_.ScriptPath -notlike $claudeGlob }
+    if ($results) {
+        $results | Format-Table -AutoSize | Out-String | Write-Host
+        $failed.Add("PSScriptAnalyzer: $($results.Count) finding(s) not excluded by PSScriptAnalyzerSettings.psd1")
+    } else {
+        Write-Host '  OK: no findings outside PSScriptAnalyzerSettings.psd1 exclusions.'
+    }
+}
+
+# 3) Pester suite. Same .claude exclusion as above, and the same "no test
+# files yet" no-op the CI workflow allows for.
+Write-Host ''
+Write-Host '[3/3] Running the Pester suite...'
+$testFiles = Get-ChildItem -Path $repoRoot -Recurse -Filter '*.Tests.ps1' -ErrorAction SilentlyContinue |
+    Where-Object { $_.FullName -notlike $claudeGlob }
+if (-not $testFiles) {
+    Write-Host '  No *.Tests.ps1 files found - nothing to run.'
+} else {
+    $pesterModule = Get-Module -ListAvailable -Name Pester | Where-Object { $_.Version.Major -ge 5 } | Select-Object -First 1
+    if (-not $pesterModule) {
+        Write-Host '  Pester 5 or newer is not installed.'
+        Write-Host '  Install it: Install-Module -Name Pester -Scope CurrentUser -Force -SkipPublisherCheck'
+        $failed.Add('Pester: module not installed')
+    } else {
+        Import-Module Pester -MinimumVersion 5.0 -ErrorAction Stop
+        $config = New-PesterConfiguration
+        $config.Run.Path = $repoRoot
+        $config.Run.ExcludePath = $claudePath
+        $config.Run.Exit = $false
+        $config.Run.PassThru = $true
+        $config.Output.Verbosity = 'Normal'
+        $result = Invoke-Pester -Configuration $config
+        $badCount = $result.FailedCount + $result.FailedContainersCount + $result.FailedBlocksCount
+        if ($badCount -gt 0) {
+            $failed.Add("Pester: $badCount failure(s)")
+        } else {
+            Write-Host '  OK: all Pester tests passed.'
+        }
+    }
+}
+
+Write-Host ''
+if ($failed.Count -gt 0) {
+    Write-Host 'pre-commit: commit refused. Failed check(s):'
+    foreach ($f in $failed) {
+        Write-Host "  - $f"
+    }
+    Write-Host ''
+    Write-Host 'Fix the issue(s) above, or skip this hook once with: git commit --no-verify'
+    exit 1
+}
+
+Write-Host 'pre-commit: all checks passed.'
+exit 0
+POWERSHELL_EOF
+
+"$pwsh_cmd" -NoProfile -ExecutionPolicy Bypass -File "$tmp_script"
+status=$?
+
+exit $status
