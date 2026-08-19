@@ -25,6 +25,12 @@ BeforeAll {
     }
 
     Initialize-VirtDiskInterop
+
+    # Stands in for one entry of a BitLocker volume's KeyProtector list.
+    function New-Protector {
+        param([string]$Type, [string]$Id)
+        return [PSCustomObject]@{ KeyProtectorType = $Type; KeyProtectorId = $Id }
+    }
 }
 
 Describe 'The script itself' {
@@ -70,6 +76,46 @@ Describe 'The script itself' {
     It 'prints a plan summary line when BitLocker is skipped' {
         Select-String -Path $script:ScriptPath -Pattern '\* Skip BitLocker encryption' |
             Should -Not -BeNullOrEmpty
+    }
+
+    It 'no longer ends a failed run with an unqualified "try again"' {
+        Select-String -Path $script:ScriptPath -Pattern 'Write-Host "Please check the error message and try again\."' |
+            Should -BeNullOrEmpty
+    }
+
+    It 'closes a failed run through Resolve-FailureAdvice' {
+        $content = Get-Content -Path $script:ScriptPath -Raw
+        $content | Should -Match 'Resolve-FailureAdvice -CompletedActions \$CompletedActions'
+    }
+
+    It 'says in the plan that a failed shrink run cannot be resumed' {
+        Select-String -Path $script:ScriptPath -Pattern 'instead of carrying on from where it stopped' |
+            Should -Not -BeNullOrEmpty
+    }
+
+    It 'asks about a disk that already holds the space before it shrinks' {
+        $content = Get-Content -Path $script:ScriptPath -Raw
+        $content | Should -Match 'Test-UnallocatedSpaceCoversRequest -UnallocatedGB \$unallocatedGB'
+        $content | Should -Match 'Request-RepeatedShrinkChoice -DiskNumber \$DiskNumber'
+    }
+
+    It 'records the shrink as a completed change once the resize returns' {
+        $content = Get-Content -Path $script:ScriptPath -Raw
+        $content | Should -Match '(?ms)Resize-Partition[^\r\n]*\r?\n.{0,400}?\$CompletedActions \+='
+    }
+
+    It 'adds the <Protector> protector only when the plan asks for it' -TestCases @(
+        @{ Protector = 'Password';         ProtectorSwitch = '-PasswordProtector' }
+        @{ Protector = 'RecoveryPassword'; ProtectorSwitch = '-RecoveryPasswordProtector' }
+    ) {
+        $content = Get-Content -Path $script:ScriptPath -Raw
+        $content | Should -Match "(?ms)if \(\`$protectorPlan\.TypesToAdd -contains '$Protector'\) \{.{0,200}?Add-BitLockerKeyProtector[^\r\n]*$ProtectorSwitch"
+    }
+
+    It 'never takes the recovery protector id straight off the volume' {
+        # -ExpandProperty hands back an array as readily as one value, which is the defect itself.
+        Select-String -Path $script:ScriptPath -Pattern 'ExpandProperty KeyProtectorId' |
+            Should -BeNullOrEmpty
     }
 }
 
@@ -346,5 +392,206 @@ Describe 'Get-Win32ErrorText' {
 
     It 'includes the message Windows gives for the code' {
         Get-Win32ErrorText -Code 5 | Should -Match 'Access is denied'
+    }
+}
+
+Describe 'Resolve-BitLockerRecoveryProtector' {
+    It 'reports no recovery key on a volume with <Description>' -TestCases @(
+        @{ Description = 'no protectors at all'; Protectors = @() }
+        @{ Description = 'only a password protector'
+           Protectors = @([PSCustomObject]@{ KeyProtectorType = 'Password'; KeyProtectorId = '{PWD}' }) }
+    ) {
+        $verdict = Resolve-BitLockerRecoveryProtector -KeyProtector $Protectors -MountPoint 'X:'
+        $verdict.Rejection | Should -Be 'None'
+        $verdict.ProtectorId | Should -BeNullOrEmpty
+        $verdict.Message | Should -Match 'X: carries no BitLocker recovery key'
+    }
+
+    It 'does not throw when the volume reports no protectors at all' {
+        { Resolve-BitLockerRecoveryProtector -KeyProtector $null -MountPoint 'X:' } | Should -Not -Throw
+        (Resolve-BitLockerRecoveryProtector -KeyProtector $null -MountPoint 'X:').Rejection | Should -Be 'None'
+    }
+
+    It 'returns the one recovery key it finds' {
+        $protectors = @(
+            New-Protector -Type 'Password' -Id '{PWD}'
+            New-Protector -Type 'RecoveryPassword' -Id '{REC}'
+            New-Protector -Type 'AdAccountOrGroup' -Id '{SID}'
+        )
+        $verdict = Resolve-BitLockerRecoveryProtector -KeyProtector $protectors -MountPoint 'X:'
+        $verdict.Rejection | Should -BeNullOrEmpty
+        $verdict.ProtectorId | Should -Be '{REC}'
+    }
+
+    It 'returns that id as one value, never as an array' {
+        # An array here is the defect itself: BackupToAAD-BitLockerKeyProtector takes a single string.
+        $protectors = @((New-Protector -Type 'RecoveryPassword' -Id '{REC}'))
+        (Resolve-BitLockerRecoveryProtector -KeyProtector $protectors -MountPoint 'X:').ProtectorId |
+            Should -BeOfType [string]
+    }
+
+    It 'refuses to choose between two recovery keys' {
+        $protectors = @(
+            New-Protector -Type 'RecoveryPassword' -Id '{FIRST}'
+            New-Protector -Type 'RecoveryPassword' -Id '{SECOND}'
+        )
+        $verdict = Resolve-BitLockerRecoveryProtector -KeyProtector $protectors -MountPoint 'X:'
+        $verdict.Rejection | Should -Be 'Multiple'
+        $verdict.ProtectorId | Should -BeNullOrEmpty
+        $verdict.ProtectorIds | Should -HaveCount 2
+    }
+
+    It 'names both keys and a way out in the refusal' {
+        $protectors = @(
+            New-Protector -Type 'RecoveryPassword' -Id '{FIRST}'
+            New-Protector -Type 'RecoveryPassword' -Id '{SECOND}'
+        )
+        $message = (Resolve-BitLockerRecoveryProtector -KeyProtector $protectors -MountPoint 'X:').Message
+        $message | Should -Match '\{FIRST\}'
+        $message | Should -Match '\{SECOND\}'
+        $message | Should -Match 'Remove-BitLockerKeyProtector'
+    }
+}
+
+Describe 'Resolve-BitLockerProtectorPlan' {
+    It 'adds both protectors to a freshly formatted volume' {
+        $plan = Resolve-BitLockerProtectorPlan -KeyProtector @() -MountPoint 'X:'
+        $plan.Rejection | Should -BeNullOrEmpty
+        $plan.TypesToAdd | Should -Contain 'Password'
+        $plan.TypesToAdd | Should -Contain 'RecoveryPassword'
+        $plan.RecoveryProtectorId | Should -BeNullOrEmpty
+    }
+
+    It 'keeps a recovery key it did not create, and backs that one up' {
+        $plan = Resolve-BitLockerProtectorPlan -MountPoint 'X:' `
+            -KeyProtector @((New-Protector -Type 'RecoveryPassword' -Id '{REC}'))
+        $plan.TypesToAdd | Should -Not -Contain 'RecoveryPassword'
+        $plan.RecoveryProtectorId | Should -Be '{REC}'
+        $plan.TypesToAdd | Should -Contain 'Password'
+    }
+
+    It 'does not add a second password protector' {
+        $plan = Resolve-BitLockerProtectorPlan -MountPoint 'X:' `
+            -KeyProtector @((New-Protector -Type 'Password' -Id '{PWD}'))
+        $plan.TypesToAdd | Should -Not -Contain 'Password'
+        $plan.TypesToAdd | Should -Contain 'RecoveryPassword'
+    }
+
+    It 'adds nothing to a volume that already carries both' {
+        $protectors = @(
+            New-Protector -Type 'Password' -Id '{PWD}'
+            New-Protector -Type 'RecoveryPassword' -Id '{REC}'
+        )
+        $plan = Resolve-BitLockerProtectorPlan -KeyProtector $protectors -MountPoint 'X:'
+        $plan.TypesToAdd | Should -Not -Contain 'Password'
+        $plan.TypesToAdd | Should -Not -Contain 'RecoveryPassword'
+    }
+
+    It 'ignores protector types this script never adds' {
+        $protectors = @(
+            New-Protector -Type 'Tpm' -Id '{TPM}'
+            New-Protector -Type 'AdAccountOrGroup' -Id '{SID}'
+        )
+        $plan = Resolve-BitLockerProtectorPlan -KeyProtector $protectors -MountPoint 'X:'
+        $plan.TypesToAdd | Should -Contain 'Password'
+        $plan.TypesToAdd | Should -Contain 'RecoveryPassword'
+    }
+
+    It 'stops the run when the volume already carries two recovery keys' {
+        $protectors = @(
+            New-Protector -Type 'RecoveryPassword' -Id '{FIRST}'
+            New-Protector -Type 'RecoveryPassword' -Id '{SECOND}'
+        )
+        $plan = Resolve-BitLockerProtectorPlan -KeyProtector $protectors -MountPoint 'X:'
+        $plan.Rejection | Should -Be 'Multiple'
+        $plan.Message | Should -Match 'will not guess'
+        $plan.TypesToAdd | Should -Not -Contain 'RecoveryPassword'
+    }
+}
+
+Describe 'Resolve-FailureAdvice' {
+    It 'still says try again while nothing has been changed' {
+        $advice = Resolve-FailureAdvice -CompletedActions @()
+        $advice.Lines | Should -HaveCount 1
+        $advice.Lines[0] | Should -Be 'Please check the error message and try again.'
+    }
+
+    It 'treats no list at all the same way' {
+        (Resolve-FailureAdvice -CompletedActions $null).Lines[0] |
+            Should -Be 'Please check the error message and try again.'
+    }
+
+    It 'stops saying try again once the disk has been changed' {
+        $advice = Resolve-FailureAdvice -CompletedActions @('Shrunk drive D: by 199 GB')
+        ($advice.Lines -join "`n") | Should -Not -Match 'try again'
+    }
+
+    It 'lists every change the run had finished' {
+        $advice = Resolve-FailureAdvice -CompletedActions @('Shrunk drive D: by 199 GB', 'Formatted E: as a Dev Drive')
+        ($advice.Lines -join "`n") | Should -Match '  - Shrunk drive D: by 199 GB'
+        ($advice.Lines -join "`n") | Should -Match '  - Formatted E: as a Dev Drive'
+    }
+
+    It 'says that running the script again starts over' {
+        $advice = Resolve-FailureAdvice -CompletedActions @('Formatted E: as a Dev Drive')
+        ($advice.Lines -join "`n") | Should -Match 'does not carry on from here'
+    }
+
+    It 'spells out what a second shrink of the same drive would cost' {
+        $advice = Resolve-FailureAdvice -CompletedActions @('Shrunk drive D: by 199 GB') -ShrunkDrive 'D:' -ShrunkGB 199
+        ($advice.Lines -join "`n") | Should -Match 'Shrinking drive D: by 199 GB again would take a further 199 GB'
+    }
+
+    It 'says nothing about shrinking when no shrink happened' {
+        $advice = Resolve-FailureAdvice -CompletedActions @('Created the virtual hard disk file D:\dev.vhdx')
+        ($advice.Lines -join "`n") | Should -Not -Match 'Shrinking drive'
+    }
+}
+
+Describe 'Test-UnallocatedSpaceCoversRequest' {
+    It 'answers <Expected> for <UnallocatedGB> GB unallocated against a <RequestedGB> GB request' -TestCases @(
+        @{ UnallocatedGB = 199;    RequestedGB = 199; Expected = $true }
+        @{ UnallocatedGB = 250;    RequestedGB = 199; Expected = $true }
+        # A shrink lands on an alignment boundary, so the gap can be a hair under the amount typed.
+        @{ UnallocatedGB = 198.99; RequestedGB = 199; Expected = $true }
+        @{ UnallocatedGB = 198;    RequestedGB = 199; Expected = $true }
+        # Ten gigabytes short is a different disk layout, not alignment.
+        @{ UnallocatedGB = 190;    RequestedGB = 199; Expected = $false }
+        @{ UnallocatedGB = 50;     RequestedGB = 199; Expected = $false }
+        @{ UnallocatedGB = 0;      RequestedGB = 199; Expected = $false }
+    ) {
+        Test-UnallocatedSpaceCoversRequest -UnallocatedGB $UnallocatedGB -RequestedGB $RequestedGB |
+            Should -Be $Expected
+    }
+
+    It 'never asks about a request of nothing' {
+        Test-UnallocatedSpaceCoversRequest -UnallocatedGB 100 -RequestedGB 0 | Should -BeFalse
+    }
+}
+
+Describe 'Measure-AllocatedPartitionSize' {
+    It 'counts a <Description>' -TestCases @(
+        @{ Description = 'basic data partition'
+           Partition = [PSCustomObject]@{ Type = 'Basic'; DriveLetter = 'D'; Size = 100GB }; Expected = 100GB }
+        @{ Description = 'reserved partition that carries a drive letter'
+           Partition = [PSCustomObject]@{ Type = 'Reserved'; DriveLetter = 'S'; Size = 1GB }; Expected = 1GB }
+        @{ Description = 'reserved partition with no drive letter, which it leaves out'
+           Partition = [PSCustomObject]@{ Type = 'Reserved'; DriveLetter = $null; Size = 1GB }; Expected = 0 }
+    ) {
+        Measure-AllocatedPartitionSize -Partition @($Partition) | Should -Be $Expected
+    }
+
+    It 'adds up the partitions it counts' {
+        $partitions = @(
+            [PSCustomObject]@{ Type = 'Basic';    DriveLetter = 'C';   Size = 200GB }
+            [PSCustomObject]@{ Type = 'Reserved'; DriveLetter = $null; Size = 1GB }
+            [PSCustomObject]@{ Type = 'Dynamic';  DriveLetter = $null; Size = 50GB }
+        )
+        Measure-AllocatedPartitionSize -Partition $partitions | Should -Be 250GB
+    }
+
+    It 'answers nothing for a disk with no partitions' {
+        Measure-AllocatedPartitionSize -Partition @() | Should -Be 0
+        Measure-AllocatedPartitionSize -Partition $null | Should -Be 0
     }
 }

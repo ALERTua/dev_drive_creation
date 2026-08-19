@@ -137,6 +137,8 @@ Selected ZSTD compression with level 2
 ===============================================================================
 
 * Shrink Drive D (ALERT) by 199 GB to free up space
+  (a run that fails after this point cannot be resumed: running the script again shrinks
+   D: by a further 199 GB instead of carrying on from where it stopped)
 * Create 199 GB Dev Drive on Disk 1 (CT4000P3PSSD8) using ReFS
 * Enable ReFS deduplication with ZSTD compression (level 2)
 * Schedule daily optimization jobs at 11:00 and 17:00 (AC power only)
@@ -188,7 +190,9 @@ E           DevDrive     ReFS           Fixed     Healthy      OK               
 
 1. **Creation Method Selection**
    - **Free Space Mode**: Uses unallocated space on a physical drive
-   - **Shrink Mode**: Shrinks an existing logical drive to create space
+   - **Shrink Mode**: Shrinks an existing logical drive to create space. A run that fails after
+     the shrink cannot be resumed: starting the script again shrinks the same drive by the same
+     amount a second time, so check the disk in Disk Management before repeating it
    - **Virtual Hard Disk Mode**: Creates a `.vhdx` file on an existing volume
 
 2. **Drive Discovery & Selection**

@@ -283,6 +283,190 @@ function Add-VirtualDiskAttachment {
     return $false
 }
 
+function Measure-AllocatedPartitionSize {
+    <#
+        Sums the data partitions of a disk. System and reserved partitions are left out, so whatever
+        they hold counts as unallocated below, the same way this script has always counted it.
+    #>
+    param([AllowNull()][AllowEmptyCollection()][object[]]$Partition)
+
+    $allocatedBytes = 0
+    foreach ($part in $Partition) {
+        if ($part.Type -eq 'Basic' -or $part.Type -eq 'Dynamic' -or $part.DriveLetter) {
+            $allocatedBytes += $part.Size
+        }
+    }
+    return $allocatedBytes
+}
+
+function Get-DiskSpaceUsage {
+    <#
+        One definition of taken and unallocated space, so the drive listing, the free space mode and
+        the repeated shrink check cannot disagree about a disk.
+    #>
+    param([Parameter(Mandatory)][int]$DiskNumber)
+
+    $disk = Get-Disk -Number $DiskNumber -ErrorAction Stop
+    $allocatedBytes = Measure-AllocatedPartitionSize -Partition (
+        Get-Partition -DiskNumber $DiskNumber -ErrorAction SilentlyContinue)
+
+    return [PSCustomObject]@{
+        TotalBytes       = $disk.Size
+        AllocatedBytes   = $allocatedBytes
+        UnallocatedBytes = $disk.Size - $allocatedBytes
+    }
+}
+
+function Test-UnallocatedSpaceCoversRequest {
+    <#
+        Answers whether a disk already holds about as much unallocated space as the shrink about to
+        be asked for. The slack absorbs the alignment boundary a shrink lands on.
+    #>
+    param(
+        [Parameter(Mandatory)][decimal]$UnallocatedGB,
+        [Parameter(Mandatory)][decimal]$RequestedGB,
+        [decimal]$SlackGB = 1
+    )
+
+    if ($RequestedGB -le 0) {
+        return $false
+    }
+    return $UnallocatedGB -ge ($RequestedGB - $SlackGB)
+}
+
+function Resolve-BitLockerRecoveryProtector {
+    <#
+        Picks the one recovery protector to back up. Two are a refusal, never a guess: the older key
+        still unlocks the volume, and an array of ids breaks BackupToAAD-BitLockerKeyProtector.
+    #>
+    param(
+        [AllowNull()][AllowEmptyCollection()][object[]]$KeyProtector,
+        [Parameter(Mandatory)][string]$MountPoint
+    )
+
+    $recovery = @($KeyProtector | Where-Object { $_.KeyProtectorType -eq 'RecoveryPassword' })
+    $ids = @($recovery | ForEach-Object { $_.KeyProtectorId })
+    $result = [PSCustomObject]@{ Rejection = $null; ProtectorId = $null; ProtectorIds = $ids; Message = $null }
+
+    if ($ids.Count -eq 0) {
+        $result.Rejection = 'None'
+        $result.Message = "Drive $MountPoint carries no BitLocker recovery key to back up to Azure AD."
+        return $result
+    }
+    if ($ids.Count -gt 1) {
+        $result.Rejection = 'Multiple'
+        $result.Message = "Drive $MountPoint carries $($ids.Count) BitLocker recovery keys ($($ids -join ', ')). " +
+            "This script will not guess which one to back up to Azure AD. Remove the ones you do not want " +
+            "with Remove-BitLockerKeyProtector, or back them up by hand, then run the script again."
+        return $result
+    }
+
+    $result.ProtectorId = $ids[0]
+    return $result
+}
+
+function Resolve-BitLockerProtectorPlan {
+    <#
+        Names the protector types still missing from the volume. Add-BitLockerKeyProtector adds a
+        second one rather than refuse, and an existing protector is kept: replacing it would
+        invalidate a key that may already be written down or escrowed.
+    #>
+    param(
+        [AllowNull()][AllowEmptyCollection()][object[]]$KeyProtector,
+        [Parameter(Mandatory)][string]$MountPoint
+    )
+
+    $recovery = Resolve-BitLockerRecoveryProtector -KeyProtector $KeyProtector -MountPoint $MountPoint
+    $existingTypes = @($KeyProtector | ForEach-Object { $_.KeyProtectorType })
+
+    # Only more than one recovery key stops the run; none at all is the ordinary case on a new volume.
+    $rejection = $null
+    $message = $null
+    if ($recovery.Rejection -eq 'Multiple') {
+        $rejection = $recovery.Rejection
+        $message = $recovery.Message
+    }
+
+    $typesToAdd = @()
+    if ($existingTypes -notcontains 'Password') {
+        $typesToAdd += 'Password'
+    }
+    if ($recovery.Rejection -eq 'None') {
+        $typesToAdd += 'RecoveryPassword'
+    }
+
+    return [PSCustomObject]@{
+        Rejection           = $rejection
+        Message             = $message
+        TypesToAdd          = $typesToAdd
+        RecoveryProtectorId = $recovery.ProtectorId
+    }
+}
+
+function Resolve-FailureAdvice {
+    <#
+        Turns the steps a failed run already finished into its closing advice. "Try again" is only
+        safe while nothing has been changed yet; after a shrink it invites a second one.
+    #>
+    param(
+        [AllowNull()][AllowEmptyCollection()][string[]]$CompletedActions,
+        [string]$ShrunkDrive,
+        [decimal]$ShrunkGB = 0
+    )
+
+    # -Unique keeps a step that a retry recorded twice from being listed twice.
+    $done = @($CompletedActions | Where-Object { $_ } | Select-Object -Unique)
+    if ($done.Count -eq 0) {
+        return [PSCustomObject]@{ Lines = @('Please check the error message and try again.') }
+    }
+
+    $lines = @('This run had already made these changes before it failed:')
+    foreach ($action in $done) {
+        $lines += "  - $action"
+    }
+    $lines += 'Running the script again does not carry on from here; it starts from the beginning.'
+    if ($ShrunkDrive) {
+        $lines += "Shrinking drive $ShrunkDrive by $ShrunkGB GB again would take a further $ShrunkGB GB from it,"
+        $lines += 'on top of what this run already took from it.'
+    }
+    $lines += 'Check the disk in Disk Management (diskmgmt.msc) before running the script again.'
+
+    return [PSCustomObject]@{ Lines = $lines }
+}
+
+function Request-RepeatedShrinkChoice {
+    <#
+        Asked when the disk already holds about as much unallocated space as the shrink about to
+        happen. Nothing records an earlier run, so this asks instead of deciding.
+    #>
+    param(
+        [Parameter(Mandatory)][int]$DiskNumber,
+        [Parameter(Mandatory)][string]$Drive,
+        [Parameter(Mandatory)][decimal]$UnallocatedGB,
+        [Parameter(Mandatory)][decimal]$ShrinkGB
+    )
+
+    Write-Host "`nDisk $DiskNumber already has $UnallocatedGB GB of unallocated space, about the $ShrinkGB GB you asked to free." -ForegroundColor Yellow
+    Write-Host "Nothing records that a shrink happened, so this script cannot tell whether an earlier run of it" -ForegroundColor Yellow
+    Write-Host "already shrank drive $Drive, or whether that space was always there." -ForegroundColor Yellow
+    Write-Host "Shrinking now takes another $ShrinkGB GB from drive $Drive, on top of the space already free." -ForegroundColor Yellow
+    Write-Host "If the space is already there, cancel and start again with option 1, unallocated free space." -ForegroundColor Yellow
+    Write-Host "1. Shrink drive $Drive by $ShrinkGB GB anyway" -ForegroundColor White
+    Write-Host "2. Cancel without changing anything" -ForegroundColor White
+    Write-Host ""
+
+    while ($true) {
+        $choice = Read-Host "Enter your choice (1 or 2)"
+        if ($choice -eq "1") {
+            return $true
+        } elseif ($choice -eq "2") {
+            return $false
+        } else {
+            Write-Host "Invalid choice. Please enter 1 or 2." -ForegroundColor Red
+        }
+    }
+}
+
 function Request-BitLockerChoice {
     param([switch]$VhdxMode)
 
@@ -493,18 +677,7 @@ function Show-DriveSelection {
     foreach ($disk in $disks) {
         $diskNumber = $disk.Number
         $diskSizeGB = [math]::Round($disk.Size / 1GB, 2)
-
-        # Calculate allocated space more accurately
-        $partitions = Get-Partition -DiskNumber $diskNumber
-        $allocatedSize = 0
-        foreach ($partition in $partitions) {
-            # Only count actual data partitions, not system/reserved
-            if ($partition.Type -eq 'Basic' -or $partition.Type -eq 'Dynamic' -or $partition.DriveLetter) {
-                $allocatedSize += $partition.Size
-            }
-        }
-
-        $freeSpaceGB = [math]::Round(($disk.Size - $allocatedSize) / 1GB, 2)
+        $freeSpaceGB = [math]::Round((Get-DiskSpaceUsage -DiskNumber $diskNumber).UnallocatedBytes / 1GB, 2)
 
         Write-Host "Disk $diskNumber`: $($disk.FriendlyName)" -ForegroundColor Yellow
         Write-Host "  Size: $diskSizeGB GB" -ForegroundColor White
@@ -783,15 +956,7 @@ if ($mode -ne "Vhdx") {
 # Step 3: Get mode-specific parameters
 if ($mode -eq "FreeSpace") {
     # Get disk info for free space calculation
-    $selectedDisk = Get-Disk -Number $DiskNumber
-    $partitions = Get-Partition -DiskNumber $DiskNumber
-    $allocatedSize = 0
-    foreach ($partition in $partitions) {
-        if ($partition.Type -eq 'Basic' -or $partition.Type -eq 'Dynamic' -or $partition.DriveLetter) {
-            $allocatedSize += $partition.Size
-        }
-    }
-    $freeSpace = $selectedDisk.Size - $allocatedSize
+    $freeSpace = (Get-DiskSpaceUsage -DiskNumber $DiskNumber).UnallocatedBytes
     # Floor (not round) so the displayed/accepted maximum is never above the real free space
     $freeSpaceGB = ConvertTo-FlooredGB -Bytes $freeSpace
 
@@ -892,6 +1057,19 @@ if ($mode -eq "FreeSpace") {
 
     $ShrinkGB = Request-DevDriveSizeGB -MaxGB $realMaxShrinkableGB -Subject 'Shrink amount'
     $SizeGB = $ShrinkGB  # The Dev Drive fills exactly the space that was freed
+
+    # A run that shrank and then failed subtracts again from the new maximum next time. Space still
+    # unclaimed is a hint that this happened, and only a hint, so the user decides. A run that got
+    # as far as creating the partition leaves no such space and no way to notice from here.
+    $unallocatedGB = ConvertTo-FlooredGB -Bytes (Get-DiskSpaceUsage -DiskNumber $DiskNumber).UnallocatedBytes
+    if (Test-UnallocatedSpaceCoversRequest -UnallocatedGB $unallocatedGB -RequestedGB $ShrinkGB) {
+        $shrinkAnyway = Request-RepeatedShrinkChoice -DiskNumber $DiskNumber -Drive "$DriveLetter`:" `
+            -UnallocatedGB $unallocatedGB -ShrinkGB $ShrinkGB
+        if (-not $shrinkAnyway) {
+            Write-Host "`nDev Drive creation cancelled. No changes were made." -ForegroundColor Yellow
+            exit 0
+        }
+    }
 } else { # Vhdx
     # Compile the interop now rather than after every question, so a machine that forbids Add-Type
     # fails before the user has answered anything.
@@ -939,6 +1117,8 @@ Write-Host "" -ForegroundColor Cyan
 # Unified action list with all details
 if ($mode -eq "ShrinkDrive") {
     Write-Host "* Shrink Drive $DriveLetter ($driveLabel) by $ShrinkGB GB to free up space" -ForegroundColor White
+    Write-Host "  (a run that fails after this point cannot be resumed: running the script again shrinks" -ForegroundColor Gray
+    Write-Host "   $DriveLetter`: by a further $ShrinkGB GB instead of carrying on from where it stopped)" -ForegroundColor Gray
 }
 if ($mode -eq "Vhdx") {
     Write-Host "* Create a $SizeGB GB $VhdxDiskType virtual hard disk at $VhdxPath" -ForegroundColor White
@@ -987,30 +1167,21 @@ if ($confirmation -notmatch "^(yes|y)$") {
 
 Write-Host "`nStarting Dev Drive creation..." -ForegroundColor Green
 
-# The catch below reads this even when the run fails before the attach.
+# The catch below reads these even when the run fails before anything sets them.
 $VhdxAtBootGranted = $false
+$CompletedActions = @()
+# Set only once the shrink has run, so the advice can tell a shrink that happened from one that did not.
+$ShrunkDriveColon = $null
+$ShrunkAmountGB = 0
 
 try {
     if ($mode -eq "FreeSpace") {
         # Check disk and free space
         Write-Host "Checking disk $DiskNumber for available free space..." -ForegroundColor Green
-        $disk = Get-Disk -Number $DiskNumber -ErrorAction Stop
-
-        # Get total disk size and calculate allocated space
-        $diskSize = $disk.Size
-
-        # Calculate allocated space more accurately
-        $partitions = Get-Partition -DiskNumber $DiskNumber
-        $allocatedSize = 0
-        foreach ($partition in $partitions) {
-            # Only count actual data partitions, not system/reserved
-            if ($partition.Type -eq 'Basic' -or $partition.Type -eq 'Dynamic' -or $partition.DriveLetter) {
-                $allocatedSize += $partition.Size
-            }
-        }
-
-        # Calculate free space
-        $freeSpace = $diskSize - $allocatedSize
+        $diskUsage = Get-DiskSpaceUsage -DiskNumber $DiskNumber
+        $diskSize = $diskUsage.TotalBytes
+        $allocatedSize = $diskUsage.AllocatedBytes
+        $freeSpace = $diskUsage.UnallocatedBytes
         $freeSpaceGB = [math]::Round($freeSpace / 1GB, 2)
 
         Write-Host "Disk $DiskNumber total size: $([math]::Round($diskSize / 1GB, 2)) GB" -ForegroundColor Green
@@ -1028,6 +1199,7 @@ try {
         # Create Dev Drive
         Write-Host "Creating a new partition with $SizeGB GB on disk $DiskNumber" -ForegroundColor Green
         $newPart = New-Partition -DiskNumber $DiskNumber -Size $requestedSizeBytes -AssignDriveLetter -ErrorAction Stop
+        $CompletedActions += "Created a new $SizeGB GB partition on disk $DiskNumber"
     } elseif ($mode -eq "ShrinkDrive") {
         # Use stored partition information to avoid redundant API calls
         if ($partitionInfo) {
@@ -1054,16 +1226,21 @@ try {
         Write-Host "Resizing Partition $($partitionInfo.PartitionNumber) of disk $diskNum to $([math]::Round($targetSize / 1GB, 2)) GB ..." -ForegroundColor Green
         Resize-Partition -DiskNumber $diskNum -PartitionNumber $partitionInfo.PartitionNumber -Size $targetSize -ErrorAction Stop
         Write-Host "Shrunk drive $DriveLetter by $ShrinkGB GB" -ForegroundColor Green
+        $ShrunkDriveColon = "$DriveLetter`:"
+        $ShrunkAmountGB = $ShrinkGB
+        $CompletedActions += "Shrunk drive $ShrunkDriveColon by $ShrinkGB GB"
 
         # Create Dev Drive from the freed space
         Write-Host "Creating a new partition from the freed space on disk $diskNum" -ForegroundColor Green
         $newPart = New-Partition -DiskNumber $diskNum -UseMaximumSize -AssignDriveLetter -ErrorAction Stop
+        $CompletedActions += "Created a new partition from that freed space on disk $diskNum"
     } else { # Vhdx
         Write-Host "Creating a $SizeGB GB $VhdxDiskType virtual hard disk at $VhdxPath" -ForegroundColor Green
         if ($VhdxDiskType -eq 'Fixed') {
             Write-Host "Allocating the whole file up front. This may take several minutes and cannot be interrupted." -ForegroundColor Yellow
         }
         New-VirtualDiskFile -Path $VhdxPath -SizeBytes ([uint64][math]::Round($SizeGB * 1GB)) -DiskType $VhdxDiskType
+        $CompletedActions += "Created the virtual hard disk file $VhdxPath"
 
         Write-Host "Attaching $VhdxPath" -ForegroundColor Green
         $VhdxAtBootGranted = Add-VirtualDiskAttachment -Path $VhdxPath -AtBoot:$VhdxAutoAttach
@@ -1093,6 +1270,7 @@ try {
     $devLetterColon = "$devLetter`:"
     Write-Host "Formatting the newly created partition drive $devLetterColon to a Dev Drive" -ForegroundColor Green
     Format-Volume -DriveLetter $devLetter -FileSystem ReFS -DevDrive -NewFileSystemLabel "DevDrive" -Confirm:$false -Force -ErrorAction Stop
+    $CompletedActions += "Formatted $devLetterColon as a Dev Drive"
     Write-Host "Dev Drive created at $devLetterColon" -ForegroundColor Green
 
     Write-Host "Marking Dev Drive $devLetterColon as trusted for Defender performance" -ForegroundColor Green
@@ -1128,25 +1306,53 @@ try {
 
         while (-not $bitLockerSuccess -and $retryCount -lt $maxRetries) {
             try {
+                Write-Host "Enabling BitLocker for $devLetterColon and recovery key back up to Azure AD." -ForegroundColor Green
+
+                # Read the volume before asking anything, on every pass of this loop: adding a
+                # protector twice adds a second one instead of refusing, and two recovery keys turn
+                # the id below into an array the Azure AD backup cannot take.
+                Write-Host "Reading the key protectors already on $devLetterColon"
+                $bitlocker_volume = Get-BitLockerVolume -MountPoint $devLetterColon -ErrorAction Stop
+                $protectorPlan = Resolve-BitLockerProtectorPlan -KeyProtector $bitlocker_volume.KeyProtector -MountPoint $devLetterColon
+                if ($protectorPlan.Rejection) {
+                    throw $protectorPlan.Message
+                }
+
                 Write-Host "Enter BitLocker password for the new volume. It must be a complex one." -ForegroundColor Yellow
                 $SecurePassword = Read-StrongPassword
 
-                Write-Host "Enabling BitLocker for $devLetterColon and recovery key back up to Azure AD." -ForegroundColor Green
-                Write-Host "Adding BitLockerKeyProtector PasswordProtector"
-                Add-BitLockerKeyProtector -MountPoint $devLetterColon -PasswordProtector -Password $SecurePassword -ErrorAction Stop
-                Write-Host "Adding BitLockerKeyProtector RecoveryPasswordProtector"
-                Add-BitLockerKeyProtector -MountPoint $devLetterColon -RecoveryPasswordProtector -ErrorAction Stop
+                if ($protectorPlan.TypesToAdd -contains 'Password') {
+                    Write-Host "Adding BitLockerKeyProtector PasswordProtector"
+                    Add-BitLockerKeyProtector -MountPoint $devLetterColon -PasswordProtector -Password $SecurePassword -ErrorAction Stop
+                } else {
+                    Write-Host "$devLetterColon already has a password protector, so a second one is not added." -ForegroundColor Yellow
+                    Write-Host "If this script did not add it, the unlock step below fails and the run stops there." -ForegroundColor Yellow
+                }
+
+                if ($protectorPlan.TypesToAdd -contains 'RecoveryPassword') {
+                    Write-Host "Adding BitLockerKeyProtector RecoveryPasswordProtector"
+                    Add-BitLockerKeyProtector -MountPoint $devLetterColon -RecoveryPasswordProtector -ErrorAction Stop
+                } else {
+                    Write-Host "$devLetterColon already has recovery key $($protectorPlan.RecoveryProtectorId)." -ForegroundColor Yellow
+                    Write-Host "That one is kept and backed up: a second key would leave two of them unlocking the drive." -ForegroundColor Yellow
+                }
 
                 Write-Host "Enabling Bitlocker"
+                # Its documentation: "on an encrypted volume or on a volume with encryption in
+                # process, it takes no action" - so a second pass adds no second AD account protector.
                 Enable-BitLocker -MountPoint $devLetterColon -AdAccountOrGroup $domain_user -AdAccountOrGroupProtector -SkipHardwareTest -UsedSpaceOnly -ErrorAction Stop
+                $CompletedActions += "Enabled BitLocker on $devLetterColon"
 
                 # Backup recovery key to Azure AD (works for AAD-joined devices only)
                 Write-Host "Getting Bitlocker Volume Data"
                 $bitlocker_volume = Get-BitLockerVolume -MountPoint $devLetterColon -ErrorAction Stop
                 Write-Host "Getting Bitlocker Protector ID"
-                $protectorId = $bitlocker_volume.KeyProtector | Where-Object { $_.KeyProtectorType -eq "RecoveryPassword" } | Select-Object -ExpandProperty KeyProtectorId
+                $recoveryProtector = Resolve-BitLockerRecoveryProtector -KeyProtector $bitlocker_volume.KeyProtector -MountPoint $devLetterColon
+                if ($recoveryProtector.Rejection) {
+                    throw $recoveryProtector.Message
+                }
                 Write-Host "Backing Up Bitlocker Key Protector to Azure AD"
-                BackupToAAD-BitLockerKeyProtector -MountPoint $devLetterColon -KeyProtectorId $protectorId -ErrorAction Stop
+                BackupToAAD-BitLockerKeyProtector -MountPoint $devLetterColon -KeyProtectorId $recoveryProtector.ProtectorId -ErrorAction Stop
 
                 Write-Host "Unlocking Bitlocker Volume"
                 Unlock-BitLocker -MountPoint $devLetterColon -Password $SecurePassword -ErrorAction Stop
@@ -1305,6 +1511,9 @@ catch {
         Write-Host "To remove it: Dismount-DiskImage -ImagePath '$VhdxPath'; Remove-Item -LiteralPath '$VhdxPath'" -ForegroundColor Yellow
     }
 
-    Write-Host "Please check the error message and try again." -ForegroundColor Yellow
+    $advice = Resolve-FailureAdvice -CompletedActions $CompletedActions -ShrunkDrive $ShrunkDriveColon -ShrunkGB $ShrunkAmountGB
+    foreach ($line in $advice.Lines) {
+        Write-Host $line -ForegroundColor Yellow
+    }
     exit 1
 }
