@@ -233,32 +233,40 @@ if ($mode -eq "FreeSpace") {
             $allocatedSize += $partition.Size
         }
     }
-    $freeSpaceGB = [math]::Round(($selectedDisk.Size - $allocatedSize) / 1GB, 2)
+    $freeSpace = $selectedDisk.Size - $allocatedSize
+    # Floor (not round) so the displayed/accepted maximum is never above the real free space
+    $freeSpaceGB = [math]::Floor($freeSpace / 1GB * 100) / 100
 
     Write-Host "`nDisk $DiskNumber has $freeSpaceGB GB of free space available." -ForegroundColor Cyan
 
-    if ($freeSpaceGB -lt $DevDriveMinSizeGB) {
+    if ($freeSpace -lt ($DevDriveMinSizeGB * 1GB)) {
         Write-Host "Disk $DiskNumber only has $freeSpaceGB GB of free space, which is below the $DevDriveMinSizeGB GB minimum required for a Dev Drive." -ForegroundColor Red
-        Write-Host "Please select a different disk or free up more space." -ForegroundColor Yellow
+        Write-Host "Exiting. Please choose a different disk or free up more space, then run the script again." -ForegroundColor Yellow
         exit 1
     }
 
     while ($true) {
-        $selectedSize = Read-Host "Enter Dev Drive size in GB (max: $freeSpaceGB, press Enter for max)"
+        $selectedSize = Read-Host "Enter Dev Drive size in GB (min: $DevDriveMinSizeGB, max: $freeSpaceGB, press Enter for max)"
         if ([string]::IsNullOrWhiteSpace($selectedSize)) {
             # User pressed Enter, use maximum available space
             $SizeGB = [decimal]$freeSpaceGB
             Write-Host "Using maximum available space: $SizeGB GB" -ForegroundColor Green
             break
-        } elseif ($selectedSize -match '^\d+\.?\d*$' -and [decimal]$selectedSize -ge $DevDriveMinSizeGB -and [decimal]$selectedSize -le $freeSpaceGB) {
-            $SizeGB = [decimal]$selectedSize
-            break
-        } elseif ([decimal]$selectedSize -gt $freeSpaceGB) {
+        }
+
+        if ($selectedSize -notmatch '^\d+\.?\d*$') {
+            Write-Host "Invalid size. Please enter a positive decimal number." -ForegroundColor Red
+            continue
+        }
+
+        $parsedSize = [decimal]$selectedSize
+        if ($parsedSize -gt $freeSpaceGB) {
             Write-Host "Size cannot exceed available free space ($freeSpaceGB GB). Please enter a smaller size." -ForegroundColor Red
-        } elseif ([decimal]$selectedSize -lt $DevDriveMinSizeGB) {
+        } elseif ($parsedSize -lt $DevDriveMinSizeGB) {
             Write-Host "Dev Drive size must be at least $DevDriveMinSizeGB GB. Please enter a larger size." -ForegroundColor Red
         } else {
-            Write-Host "Invalid size. Please enter a positive decimal number (minimum $DevDriveMinSizeGB GB)." -ForegroundColor Red
+            $SizeGB = $parsedSize
+            break
         }
     }
 
@@ -307,7 +315,9 @@ if ($mode -eq "FreeSpace") {
                     $partitionInfo = Get-Partition -DriveLetter $DriveLetter -ErrorAction Stop
                     $supportedSizes = $partitionInfo | Get-PartitionSupportedSize -ErrorAction Stop
                     $minSizeGB = [math]::Round($supportedSizes.SizeMin / 1GB, 2)
-                    $realMaxShrinkableGB = [math]::Round(($partitionInfo.Size - $supportedSizes.SizeMin) / 1GB, 2)
+                    $realMaxShrinkableBytes = $partitionInfo.Size - $supportedSizes.SizeMin
+                    # Floor (not round) so the displayed/accepted maximum is never above the real shrinkable size
+                    $realMaxShrinkableGB = [math]::Floor($realMaxShrinkableBytes / 1GB * 100) / 100
 
                     Write-Host "Shrinkable size information:" -ForegroundColor Yellow
                     Write-Host "  Current partition size: $([math]::Round($partitionInfo.Size / 1GB, 2)) GB" -ForegroundColor White
@@ -319,7 +329,8 @@ if ($mode -eq "FreeSpace") {
                 }
                 catch {
                     Write-Host "Could not determine real shrinkable size. Using estimated values." -ForegroundColor Yellow
-                    $realMaxShrinkableGB = [math]::Round(($driveOnDisk.SizeRemaining / 1GB), 2) - 5
+                    $realMaxShrinkableBytes = [math]::Max(0, $driveOnDisk.SizeRemaining - (5 * 1GB))
+                    $realMaxShrinkableGB = [math]::Floor($realMaxShrinkableBytes / 1GB * 100) / 100
                     Write-Host "Estimated maximum shrinkable: $realMaxShrinkableGB GB" -ForegroundColor Green
                     # Set partitionInfo to null so we know to get it again later
                     $partitionInfo = $null
@@ -334,24 +345,32 @@ if ($mode -eq "FreeSpace") {
         }
     }
 
-    if ($realMaxShrinkableGB -lt $DevDriveMinSizeGB) {
-        Write-Host "Drive $DriveLetter can only be shrunk by $realMaxShrinkableGB GB, which is below the $DevDriveMinSizeGB GB minimum required for a Dev Drive." -ForegroundColor Red
-        Write-Host "Please select a different drive or use free space mode." -ForegroundColor Yellow
+    if ($realMaxShrinkableBytes -lt ($DevDriveMinSizeGB * 1GB)) {
+        if ($partitionInfo) {
+            Write-Host "Drive $DriveLetter can only be shrunk by $realMaxShrinkableGB GB, which is below the $DevDriveMinSizeGB GB minimum required for a Dev Drive." -ForegroundColor Red
+        } else {
+            Write-Host "Drive $DriveLetter can only be shrunk by an estimated $realMaxShrinkableGB GB, which is below the $DevDriveMinSizeGB GB minimum required for a Dev Drive." -ForegroundColor Red
+        }
+        Write-Host "Exiting. Please choose a different drive or use free space mode, then run the script again." -ForegroundColor Yellow
         exit 1
     }
 
     while ($true) {
-        $selectedShrink = Read-Host "Enter amount to shrink in GB (max: $realMaxShrinkableGB GB)"
-        if ($selectedShrink -match '^\d+\.?\d*$' -and [decimal]$selectedShrink -ge $DevDriveMinSizeGB -and [decimal]$selectedShrink -le $realMaxShrinkableGB) {
-            $ShrinkGB = [decimal]$selectedShrink
-            $SizeGB = $ShrinkGB  # Set the Dev Drive size to match the shrink amount
-            break
-        } elseif ([decimal]$selectedShrink -gt $realMaxShrinkableGB) {
+        $selectedShrink = Read-Host "Enter amount to shrink in GB (min: $DevDriveMinSizeGB GB, max: $realMaxShrinkableGB GB)"
+        if ($selectedShrink -notmatch '^\d+\.?\d*$') {
+            Write-Host "Invalid shrink amount. Please enter a positive decimal number." -ForegroundColor Red
+            continue
+        }
+
+        $parsedShrink = [decimal]$selectedShrink
+        if ($parsedShrink -gt $realMaxShrinkableGB) {
             Write-Host "Shrink amount cannot exceed the maximum shrinkable size ($realMaxShrinkableGB GB). Please enter a smaller amount." -ForegroundColor Red
-        } elseif ([decimal]$selectedShrink -lt $DevDriveMinSizeGB) {
+        } elseif ($parsedShrink -lt $DevDriveMinSizeGB) {
             Write-Host "Dev Drive size must be at least $DevDriveMinSizeGB GB. Please enter a larger amount." -ForegroundColor Red
         } else {
-            Write-Host "Invalid shrink amount. Please enter a positive decimal number (minimum $DevDriveMinSizeGB GB)." -ForegroundColor Red
+            $ShrinkGB = $parsedShrink
+            $SizeGB = $ShrinkGB  # Set the Dev Drive size to match the shrink amount
+            break
         }
     }
 

@@ -21,6 +21,7 @@ https://github.com/user-attachments/assets/e5e97018-6966-4c64-8aaf-08764670f31f
 
 - **Windows 11 26100 or newer**
 - **Administrator privileges** - Script must be run as administrator (elevated)
+- **50 GB minimum** - The selected disk's free space (or drive's shrinkable space) must be at least 50 GB, the documented Dev Drive minimum; the script exits if it is not
 
 ## Basic Usage
 
@@ -35,7 +36,7 @@ This script runs in interactive mode and will guide you through the entire Dev D
 
 1. **Drive Selection**: Shows all physical drives with size and free space information
 2. **Creation Method**: Choose between using free space or shrinking an existing drive
-3. **Size Configuration**: Enter Dev Drive size (press Enter for maximum available)
+3. **Size Configuration**: Enter Dev Drive size (minimum 50 GB, press Enter for maximum available)
 4. **BitLocker Setup**: Optional encryption with automatic password retry
 5. **Deduplication Options**: Choose deduplication level and compression settings
 6. **Compression Configuration**: Select format (LZ4/ZSTD) and level (1-9 for ZSTD)
@@ -92,7 +93,7 @@ Shrinkable size information:
                                                                                                              
 Note: Windows allows shrinking by the size of starting from the end of the drive disk space to the nearest written file block. Disk Fragmentation can affect this. If Windows does not allow for a drive to be shrunk, please use third-party tools (e.g. AOMEI).                                                                      
                                                                                                              
-Enter amount to shrink in GB (max: 816.36 GB): 199                                                           
+Enter amount to shrink in GB (min: 50 GB, max: 816.36 GB): 199                                                
                                                                                                              
 Do you want to enable BitLocker encryption for the Dev Drive?                                                
 BitLocker provides security but may impact performance.
