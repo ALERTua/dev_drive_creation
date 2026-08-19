@@ -7,6 +7,10 @@
 #>
 param()
 
+# Reading an unassigned variable or a missing property is a terminating error, not a silent $null:
+# a script that repartitions disks must stop on a typo rather than act on an empty value.
+Set-StrictMode -Version Latest
+
 function Initialize-VirtDiskInterop {
     <#
         virtdisk.dll declarations for creating and attaching a .vhdx; only these can request
@@ -268,7 +272,8 @@ function Add-VirtualDiskAttachment {
             $handle, [IntPtr]::Zero, $lifetimeFlag, 0, [ref]$attachParams, [IntPtr]::Zero)
 
         # A refused first attempt may still have attached the disk, which makes the retry fail.
-        if ($result -ne 0 -and -not (Get-DiskImage -ImagePath $Path -ErrorAction SilentlyContinue).Attached) {
+        $image = Get-DiskImage -ImagePath $Path -ErrorAction SilentlyContinue
+        if ($result -ne 0 -and -not ($image -and $image.Attached)) {
             throw "Could not attach $Path`: $(Get-Win32ErrorText -Code $result)"
         }
     }
@@ -732,6 +737,7 @@ $CompressionFormat = 'LZ4'
 $CompressionLevel = 5
 $RunInitialJob = $true
 $SkipBitLocker = $false
+$SkipDeduplication = $false
 
 # Interactive mode only - Gather all information first
 Write-Host "`n=== GATHERING CONFIGURATION ===" -ForegroundColor Cyan
@@ -792,17 +798,17 @@ if ($mode -eq "FreeSpace") {
     }
 
     $SizeGB = Prompt-DevDriveSizeGB -MaxGB $freeSpaceGB -Subject 'Dev Drive size' -AllowMaxOnEmpty
-
-    $creationMethod = "Use $SizeGB GB of free space from Disk $DiskNumber ($selectedDiskName)"
 } elseif ($mode -eq "ShrinkDrive") {
     Write-Host "`n=== SELECT DRIVE TO SHRINK ===" -ForegroundColor Cyan
     Write-Host "Available drives on Disk $DiskNumber for shrinking:" -ForegroundColor White
 
-    # Show only drives on the selected disk
-    $volumesOnDisk = Get-Volume | Where-Object {
-        $_.DriveLetter -and $_.DriveType -eq 'Fixed' -and
-        (Get-Partition -DriveLetter $_.DriveLetter).DiskNumber -eq $DiskNumber
-    } | Sort-Object DriveLetter
+    # Show only drives on the selected disk. @() so a single match still answers .Count, and
+    # a volume Get-Partition cannot map to a partition drops out of the list instead of failing it.
+    $volumesOnDisk = @(Get-Volume | Where-Object {
+        if (-not ($_.DriveLetter -and $_.DriveType -eq 'Fixed')) { return $false }
+        $volumePartition = Get-Partition -DriveLetter $_.DriveLetter -ErrorAction SilentlyContinue
+        $volumePartition -and $volumePartition.DiskNumber -eq $DiskNumber
+    } | Sort-Object DriveLetter)
 
     if ($volumesOnDisk.Count -eq 0) {
         Write-Host "No shrinkable drives found on Disk $DiskNumber." -ForegroundColor Red
@@ -880,8 +886,6 @@ if ($mode -eq "FreeSpace") {
 
     $ShrinkGB = Prompt-DevDriveSizeGB -MaxGB $realMaxShrinkableGB -Subject 'Shrink amount'
     $SizeGB = $ShrinkGB  # The Dev Drive fills exactly the space that was freed
-
-    $creationMethod = "Shrink Drive $DriveLetter ($driveLabel) by $ShrinkGB GB to create $ShrinkGB GB Dev Drive"
 } else { # Vhdx
     # Compile the interop now rather than after every question, so a machine that forbids Add-Type
     # fails before the user has answered anything.
@@ -896,13 +900,11 @@ if ($mode -eq "FreeSpace") {
 # Ask about BitLocker encryption
 $enableBitLocker = Prompt-BitLockerChoice -VhdxMode:($mode -eq "Vhdx")
 $SkipBitLocker = -not $enableBitLocker
-$bitLockerChoice = if ($enableBitLocker) { "Enable BitLocker encryption" } else { "Skip BitLocker encryption" }
 
 # Ask about deduplication
 $dedupChoice = Prompt-DeduplicationChoice
 if ($dedupChoice -eq "None") {
     $SkipDeduplication = $true
-    $deduplicationChoice = "Skip deduplication"
 } elseif ($dedupChoice -eq "DedupAndCompress") {
     $DedupMode = $dedupChoice
 
@@ -912,15 +914,12 @@ if ($dedupChoice -eq "None") {
     # Ask for compression level if ZSTD is selected
     if ($CompressionFormat -eq "ZSTD") {
         $CompressionLevel = Prompt-CompressionLevel
-        $deduplicationChoice = "Enable deduplication with ZSTD compression (level $CompressionLevel)"
         Write-Host "Selected ZSTD compression with level $CompressionLevel" -ForegroundColor Green
     } else {
-        $deduplicationChoice = "Enable deduplication with LZ4 compression"
         Write-Host "Selected LZ4 compression" -ForegroundColor Green
     }
 } else {
     $DedupMode = $dedupChoice
-    $deduplicationChoice = "Enable deduplication only (no compression)"
     Write-Host "Selected deduplication only (no compression)" -ForegroundColor Green
 }
 
@@ -979,6 +978,9 @@ if ($confirmation -notmatch "^(yes|y)$") {
 }
 
 Write-Host "`nStarting Dev Drive creation..." -ForegroundColor Green
+
+# Set before the try so the error handler below can read it even when the run fails before the attach.
+$VhdxAtBootGranted = $false
 
 try {
     if ($mode -eq "FreeSpace") {
@@ -1207,25 +1209,27 @@ try {
             $dedupTasks = Get-ScheduledTask | Where-Object {$_.TaskPath -Like "\Microsoft\Windows\ReFsDedupSvc\" -And $_.TaskName -ne "Initialization" -And $_.State -ne "Disabled"}
 
             $configuredTasks = 0
+            $taskFailures = @()
             foreach ($task in $dedupTasks) {
                 try {
                     $task.Settings.DisallowStartIfOnBatteries = $true
                     $task.Settings.StopIfGoingOnBatteries = $true
-                    $task | Set-ScheduledTask | Out-Null
-                    $lec = $LASTEXITCODE
-                    # Write-Host "$task.TaskName change result: $lec"
-                    if ($lec -eq 0) {
-                        $configuredTasks++
-                    }
+                    $task | Set-ScheduledTask -ErrorAction Stop | Out-Null
+                    $configuredTasks++
                 }
                 catch {
-                    # Continue with other tasks if one fails
+                    # One task's failure must not stop the others, but it must not pass unseen either.
+                    $taskFailures += "$($task.TaskName): $($_.Exception.Message)"
                 }
             }
 
             if ($configuredTasks -gt 0) {
                 Write-Host "Successfully configured $configuredTasks deduplication task(s) to run only on AC power" -ForegroundColor Green
-            } else {
+            }
+            foreach ($failure in $taskFailures) {
+                Write-Host "Could not set AC power only on task $failure" -ForegroundColor Yellow
+            }
+            if ($configuredTasks -eq 0 -and $taskFailures.Count -eq 0) {
                 Write-Host "No deduplication tasks were found to configure. Tasks will run on any power source." -ForegroundColor Yellow
             }
         }
