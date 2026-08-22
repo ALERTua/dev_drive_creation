@@ -1306,7 +1306,7 @@ if ($mode -eq "Vhdx") {
     if ($VhdxAutoAttach) {
         Write-Host "* Register the virtual disk to be mounted on every Windows startup" -ForegroundColor White
     } else {
-        Write-Host "* Skip automatic mounting; the Dev Drive is gone after every restart until mounted by hand" -ForegroundColor White
+        Write-Host "* Skip automatic mounting; the Dev Drive mount point is gone after every restart until mounted by hand" -ForegroundColor White
     }
 } else {
     Write-Host "* Create $SizeGB GB Dev Drive on Disk $DiskNumber ($selectedDiskName) using ReFS" -ForegroundColor White
