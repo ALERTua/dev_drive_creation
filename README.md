@@ -41,6 +41,7 @@ This script runs in interactive mode and will guide you through the entire Dev D
 4. **BitLocker Setup**: Optional encryption, with the recovery key shown and acknowledged
 5. **Deduplication Options**: Choose deduplication level and compression settings
 6. **Compression Configuration**: Select format (LZ4/ZSTD) and level (1-9 for ZSTD)
+7. **Deduplication Schedule**: Keep the suggested times, or set them yourself
 
 In virtual hard disk mode, step 2 is skipped; instead you are asked for the file path, the disk
 type, the size and whether to mount the file automatically on startup. There is no press-Enter-for-
@@ -216,7 +217,15 @@ E           DevDrive     ReFS           Fixed     Healthy      OK               
    - Choose deduplication level (none, deduplication-only, or with compression)
    - Select compression format (LZ4 for speed, ZSTD for better compression)
    - Configure compression level (1-9 for ZSTD, affects CPU usage)
-   - Jobs automatically scheduled to run only on AC power
+   - Keep the suggested schedule, or set three fields yourself: the daily start times
+     (comma separated, 24-hour HH:MM, up to four), the weekly maintenance day, and its start time
+   - Each of the three takes Enter to keep the value shown; choosing your own times gets the
+     result repeated back, taking the defaults does not
+   - The daily job's days, its two-hour limit, its 60% CPU share and its AC-power condition
+     are fixed and are not asked about
+   - After the jobs are created the script says where to change the times later, in Task
+     Scheduler under Microsoft > Windows > ReFsDedupSvc
+   - The daily jobs are automatically scheduled to run only on AC power
 
 6. **Dev Drive Creation & Setup**
    - Creates ReFS-formatted Dev Drive with selected size
@@ -314,11 +323,12 @@ against a deduplicated Dev Drive without a backup.
 
 ## Scheduled Jobs
 
-The script creates two daily deduplication jobs that run **only on AC power**:
-- 11:00 AM (2 hours duration)
-- 5:00 PM (2 hours duration)
+By default the script creates two daily deduplication jobs and one weekly maintenance job:
+- 11:00 AM and 5:00 PM daily, Monday-Friday, **only on AC power** (2 hours duration, 60% CPU limit each)
+- Monday at 5:30 PM weekly (maintenance pass, every week)
 
-Jobs run Monday-Friday with 60% CPU limit to preserve battery life on laptops.
+The daily start times, the weekly maintenance day and its start time are asked for during the run,
+so there is no need to edit the script to move them. Everything else about the jobs is fixed.
 
 ## Development
 
