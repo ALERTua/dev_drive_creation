@@ -154,6 +154,13 @@ function ConvertTo-FlooredGB {
     return [math]::Floor($Bytes / 1GB * 100) / 100
 }
 
+function ConvertTo-CeilingedGB {
+    # Ceiling, never round: a displayed minimum must never read below the real one.
+    param([Parameter(Mandatory)][double]$Bytes)
+    if ($Bytes -le 0) { return 0 }
+    return [math]::Ceiling($Bytes / 1GB * 100) / 100
+}
+
 function Get-VhdxAlignedSize {
     # A .vhdx virtual size must be a whole number of sectors, so a fractional GB has to be trimmed.
     param([Parameter(Mandatory)][uint64]$SizeBytes)
@@ -1063,6 +1070,26 @@ function Request-AutoAttachChoice {
     }
 }
 
+function Resolve-RerunAdvice {
+    <#
+        What the closing failure message says about running again. A run never resumes - it always
+        starts from the beginning - so shrink mode has to warn when a resize already happened.
+    #>
+    param([AllowNull()][AllowEmptyString()][string]$ShrunkDriveLetter)
+
+    $lines = @(
+        "Check the error above, undo whatever this run already changed, and only then run it again."
+        "This script does not resume: every run starts from the beginning."
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($ShrunkDriveLetter)) {
+        $lines += "Drive ${ShrunkDriveLetter}: has already been shrunk."
+        $lines += "Running again with the same answer takes that much off it a second time."
+    }
+
+    return $lines
+}
+
 Write-Host "Dev Drive creation script with BitLocker encryption and ReFS deduplication." -ForegroundColor Green
 
 # Check Windows version. Read in two steps: a missing value leaves nothing to take CurrentBuild off.
@@ -1385,6 +1412,8 @@ Write-Host "`nStarting Dev Drive creation..." -ForegroundColor Green
 $VhdxAtBootGranted = $false
 # Repeated at the end: printed once at attach time, it scrolls away behind formatting and dedup.
 $VhdxMountAdvice = @()
+# The catch below reads this to know whether a shrink already resized a partition.
+$ShrunkDriveLetter = $null
 
 try {
     if ($mode -eq "FreeSpace") {
@@ -1430,6 +1459,7 @@ try {
             # We already have the partition info from the shrinkable size check
             $diskNum = $partitionInfo.DiskNumber
             $maxSize = $supportedSizes.SizeMax
+            $minSize = $supportedSizes.SizeMin
             Write-Host "Using previously retrieved partition information for drive $DriveLetter" -ForegroundColor Green
         } else {
             # Fallback: get partition info if we couldn't get it earlier
@@ -1438,17 +1468,21 @@ try {
             $diskNum = $partitionInfo.DiskNumber
             $supportedSizes = $partitionInfo | Get-PartitionSupportedSize -ErrorAction Stop
             $maxSize = $supportedSizes.SizeMax
+            $minSize = $supportedSizes.SizeMin
         }
 
-        Write-Host "Maximum size for $DriveLetter`: $([math]::Round($maxSize / 1GB, 2)) GB" -ForegroundColor Green
+        Write-Host "Maximum size for $DriveLetter`: $(ConvertTo-FlooredGB -Bytes $maxSize) GB" -ForegroundColor Green
         $targetSize = $maxSize - [math]::Round($ShrinkGB * 1GB, 2)
-        Write-Host "Target size after shrinking: $([math]::Round($targetSize / 1GB, 2)) GB" -ForegroundColor Green
-        if ($targetSize -lt 0) {
-            throw "Cannot shrink drive $DriveLetter by $ShrinkGB GB; insufficient space."
+        Write-Host "Target size after shrinking: $(ConvertTo-FlooredGB -Bytes $targetSize) GB" -ForegroundColor Green
+        if ($targetSize -lt $minSize) {
+            Write-Host "Cannot shrink drive $DriveLetter to $(ConvertTo-FlooredGB -Bytes $targetSize) GB; Windows will not take it below $(ConvertTo-CeilingedGB -Bytes $minSize) GB." -ForegroundColor Red
+            Write-Host "Exiting. Please choose a different drive or use free space mode, then run the script again." -ForegroundColor Yellow
+            exit 1
         }
 
-        Write-Host "Resizing Partition $($partitionInfo.PartitionNumber) of disk $diskNum to $([math]::Round($targetSize / 1GB, 2)) GB ..." -ForegroundColor Green
+        Write-Host "Resizing Partition $($partitionInfo.PartitionNumber) of disk $diskNum to $(ConvertTo-FlooredGB -Bytes $targetSize) GB ..." -ForegroundColor Green
         Resize-Partition -DiskNumber $diskNum -PartitionNumber $partitionInfo.PartitionNumber -Size $targetSize -ErrorAction Stop
+        $ShrunkDriveLetter = $DriveLetter
         Write-Host "Shrunk drive $DriveLetter by $ShrinkGB GB" -ForegroundColor Green
 
         # Create Dev Drive from the freed space
@@ -1793,6 +1827,8 @@ catch {
         Write-Host "To remove it: Dismount-DiskImage -ImagePath '$VhdxPath'; Remove-Item -LiteralPath '$VhdxPath'" -ForegroundColor Yellow
     }
 
-    Write-Host "Please check the error message and try again." -ForegroundColor Yellow
+    foreach ($line in (Resolve-RerunAdvice -ShrunkDriveLetter $ShrunkDriveLetter)) {
+        Write-Host $line -ForegroundColor Yellow
+    }
     exit 1
 }

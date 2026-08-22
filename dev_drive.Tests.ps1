@@ -124,6 +124,65 @@ Describe 'The script itself' {
         $adAt | Should -BeGreaterThan $bannerAt
         $backupAt | Should -BeGreaterThan $bannerAt
     }
+
+    It 'never tells the user to just try again' {
+        Select-String -Path $script:ScriptPath -Pattern 'try again' | Should -BeNullOrEmpty
+    }
+
+    It 'checks the target against the size Windows itself reports as the minimum, before it resizes' {
+        $content = Get-Content -Path $script:ScriptPath -Raw
+        $minBoundAt = $content.IndexOf('$minSize = $supportedSizes.SizeMin')
+        $guardAt = $content.IndexOf('if ($targetSize -lt $minSize)')
+        $resizeAt = $content.IndexOf('Resize-Partition -DiskNumber $diskNum')
+        $minBoundAt | Should -BeGreaterThan 0
+        $guardAt | Should -BeGreaterThan $minBoundAt
+        $resizeAt | Should -BeGreaterThan $guardAt
+    }
+
+    It 'ends the run on a plain refusal, not a throw, when the target is below what Windows allows' {
+        # The guard fires before Resize-Partition ever runs, so this must not fall into the catch
+        # that would otherwise warn a shrink already happened.
+        $content = Get-Content -Path $script:ScriptPath -Raw
+        $guardAt = $content.IndexOf('if ($targetSize -lt $minSize)')
+        $blockEnd = $content.IndexOf('Write-Host "Resizing Partition')
+        $guardBlock = $content.Substring($guardAt, $blockEnd - $guardAt)
+        $guardBlock | Should -Not -Match 'throw'
+        $guardBlock | Should -Match 'exit 1'
+    }
+
+    It 'names both the target and the Windows minimum in that refusal with the rounding helpers' {
+        $content = Get-Content -Path $script:ScriptPath -Raw
+        $guardAt = $content.IndexOf('if ($targetSize -lt $minSize)')
+        $blockEnd = $content.IndexOf('Write-Host "Resizing Partition')
+        $guardBlock = $content.Substring($guardAt, $blockEnd - $guardAt)
+        $guardBlock | Should -Match 'ConvertTo-FlooredGB -Bytes \$targetSize'
+        $guardBlock | Should -Match 'ConvertTo-CeilingedGB -Bytes \$minSize'
+    }
+
+    It 'shows the resize target and its sizes with the rounding helpers, not a bare Math.Round' {
+        # Scoped to the try block's resize section, not the earlier drive-selection prompt, which
+        # has its own bare Round calls outside this change's reach.
+        $content = Get-Content -Path $script:ScriptPath -Raw
+        $blockStart = $content.IndexOf('# Use stored partition information to avoid redundant API calls')
+        $blockEnd = $content.IndexOf('# Create Dev Drive from the freed space')
+        $blockStart | Should -BeGreaterThan 0
+        $blockEnd | Should -BeGreaterThan $blockStart
+        $block = $content.Substring($blockStart, $blockEnd - $blockStart)
+        $block | Should -Not -Match '\[math\]::Round\([^)]*/ 1GB, 2\)'
+    }
+
+    It 'records the shrunk drive letter right after the resize, before anything else can throw' {
+        $content = Get-Content -Path $script:ScriptPath -Raw
+        $resizeAt = $content.IndexOf('Resize-Partition -DiskNumber $diskNum -PartitionNumber $partitionInfo.PartitionNumber')
+        $recordAt = $content.IndexOf('$ShrunkDriveLetter = $DriveLetter')
+        $resizeAt | Should -BeGreaterThan 0
+        $recordAt | Should -BeGreaterThan $resizeAt
+    }
+
+    It 'sets the shrunk-drive variable to a known value before the try block that might throw first' {
+        Select-String -Path $script:ScriptPath -Pattern '^\$ShrunkDriveLetter = \$null' |
+            Should -Not -BeNullOrEmpty
+    }
 }
 
 Describe 'Layout of the structures passed to virtdisk.dll' {
@@ -402,6 +461,30 @@ Describe 'ConvertTo-FlooredGB' {
     It 'answers for a byte count far above the Int32 range' {
         # 3.5 TB of free space less the shrink head-room: the size of a real disk, not of an Int32.
         ConvertTo-FlooredGB -Bytes (3.5TB - 5GB) | Should -Be 3579
+    }
+}
+
+Describe 'ConvertTo-CeilingedGB' {
+    It 'ceilings <Bytes> to <Expected> rather than rounding down' -TestCases @(
+        @{ Bytes = 50GB;                   Expected = 50 }
+        @{ Bytes = [uint64](49.001 * 1GB); Expected = 49.01 }
+        @{ Bytes = [uint64](0.001 * 1GB);  Expected = 0.01 }
+        @{ Bytes = 0;                      Expected = 0 }
+    ) {
+        ConvertTo-CeilingedGB -Bytes $Bytes | Should -Be $Expected
+    }
+
+    It 'never reports fewer gigabytes than there are bytes' {
+        $bytes = [uint64](49.001 * 1GB)
+        (ConvertTo-CeilingedGB -Bytes $bytes) * 1GB | Should -BeGreaterOrEqual $bytes
+    }
+
+    It 'reports <Bytes> bytes as 0 rather than as a negative size' -TestCases @(
+        @{ Bytes = -1 }
+        @{ Bytes = -5GB }
+        @{ Bytes = 1GB - 5GB }
+    ) {
+        ConvertTo-CeilingedGB -Bytes $Bytes | Should -Be 0
     }
 }
 
@@ -987,5 +1070,31 @@ Describe 'Resolve-VhdxMountAdvice' {
 
     It 'returns plain lines rather than an object to unwrap' {
         Resolve-VhdxMountAdvice -VhdxPath 'D:\dev.vhdx' | Should -BeOfType [string]
+    }
+}
+
+Describe 'Resolve-RerunAdvice' {
+    It 'says the run does not resume, and never says to just try again' {
+        $lines = (Resolve-RerunAdvice -ShrunkDriveLetter $null) -join "`n"
+        $lines | Should -Match 'does not resume'
+        $lines | Should -Not -Match 'try again'
+    }
+
+    It 'says nothing about a shrunk drive when nothing was shrunk' -TestCases @(
+        @{ ShrunkDriveLetter = $null }
+        @{ ShrunkDriveLetter = '' }
+    ) {
+        $lines = (Resolve-RerunAdvice -ShrunkDriveLetter $ShrunkDriveLetter) -join "`n"
+        $lines | Should -Not -Match 'shrunk'
+    }
+
+    It 'names the shrunk drive and warns a second run takes the same amount off it again' {
+        $lines = (Resolve-RerunAdvice -ShrunkDriveLetter 'C') -join ' '
+        $lines | Should -Match 'Drive C: has already been shrunk'
+        $lines | Should -Match 'off it a second time'
+    }
+
+    It 'returns plain lines rather than an object to unwrap' {
+        Resolve-RerunAdvice -ShrunkDriveLetter $null | Should -BeOfType [string]
     }
 }
