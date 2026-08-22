@@ -132,12 +132,41 @@ Describe 'The script itself' {
         $content | Should -Not -Match '\$ShrinkGB'
     }
 
-    It 'checks the target against the Windows minimum before it resizes' {
+    It 'checks the target against the size Windows itself reports as the minimum, before it resizes' {
         $content = Get-Content -Path $script:ScriptPath -Raw
+        $minBoundAt = $content.IndexOf('$minSize = $supportedSizes.SizeMin')
         $guardAt = $content.IndexOf('if ($targetSize -lt $minSize)')
         $resizeAt = $content.IndexOf('Resize-Partition -DiskNumber $diskNum')
-        $guardAt | Should -BeGreaterThan 0
+        $minBoundAt | Should -BeGreaterThan 0
+        $guardAt | Should -BeGreaterThan $minBoundAt
         $resizeAt | Should -BeGreaterThan $guardAt
+    }
+
+    It 'ends the run on a plain refusal, not a throw, when the target is below what Windows allows' {
+        # The guard fires before Resize-Partition ever runs, so this must not fall into the catch
+        # that warns the disks may already have changed.
+        $content = Get-Content -Path $script:ScriptPath -Raw
+        $guardAt = $content.IndexOf('if ($targetSize -lt $minSize)')
+        $blockEnd = $content.IndexOf('Write-Host "Resizing Partition')
+        $guardBlock = $content.Substring($guardAt, $blockEnd - $guardAt)
+        $guardBlock | Should -Not -Match 'throw'
+        $guardBlock | Should -Match 'exit 1'
+    }
+
+    It 'names the Windows minimum in that refusal with the ceiling helper, not a bare Round' {
+        $content = Get-Content -Path $script:ScriptPath -Raw
+        $guardAt = $content.IndexOf('if ($targetSize -lt $minSize)')
+        $blockEnd = $content.IndexOf('Write-Host "Resizing Partition')
+        $guardBlock = $content.Substring($guardAt, $blockEnd - $guardAt)
+        $guardBlock | Should -Match 'ConvertTo-CeilingedGB -Bytes \$minSize'
+    }
+
+    It 'asks the shrink question with the reworded prompt and a note true under both refusals' {
+        # The note must hold whether Windows' own floor or the Dev Drive minimum is what rejected
+        # the answer, so it names the drive's current size and says nothing about either minimum.
+        $content = Get-Content -Path $script:ScriptPath -Raw
+        $content | Should -Match ([regex]::Escape('-Question "$driveIsNow. Enter the size it should end up as in GB"'))
+        $content | Should -Match ([regex]::Escape('-Note "$driveIsNow. This number is the size the drive should end up as, not an amount to cut from it."'))
     }
 
     It 'never takes the recovery protector id straight off the volume' {
@@ -423,6 +452,30 @@ Describe 'ConvertTo-FlooredGB' {
     It 'answers for a byte count far above the Int32 range' {
         # 3.5 TB of free space less the shrink head-room: the size of a real disk, not of an Int32.
         ConvertTo-FlooredGB -Bytes (3.5TB - 5GB) | Should -Be 3579
+    }
+}
+
+Describe 'ConvertTo-CeilingedGB' {
+    It 'ceilings <Bytes> to <Expected> rather than rounding down' -TestCases @(
+        @{ Bytes = 50GB;                   Expected = 50 }
+        @{ Bytes = [uint64](49.001 * 1GB); Expected = 49.01 }
+        @{ Bytes = [uint64](0.001 * 1GB);  Expected = 0.01 }
+        @{ Bytes = 0;                      Expected = 0 }
+    ) {
+        ConvertTo-CeilingedGB -Bytes $Bytes | Should -Be $Expected
+    }
+
+    It 'never reports fewer gigabytes than there are bytes' {
+        $bytes = [uint64](49.001 * 1GB)
+        (ConvertTo-CeilingedGB -Bytes $bytes) * 1GB | Should -BeGreaterOrEqual $bytes
+    }
+
+    It 'reports <Bytes> bytes as 0 rather than as a negative size' -TestCases @(
+        @{ Bytes = -1 }
+        @{ Bytes = -5GB }
+        @{ Bytes = 1GB - 5GB }
+    ) {
+        ConvertTo-CeilingedGB -Bytes $Bytes | Should -Be 0
     }
 }
 
@@ -1074,20 +1127,6 @@ Describe 'Resolve-ShrinkTargetRange' {
         $second = Resolve-ShrinkTargetRange -CurrentGB $accepted -WindowsMinGB 120 -DevDriveMinGB 50
         (Resolve-DevDriveSizeInput -Answer "$accepted" -MinGB $second.MinTargetGB -MaxGB $second.MaxTargetGB).Rejection |
             Should -Be 'AboveMaximum'
-    }
-}
-
-Describe 'Resolve-FreedSpaceGB' {
-    It 'frees the gap between the size now and the size asked for' {
-        Resolve-FreedSpaceGB -CurrentGB 3613.28 -TargetGB 3414.28 | Should -Be 199
-    }
-
-    It 'frees nothing when the answer is the size the drive already is' {
-        Resolve-FreedSpaceGB -CurrentGB 439 -TargetGB 439 | Should -Be 0
-    }
-
-    It 'keeps the fraction when only one of the two sizes has one' {
-        Resolve-FreedSpaceGB -CurrentGB 500.25 -TargetGB 400 | Should -Be 100.25
     }
 }
 

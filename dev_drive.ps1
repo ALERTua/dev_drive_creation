@@ -154,6 +154,13 @@ function ConvertTo-FlooredGB {
     return [math]::Floor($Bytes / 1GB * 100) / 100
 }
 
+function ConvertTo-CeilingedGB {
+    # Ceiling, never round: a displayed minimum must never read below the real one.
+    param([Parameter(Mandatory)][double]$Bytes)
+    if ($Bytes -le 0) { return 0 }
+    return [math]::Ceiling($Bytes / 1GB * 100) / 100
+}
+
 function Get-VhdxAlignedSize {
     # A .vhdx virtual size must be a whole number of sectors, so a fractional GB has to be trimmed.
     param([Parameter(Mandatory)][uint64]$SizeBytes)
@@ -768,19 +775,6 @@ function Resolve-ShrinkTargetRange {
     return $result
 }
 
-function Resolve-FreedSpaceGB {
-    <#
-        The space a shrink frees, and so the size of the Dev Drive built from it: what the drive
-        measures now, less the size it was told to end up as.
-    #>
-    param(
-        [Parameter(Mandatory)][decimal]$CurrentGB,
-        [Parameter(Mandatory)][decimal]$TargetGB
-    )
-
-    return $CurrentGB - $TargetGB
-}
-
 function Request-DevDriveSizeGB {
     <#
         The one size question for all three creation modes. -Subject names the answer in the
@@ -800,6 +794,7 @@ function Request-DevDriveSizeGB {
     $maxHint = if ($AllowMaxOnEmpty) { "max: $MaxGB, press Enter for max" } else { "max: $MaxGB" }
     $asked = if ($Question) { $Question } else { "Enter $Subject in GB" }
 
+    # Subject opens every refusal, so it must be capitalised.
     while ($true) {
         $answer = Read-Host "$asked (min: $MinGB, $maxHint)"
 
@@ -807,7 +802,6 @@ function Request-DevDriveSizeGB {
             -AllowEmpty:$AllowMaxOnEmpty -MaxIsAdvisory:$MaxIsAdvisory
 
         if ($verdict.Rejection -eq 'NotANumber') {
-            # Subject opens the sentence in all three refusals, so a capitalised one always reads right.
             Write-Host "$Subject must be a positive decimal number. Please try again." -ForegroundColor Red
             continue
         }
@@ -1274,8 +1268,7 @@ if ($mode -eq "FreeSpace") {
                     # Resize-Partition takes a partition size, so prefer the partition's own over the volume's.
                     $currentSizeBytes = if ($partitionInfo) { $partitionInfo.Size } else { $driveOnDisk.Size }
                     if (-not $partitionInfo) {
-                        Write-Host "The partition size is unknown too, so this uses the size of the volume inside it." -ForegroundColor Yellow
-                        Write-Host "A little more than the plan says may be freed, by the few MB the partition holds beyond the volume." -ForegroundColor Yellow
+                        Write-Host "The partition size is unknown too, so this uses the size of the volume inside it; both the freed space and the Dev Drive built from it may come out a few MB larger than planned." -ForegroundColor Yellow
                     }
                     $currentPartitionGB = ConvertTo-FlooredGB -Bytes $currentSizeBytes
                     # Windows never answered: guess its floor as the used space plus the spare.
@@ -1312,8 +1305,8 @@ if ($mode -eq "FreeSpace") {
     $TargetDriveGB = Request-DevDriveSizeGB -MinGB $shrinkRange.MinTargetGB -MaxGB $shrinkRange.MaxTargetGB `
         -Subject "Final size for drive $DriveLetter" `
         -Question "$driveIsNow. Enter the size it should end up as in GB" `
-        -Note "$driveIsNow and has to give up at least $DevDriveMinSizeGB GB for the Dev Drive."
-    $SizeGB = Resolve-FreedSpaceGB -CurrentGB $currentPartitionGB -TargetGB $TargetDriveGB
+        -Note "$driveIsNow. This number is the size the drive should end up as, not an amount to cut from it."
+    $SizeGB = $currentPartitionGB - $TargetDriveGB
 } else { # Vhdx
     # Compile the interop now rather than after every question, so a machine that forbids Add-Type
     # fails before the user has answered anything.
@@ -1505,18 +1498,21 @@ try {
         $maxSize = $supportedSizes.SizeMax
         $minSize = $supportedSizes.SizeMin
 
-        Write-Host "Maximum size for $DriveLetter`: $([math]::Round($maxSize / 1GB, 2)) GB" -ForegroundColor Green
+        Write-Host "Maximum size for $DriveLetter`: $(ConvertTo-FlooredGB -Bytes $maxSize) GB" -ForegroundColor Green
         $targetSize = [math]::Round($TargetDriveGB * 1GB)
-        Write-Host "Target size after shrinking: $([math]::Round($targetSize / 1GB, 2)) GB" -ForegroundColor Green
+        Write-Host "Target size after shrinking: $(ConvertTo-FlooredGB -Bytes $targetSize) GB" -ForegroundColor Green
         if ($targetSize -le 0 -or $targetSize -gt $maxSize) {
             throw "Cannot shrink drive $DriveLetter to $TargetDriveGB GB; that size is not possible for this partition."
         }
         # The estimated path guessed this floor, so it can sit below the one Windows now reports.
+        # Nothing has touched the disk yet, so this exits plainly rather than throwing into the catch.
         if ($targetSize -lt $minSize) {
-            throw "Cannot shrink drive $DriveLetter to $TargetDriveGB GB; Windows will not take it below $([math]::Round($minSize / 1GB, 2)) GB."
+            Write-Host "Cannot shrink drive $DriveLetter to $TargetDriveGB GB; Windows will not take it below $(ConvertTo-CeilingedGB -Bytes $minSize) GB." -ForegroundColor Red
+            Write-Host "Exiting. Please choose a different drive or use free space mode, then run the script again." -ForegroundColor Yellow
+            exit 1
         }
 
-        Write-Host "Resizing Partition $($partitionInfo.PartitionNumber) of disk $diskNum to $([math]::Round($targetSize / 1GB, 2)) GB ..." -ForegroundColor Green
+        Write-Host "Resizing Partition $($partitionInfo.PartitionNumber) of disk $diskNum to $(ConvertTo-FlooredGB -Bytes $targetSize) GB ..." -ForegroundColor Green
         Resize-Partition -DiskNumber $diskNum -PartitionNumber $partitionInfo.PartitionNumber -Size $targetSize -ErrorAction Stop
         Write-Host "Shrunk drive $DriveLetter to $TargetDriveGB GB, freeing $SizeGB GB" -ForegroundColor Green
 
