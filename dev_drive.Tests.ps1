@@ -114,30 +114,16 @@ Describe 'The script itself' {
         $backupAt | Should -BeGreaterThan $bannerAt
     }
 
-    It 'no longer ends a failed run with an unqualified "try again"' {
-        Select-String -Path $script:ScriptPath -Pattern 'Write-Host "Please check the error message and try again\."' |
-            Should -BeNullOrEmpty
-    }
-
-    It 'closes a failed run through Resolve-FailureAdvice' {
+    It 'asks the shrink question as a size to end up as, not as an amount' {
+        # Asking for an amount is the double-shrink defect: the same answer twice takes it twice.
         $content = Get-Content -Path $script:ScriptPath -Raw
-        $content | Should -Match 'Resolve-FailureAdvice -CompletedActions \$CompletedActions'
+        $content | Should -Match '-Subject "the size drive \$DriveLetter`: should end up as"'
+        $content | Should -Not -Match "-Subject 'Shrink amount'"
     }
 
-    It 'says in the plan that a failed shrink run cannot be resumed' {
-        Select-String -Path $script:ScriptPath -Pattern 'instead of carrying on from where it stopped' |
-            Should -Not -BeNullOrEmpty
-    }
-
-    It 'asks about a disk that already holds the space before it shrinks' {
+    It 'shrinks to the size that was asked for' {
         $content = Get-Content -Path $script:ScriptPath -Raw
-        $content | Should -Match 'Test-UnallocatedSpaceCoversRequest -UnallocatedGB \$unallocatedGB'
-        $content | Should -Match 'Request-RepeatedShrinkChoice -DiskNumber \$DiskNumber'
-    }
-
-    It 'records the shrink as a completed change once the resize returns' {
-        $content = Get-Content -Path $script:ScriptPath -Raw
-        $content | Should -Match '(?ms)Resize-Partition[^\r\n]*\r?\n.{0,400}?\$CompletedActions \+='
+        $content | Should -Match '\$targetSize = \[math\]::Round\(\$TargetDriveGB \* 1GB\)'
     }
 
     It 'never takes the recovery protector id straight off the volume' {
@@ -998,90 +984,73 @@ Describe 'Resolve-VhdxMountAdvice' {
     }
 }
 
-
-Describe 'Resolve-FailureAdvice' {
-    It 'still says try again while nothing has been changed' {
-        $advice = Resolve-FailureAdvice -CompletedActions @()
-        $advice.Lines | Should -HaveCount 1
-        $advice.Lines[0] | Should -Be 'Please check the error message and try again.'
+Describe 'Resolve-ShrinkTargetRange' {
+    It 'offers every size between the Windows minimum and a whole Dev Drive freed' {
+        $range = Resolve-ShrinkTargetRange -CurrentGB 500 -WindowsMinGB 120 -DevDriveMinGB 50
+        $range.Rejection | Should -BeNullOrEmpty
+        $range.MinTargetGB | Should -Be 120
+        $range.MaxTargetGB | Should -Be 450
+        $range.MaxFreeableGB | Should -Be 380
     }
 
-    It 'treats no list at all the same way' {
-        (Resolve-FailureAdvice -CompletedActions $null).Lines[0] |
-            Should -Be 'Please check the error message and try again.'
+    It 'rounds the Windows minimum up, never down' {
+        $range = Resolve-ShrinkTargetRange -CurrentGB 500 -WindowsMinGB 120.01 -DevDriveMinGB 50
+        $range.MinTargetGB | Should -Be 121
+        $range.MaxFreeableGB | Should -Be 379
     }
 
-    It 'stops saying try again once the disk has been changed' {
-        $advice = Resolve-FailureAdvice -CompletedActions @('Shrunk drive D: by 199 GB')
-        ($advice.Lines -join "`n") | Should -Not -Match 'try again'
+    It 'accepts a drive that can free exactly one Dev Drive' {
+        $range = Resolve-ShrinkTargetRange -CurrentGB 170 -WindowsMinGB 120 -DevDriveMinGB 50
+        $range.Rejection | Should -BeNullOrEmpty
+        $range.MaxTargetGB | Should -Be $range.MinTargetGB
     }
 
-    It 'lists every change the run had finished' {
-        $advice = Resolve-FailureAdvice -CompletedActions @('Shrunk drive D: by 199 GB', 'Formatted E: as a Dev Drive')
-        ($advice.Lines -join "`n") | Should -Match '  - Shrunk drive D: by 199 GB'
-        ($advice.Lines -join "`n") | Should -Match '  - Formatted E: as a Dev Drive'
+    It 'refuses a drive that is one gigabyte short of a Dev Drive' {
+        $range = Resolve-ShrinkTargetRange -CurrentGB 169 -WindowsMinGB 120 -DevDriveMinGB 50
+        $range.Rejection | Should -Be 'BelowDevDriveMinimum'
+        $range.MaxFreeableGB | Should -Be 49
     }
 
-    It 'says that running the script again starts over' {
-        $advice = Resolve-FailureAdvice -CompletedActions @('Formatted E: as a Dev Drive')
-        ($advice.Lines -join "`n") | Should -Match 'does not carry on from here'
+    It 'refuses a drive already at the smallest size Windows allows' {
+        $range = Resolve-ShrinkTargetRange -CurrentGB 120 -WindowsMinGB 120 -DevDriveMinGB 50
+        $range.Rejection | Should -Be 'BelowDevDriveMinimum'
+        $range.MaxFreeableGB | Should -Be 0
     }
 
-    It 'spells out what a second shrink of the same drive would cost' {
-        $advice = Resolve-FailureAdvice -CompletedActions @('Shrunk drive D: by 199 GB') -ShrunkDrive 'D:' -ShrunkGB 199
-        ($advice.Lines -join "`n") | Should -Match 'Shrinking drive D: by 199 GB again would take a further 199 GB'
+    It 'never reports a negative amount as freeable' {
+        # Rounding the minimum up can put it above a partition that is already at its floor.
+        $range = Resolve-ShrinkTargetRange -CurrentGB 120.2 -WindowsMinGB 120.2 -DevDriveMinGB 50
+        $range.MaxFreeableGB | Should -Be 0
+        $range.Rejection | Should -Be 'BelowDevDriveMinimum'
     }
 
-    It 'says nothing about shrinking when no shrink happened' {
-        $advice = Resolve-FailureAdvice -CompletedActions @('Created the virtual hard disk file D:\dev.vhdx')
-        ($advice.Lines -join "`n") | Should -Not -Match 'Shrinking drive'
-    }
-}
-
-Describe 'Test-UnallocatedSpaceCoversRequest' {
-    It 'answers <Expected> for <UnallocatedGB> GB unallocated against a <RequestedGB> GB request' -TestCases @(
-        @{ UnallocatedGB = 199;    RequestedGB = 199; Expected = $true }
-        @{ UnallocatedGB = 250;    RequestedGB = 199; Expected = $true }
-        # A shrink lands on an alignment boundary, so the gap can be a hair under the amount typed.
-        @{ UnallocatedGB = 198.99; RequestedGB = 199; Expected = $true }
-        @{ UnallocatedGB = 198;    RequestedGB = 199; Expected = $true }
-        # Ten gigabytes short is a different disk layout, not alignment.
-        @{ UnallocatedGB = 190;    RequestedGB = 199; Expected = $false }
-        @{ UnallocatedGB = 50;     RequestedGB = 199; Expected = $false }
-        @{ UnallocatedGB = 0;      RequestedGB = 199; Expected = $false }
-    ) {
-        Test-UnallocatedSpaceCoversRequest -UnallocatedGB $UnallocatedGB -RequestedGB $RequestedGB |
-            Should -Be $Expected
-    }
-
-    It 'never asks about a request of nothing' {
-        Test-UnallocatedSpaceCoversRequest -UnallocatedGB 100 -RequestedGB 0 | Should -BeFalse
+    It 'puts the answer of a run that already shrank out of range on the next run' {
+        $first = Resolve-ShrinkTargetRange -CurrentGB 500 -WindowsMinGB 120 -DevDriveMinGB 50
+        $first.MaxTargetGB | Should -BeGreaterOrEqual 439
+        $second = Resolve-ShrinkTargetRange -CurrentGB 439 -WindowsMinGB 120 -DevDriveMinGB 50
+        $second.MaxTargetGB | Should -BeLessThan 439
     }
 }
 
-Describe 'Measure-AllocatedPartitionSize' {
-    It 'counts a <Description>' -TestCases @(
-        @{ Description = 'basic data partition'
-           Partition = [PSCustomObject]@{ Type = 'Basic'; DriveLetter = 'D'; Size = 100GB }; Expected = 100GB }
-        @{ Description = 'reserved partition that carries a drive letter'
-           Partition = [PSCustomObject]@{ Type = 'Reserved'; DriveLetter = 'S'; Size = 1GB }; Expected = 1GB }
-        @{ Description = 'reserved partition with no drive letter, which it leaves out'
-           Partition = [PSCustomObject]@{ Type = 'Reserved'; DriveLetter = $null; Size = 1GB }; Expected = 0 }
-    ) {
-        Measure-AllocatedPartitionSize -Partition @($Partition) | Should -Be $Expected
+Describe 'Request-DevDriveSizeGB' {
+    BeforeEach {
+        $script:answers = @('600', '400')
+        $script:index = 0
+        $script:said = @()
+        Mock Read-Host { $script:answers[$script:index++] }
+        Mock Write-Host { $script:said += $Object }
     }
 
-    It 'adds up the partitions it counts' {
-        $partitions = @(
-            [PSCustomObject]@{ Type = 'Basic';    DriveLetter = 'C';   Size = 200GB }
-            [PSCustomObject]@{ Type = 'Reserved'; DriveLetter = $null; Size = 1GB }
-            [PSCustomObject]@{ Type = 'Dynamic';  DriveLetter = $null; Size = 50GB }
-        )
-        Measure-AllocatedPartitionSize -Partition $partitions | Should -Be 250GB
+    It 'adds the note under the refusal of a too-large answer' {
+        Request-DevDriveSizeGB -MinGB 120 -MaxGB 450 -Subject 'the size drive D: should end up as' `
+            -MaxNote 'Drive D: is 500 GB now.' | Should -Be 400
+        $script:said | Should -HaveCount 2
+        $script:said[1] | Should -Be 'Drive D: is 500 GB now.'
     }
 
-    It 'answers nothing for a disk with no partitions' {
-        Measure-AllocatedPartitionSize -Partition @() | Should -Be 0
-        Measure-AllocatedPartitionSize -Partition $null | Should -Be 0
+    It 'refuses without a second line when no note was given' {
+        Request-DevDriveSizeGB -MinGB 120 -MaxGB 450 -Subject 'Dev Drive size' | Should -Be 400
+        $script:said | Should -HaveCount 1
+        $script:said[0] | Should -Match 'cannot exceed 450 GB'
     }
 }

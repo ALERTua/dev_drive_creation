@@ -95,12 +95,13 @@ Selected Drive D: ALERT (842.78 GB free)
 Getting Partition shrinkable size information (this may take ~30 seconds)...
 Shrinkable size information:
   Current partition size: 3613.28 GB                                                                         
-  Minimum partition size: 2796.92 GB                                                                         
-  Maximum shrinkable: 816.36 GB                                                                              
+  Smallest size Windows allows: 2797 GB                                                                      
+  Maximum shrinkable: 816.28 GB                                                                              
                                                                                                              
 Note: Windows allows shrinking by the size of starting from the end of the drive disk space to the nearest written file block. Disk Fragmentation can affect this. If Windows does not allow for a drive to be shrunk, please use third-party tools (e.g. AOMEI).                                                                      
                                                                                                              
-Enter Shrink amount in GB (min: 50, max: 816.36): 199                                                
+Drive D: is 3613.28 GB now.                                                                          
+Enter the size drive D: should end up as in GB (min: 2797, max: 3563.28): 3414.28                    
                                                                                                              
 Do you want to enable BitLocker encryption for the Dev Drive?                                                
 BitLocker provides security but may impact performance.
@@ -136,10 +137,8 @@ Selected ZSTD compression with level 2
                         DEV DRIVE CREATION PLAN
 ===============================================================================
 
-* Shrink Drive D (ALERT) by 199 GB to free up space
-  (a run that fails after this point cannot be resumed: running the script again shrinks
-   D: by a further 199 GB instead of carrying on from where it stopped)
-* Create 199 GB Dev Drive on Disk 1 (CT4000P3PSSD8) using ReFS
+* Shrink Drive D (ALERT) from 3613.28 GB to 3414.28 GB, freeing 199.00 GB
+* Create 199.00 GB Dev Drive on Disk 1 (CT4000P3PSSD8) using ReFS
 * Enable ReFS deduplication with ZSTD compression (level 2)
 * Schedule daily optimization jobs at 11:00 and 17:00 (AC power only)
 * Schedule weekly maintenance job every Monday at 17:30
@@ -158,7 +157,7 @@ Using previously retrieved partition information for drive D
 Maximum size for D: 3613.28 GB
 Target size after shrinking: 3414.28 GB
 Resizing Partition 2 of disk 1 to 3414.28 GB ...
-Shrunk drive D by 199 GB
+Shrunk drive D to 3414.28 GB, freeing 199.00 GB
 Creating a new partition from the freed space on disk 1
 Formatting the newly created partition drive E: to a Dev Drive
 
@@ -190,9 +189,9 @@ E           DevDrive     ReFS           Fixed     Healthy      OK               
 
 1. **Creation Method Selection**
    - **Free Space Mode**: Uses unallocated space on a physical drive
-   - **Shrink Mode**: Shrinks an existing logical drive to create space. A run that fails after
-     the shrink cannot be resumed: starting the script again shrinks the same drive by the same
-     amount a second time, so check the disk in Disk Management before repeating it
+   - **Shrink Mode**: Shrinks an existing logical drive to create space. You are asked for the
+     size the drive should end up as, not for an amount to take off it, so answering with the
+     same size again after a failed run leaves the drive alone instead of shrinking it twice
    - **Virtual Hard Disk Mode**: Creates a `.vhdx` file on an existing volume
 
 2. **Drive Discovery & Selection**
