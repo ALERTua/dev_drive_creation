@@ -148,7 +148,9 @@ function Get-Win32ErrorText {
 
 function ConvertTo-FlooredGB {
     # Floor, never round: a displayed maximum must never exceed the real one.
+    # A volume with nothing to give reads as 0, not as a negative.
     param([Parameter(Mandatory)][double]$Bytes)
+    if ($Bytes -le 0) { return 0 }
     return [math]::Floor($Bytes / 1GB * 100) / 100
 }
 
@@ -747,14 +749,19 @@ function Resolve-ShrinkTargetRange {
         [Parameter(Mandatory)][decimal]$DevDriveMinGB
     )
 
-    # Ceiling, never round: an answer below what Windows reported as the minimum is refused by Resize-Partition.
-    $minTargetGB = [math]::Ceiling($WindowsMinGB)
+    # Ceiling, never round: Resize-Partition refuses anything below the reported minimum.
+    $minTargetGB = [decimal][math]::Ceiling($WindowsMinGB)
+
+    # Kept decimal, and clamped without Math.Max: a bare zero there would bind the Int32
+    # overload and round the answer up, which is what this figure must never do.
+    $freeableGB = $CurrentGB - $minTargetGB
+    if ($freeableGB -lt 0) { $freeableGB = [decimal]0 }
 
     $result = [PSCustomObject]@{
         Rejection     = $null
         MinTargetGB   = $minTargetGB
         MaxTargetGB   = $CurrentGB - $DevDriveMinGB
-        MaxFreeableGB = [math]::Max(0, $CurrentGB - $minTargetGB)
+        MaxFreeableGB = $freeableGB
     }
     if ($result.MaxTargetGB -lt $minTargetGB) {
         $result.Rejection = 'BelowDevDriveMinimum'
@@ -1112,6 +1119,9 @@ $DevDriveMinSizeGB = 50
 # Head-room kept on the volume hosting a fixed size .vhdx, so it is never filled to the last byte.
 $VhdxHostSpareBytes = 1GB
 
+# Head-room left on a shrunk volume, so an estimate never offers to take its last free byte.
+$ShrinkSpareBytes = 5GB
+
 # Set default values for deduplication and compression settings
 $DedupMode = 'Dedup'
 $CompressionFormat = 'LZ4'
@@ -1207,7 +1217,8 @@ if ($mode -eq "FreeSpace") {
         # Not $sizeGB: names are case-insensitive here, and $SizeGB is the Dev Drive size.
         $volSizeGB = [math]::Round($vol.Size / 1GB, 2)
         $freeGB = [math]::Round($vol.SizeRemaining / 1GB, 2)
-        $shrinkableGB = [math]::Max(0, $freeGB - 5)
+        # From bytes, not from the already-rounded $freeGB, so the listed figure is never above the real one.
+        $shrinkableGB = ConvertTo-FlooredGB -Bytes ($vol.SizeRemaining - $ShrinkSpareBytes)
 
         Write-Host "  Drive $letter`: $($vol.FileSystemLabel)" -ForegroundColor Yellow
         Write-Host "    Total: $volSizeGB GB | Free: $freeGB GB | Shrinkable: ~$shrinkableGB GB" -ForegroundColor White
@@ -1246,8 +1257,9 @@ if ($mode -eq "FreeSpace") {
                 catch {
                     Write-Host "Could not determine real shrinkable size. Using estimated values." -ForegroundColor Yellow
                     $currentPartitionGB = ConvertTo-FlooredGB -Bytes $driveOnDisk.Size
-                    # Windows never answered, so its floor is guessed: everything but the free space, less 5 GB headroom.
-                    $estimatedMinBytes = $driveOnDisk.Size - [math]::Max(0, $driveOnDisk.SizeRemaining - (5 * 1GB))
+                    # Windows never answered: guess its floor as the used space plus the spare.
+                    # Left free to go negative, so a volume with less spare than that is refused below.
+                    $estimatedMinBytes = $driveOnDisk.Size - ($driveOnDisk.SizeRemaining - $ShrinkSpareBytes)
                     $shrinkRange = Resolve-ShrinkTargetRange -CurrentGB $currentPartitionGB `
                         -WindowsMinGB ($estimatedMinBytes / 1GB) -DevDriveMinGB $DevDriveMinSizeGB
                     Write-Host "Estimated maximum shrinkable: $($shrinkRange.MaxFreeableGB) GB" -ForegroundColor Green

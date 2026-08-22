@@ -87,9 +87,9 @@ Selected Disk 1: CT4000P3PSSD8
 === SELECT DRIVE TO SHRINK ===                                                                               
 Available drives on Disk 1 for shrinking:
   Drive D: ALERT
-    Total: 3613.28 GB | Free: 842.78 GB | Shrinkable: ~838 GB
+    Total: 3613.28 GB | Free: 842.78 GB | Shrinkable: ~837.78 GB
   Drive V: dev
-    Total: 112.69 GB | Free: 76.89 GB | Shrinkable: ~72 GB
+    Total: 112.69 GB | Free: 76.89 GB | Shrinkable: ~71.89 GB
 Enter drive letter to shrink: D
 Selected Drive D: ALERT (842.78 GB free)
 Getting Partition shrinkable size information (this may take ~30 seconds)...
