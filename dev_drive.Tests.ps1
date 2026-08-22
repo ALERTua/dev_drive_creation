@@ -89,15 +89,23 @@ Describe 'The script itself' {
 
     # A user who picked their own times was shown 11:00 and 17:00 in the plan, because the line was
     # a literal. Only the source can be checked: the plan is printed by the linear part.
-    It 'builds the plan summary schedule lines with the same formatter as the schedule question' {
+    It 'asks the schedule question only inside the SkipDeduplication guard, then stores the answer' {
         $content = Get-Content -Path $script:ScriptPath -Raw
-        $content | Should -Match 'Format-DedupScheduleSummary -DailyTimes \$DedupStartTimes'
-        $content | Should -Not -Match '\* Schedule daily optimization jobs at 11:00 and 17:00'
+        $content | Should -Match ('(?ms)if \(-not \$SkipDeduplication\) \{\s*\r?\n\s*' +
+            '\$dedupSchedule = Request-DedupSchedule .*?\r?\n\s*' +
+            '\$DedupStartTimes = \$dedupSchedule\.DailyTimes\s*\r?\n\s*' +
+            '\$ScrubDays = \$dedupSchedule\.WeeklyDay\s*\r?\n\s*' +
+            '\$ScrubStart = \$dedupSchedule\.WeeklyStart\s*\r?\n\s*\}')
     }
 
-    It 'schedules the daily jobs from the same variable the plan summary shows' {
+    It 'builds the plan summary, schedules and reminds using the chosen values, not a literal or a stale default' {
         $content = Get-Content -Path $script:ScriptPath -Raw
+        $content | Should -Not -Match '\* Schedule daily optimization jobs at 11:00 and 17:00'
+        $content | Should -Match 'Format-DedupScheduleSummary -DailyTimes \$DedupStartTimes'
         $content | Should -Match 'foreach \(\$time in \$DedupStartTimes\)'
+        $content | Should -Match 'Set-ReFSDedupScrubSchedule -Volume "\$devLetterColon" -Days \$ScrubDays -Start \$ScrubStart'
+        $content | Should -Match ('(?ms)Resolve-DedupScheduleReminder -DailyTimes \$DedupStartTimes .*?' +
+            '-WeeklyDay \$ScrubDays -WeeklyStart \$ScrubStart')
     }
 
     It 'checks the fsutil devdrv trust exit code before declaring the drive trusted' {
@@ -1176,6 +1184,7 @@ Describe 'Resolve-DedupTimeListInput' {
         @{ Answer = '11:00,25:00';    Rejection = 'InvalidTime' }
         @{ Answer = '11:00,,17:00';   Rejection = 'InvalidTime' }
         @{ Answer = '11:00,17:00,';   Rejection = 'InvalidTime' }
+        @{ Answer = '11:00,,,,17:00'; Rejection = 'InvalidTime' }
         @{ Answer = '11:00,11:00';    Rejection = 'DuplicateTime' }
         @{ Answer = '8:15,08:15';     Rejection = 'DuplicateTime' }
         @{ Answer = '1:00,2:00,3:00,4:00,5:00'; Rejection = 'TooMany' }
@@ -1390,6 +1399,18 @@ Describe 'Request-DedupSchedule' {
         $chosen = Request-DedupSchedule -DailyTimes @('11:00', '17:00') -DailyDaysLabel 'Monday-Friday' `
             -WeeklyDay 'Monday' -WeeklyStart '17:30' -WeeksInterval 1 -DailyDurationHours 2 -DailyCpuPercent 60
         $chosen.DailyTimes | Should -Be @('08:15')
+    }
+
+    It 'gives the real reason for the daily-time cap, not a claim about overlap' {
+        $script:answers = @('2', '1:00,2:00,3:00,4:00,5:00', '08:15', 'Tue', '07:30')
+        $script:index = 0
+        Mock Read-Host { $script:answers[$script:index++] }
+        Request-DedupSchedule -DailyTimes @('11:00', '17:00') -DailyDaysLabel 'Monday-Friday' `
+            -WeeklyDay 'Monday' -WeeklyStart '17:30' -WeeksInterval 1 -DailyDurationHours 2 -DailyCpuPercent 60 |
+            Out-Null
+        Should -Invoke Write-Host -ParameterFilter {
+            $Object -match 'own scheduled task' -and $Object -notmatch 'Overlap'
+        }
     }
 
     It 'says the daily job, not both jobs, run on mains power for a duration and CPU cap it names' {

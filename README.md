@@ -221,11 +221,11 @@ E           DevDrive     ReFS           Fixed     Healthy      OK               
      (comma separated, 24-hour HH:MM, up to four), the weekly maintenance day, and its start time
    - Each of the three takes Enter to keep the value shown; choosing your own times gets the
      result repeated back, taking the defaults does not
-   - The days the daily job runs, the two-hour limit, the 60% CPU share and the AC-power
-     condition are fixed and are not asked about
+   - The daily job's days, its two-hour limit, its 60% CPU share and its AC-power condition
+     are fixed and are not asked about
    - After the jobs are created the script says where to change the times later, in Task
      Scheduler under Microsoft > Windows > ReFsDedupSvc
-   - Jobs automatically scheduled to run only on AC power
+   - The daily jobs are automatically scheduled to run only on AC power
 
 6. **Dev Drive Creation & Setup**
    - Creates ReFS-formatted Dev Drive with selected size
@@ -323,9 +323,8 @@ against a deduplicated Dev Drive without a backup.
 
 ## Scheduled Jobs
 
-By default the script creates two daily deduplication jobs and one weekly maintenance job, all
-running **only on AC power**:
-- 11:00 AM and 5:00 PM daily, Monday-Friday (2 hours duration, 60% CPU limit each)
+By default the script creates two daily deduplication jobs and one weekly maintenance job:
+- 11:00 AM and 5:00 PM daily, Monday-Friday, **only on AC power** (2 hours duration, 60% CPU limit each)
 - Monday at 5:30 PM weekly (maintenance pass, every week)
 
 The daily start times, the weekly maintenance day and its start time are asked for during the run,

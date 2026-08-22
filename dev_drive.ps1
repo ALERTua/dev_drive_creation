@@ -757,11 +757,6 @@ function Resolve-DedupTimeListInput {
         $result.Rejection = 'Empty'
         return $result
     }
-    if ($entries.Count -gt $MaxTimes) {
-        # More entries than this create overlapping jobs rather than a useful schedule.
-        $result.Rejection = 'TooMany'
-        return $result
-    }
 
     $times = @()
     foreach ($entry in $entries) {
@@ -776,6 +771,12 @@ function Resolve-DedupTimeListInput {
             return $result
         }
         $times += $verdict.Time
+    }
+
+    if ($times.Count -gt $MaxTimes) {
+        # Count only entries that survived validation, so a stray comma is not blamed on this.
+        $result.Rejection = 'TooMany'
+        return $result
     }
 
     $result.Times = @($times | Sort-Object)
@@ -930,7 +931,7 @@ function Request-DedupSchedule {
                 continue
             }
             if ($verdict.Rejection -eq 'TooMany') {
-                Write-Host "Too many times. Overlapping jobs waste effort; enter at most $maxDailyTimes." -ForegroundColor Red
+                Write-Host "Too many times. Each start time becomes its own scheduled task; enter at most $maxDailyTimes." -ForegroundColor Red
                 continue
             }
 
