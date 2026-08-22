@@ -933,3 +933,35 @@ Describe 'Request-BitLockerFailureChoice' {
         $script:index | Should -Be 4
     }
 }
+
+Describe 'Resolve-VhdxMountAdvice' {
+    It 'says nothing about mounting by hand when Windows does it' {
+        $lines = (Resolve-VhdxMountAdvice -VhdxPath 'D:\dev.vhdx' -AutoAttachRequested -AutoAttachGranted) -join "`n"
+        $lines | Should -Match 'automatically on every startup'
+        $lines | Should -Not -Match 'Mount-DiskImage'
+    }
+
+    It 'gives the command when the user declined automatic mounting' {
+        $lines = (Resolve-VhdxMountAdvice -VhdxPath 'D:\dev.vhdx') -join "`n"
+        $lines | Should -Match 'You chose to mount this Dev Drive yourself'
+        $lines | Should -Match ([regex]::Escape("Mount-DiskImage -ImagePath 'D:\dev.vhdx' -StorageType VHDX -Access ReadWrite"))
+    }
+
+    It 'gives the command when Windows refused the request' {
+        $lines = (Resolve-VhdxMountAdvice -VhdxPath 'D:\dev.vhdx' -AutoAttachRequested) -join "`n"
+        $lines | Should -Match 'Automatic mounting was NOT enabled'
+        $lines | Should -Match 'Mount-DiskImage -ImagePath'
+    }
+
+    It 'names the administrator requirement whenever it gives the command' -TestCases @(
+        @{ Requested = $true }
+        @{ Requested = $false }
+    ) {
+        $lines = (Resolve-VhdxMountAdvice -VhdxPath 'D:\dev.vhdx' -AutoAttachRequested:$Requested) -join "`n"
+        $lines | Should -Match 'started as administrator'
+    }
+
+    It 'returns plain lines rather than an object to unwrap' {
+        Resolve-VhdxMountAdvice -VhdxPath 'D:\dev.vhdx' | Should -BeOfType [string]
+    }
+}

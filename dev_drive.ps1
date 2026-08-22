@@ -1015,6 +1015,33 @@ function Request-VhdxSize {
     return Request-DevDriveSizeGB -MaxGB $hostFreeGB -Subject 'Dev Drive size' -MaxIsAdvisory:($DiskType -eq 'Dynamic')
 }
 
+function Resolve-VhdxMountAdvice {
+    <# Names the mount command whenever Windows will not do it, whether the user declined it or Windows refused. #>
+    param(
+        [Parameter(Mandatory)][string]$VhdxPath,
+        [switch]$AutoAttachRequested,
+        [switch]$AutoAttachGranted
+    )
+
+    if ($AutoAttachGranted) {
+        return @("Windows will mount $VhdxPath automatically on every startup.")
+    }
+
+    $opening = if ($AutoAttachRequested) {
+        "Automatic mounting was NOT enabled, so this Dev Drive is gone after every restart."
+    } else {
+        "You chose to mount this Dev Drive yourself, so it is gone after every restart."
+    }
+
+    return @(
+        $opening
+        "Mount it again with:"
+        "  Mount-DiskImage -ImagePath '$VhdxPath' -StorageType VHDX -Access ReadWrite"
+        "Run that from a PowerShell started as administrator: mounting a virtual hard disk needs"
+        "administrator rights, unlike mounting a .iso file."
+    )
+}
+
 function Request-AutoAttachChoice {
     Write-Host "`nMount this virtual hard disk automatically on every Windows startup?" -ForegroundColor Cyan
     Write-Host "Without this, the Dev Drive disappears after each restart until mounted by hand." -ForegroundColor White
@@ -1349,6 +1376,8 @@ Write-Host "`nStarting Dev Drive creation..." -ForegroundColor Green
 
 # The catch below reads this even when the run fails before the attach.
 $VhdxAtBootGranted = $false
+# Repeated at the end: printed once at attach time, it scrolls away behind formatting and dedup.
+$VhdxMountAdvice = @()
 
 try {
     if ($mode -eq "FreeSpace") {
@@ -1435,11 +1464,11 @@ try {
 
         $vhdxDiskNumber = $vhdxImage.Number
         Write-Host "Attached $VhdxPath as disk $vhdxDiskNumber" -ForegroundColor Green
-        if ($VhdxAutoAttach -and -not $VhdxAtBootGranted) {
-            Write-Host "Automatic mounting was NOT enabled. After each restart, mount it with:" -ForegroundColor Yellow
-            Write-Host "  Mount-DiskImage -ImagePath '$VhdxPath' -StorageType VHDX -Access ReadWrite" -ForegroundColor Yellow
-        } elseif ($VhdxAtBootGranted) {
-            Write-Host "Windows will mount it automatically on every startup." -ForegroundColor Green
+        $VhdxMountAdvice = Resolve-VhdxMountAdvice -VhdxPath $VhdxPath `
+            -AutoAttachRequested:$VhdxAutoAttach -AutoAttachGranted:$VhdxAtBootGranted
+        $adviceColour = if ($VhdxAtBootGranted) { 'Green' } else { 'Yellow' }
+        foreach ($line in $VhdxMountAdvice) {
+            Write-Host $line -ForegroundColor $adviceColour
         }
 
         Write-Host "Initializing disk $vhdxDiskNumber with a GPT partition table" -ForegroundColor Green
@@ -1737,6 +1766,12 @@ try {
     }
 
     Write-Host "All done. Dev Drive $devLetterColon ready." -ForegroundColor Green
+    if (-not $VhdxAtBootGranted -and $VhdxMountAdvice) {
+        Write-Host ""
+        foreach ($line in $VhdxMountAdvice) {
+            Write-Host $line -ForegroundColor Yellow
+        }
+    }
 }
 catch {
     Write-Host "An error occurred during Dev Drive creation:" -ForegroundColor Red

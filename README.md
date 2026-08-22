@@ -272,11 +272,20 @@ startup, with the same drive letter and its trusted Dev Drive status intact. Tha
 Windows's own bookkeeping — writing it by hand does not enable anything.
 
 Older Windows builds may reject the flag. If that happens the script says so, attaches the disk
-anyway, and you get a working Dev Drive that needs mounting by hand after each restart:
+anyway, and you get a working Dev Drive that needs mounting by hand after each restart.
+
+Whenever the disk will not be mounted for you — because Windows refused the flag, or because you
+declined automatic mounting — the script prints the command, once when the disk is attached and
+again at the end so it does not scroll away:
 
 ```powershell
 Mount-DiskImage -ImagePath 'D:\DevDrive.vhdx' -StorageType VHDX -Access ReadWrite
 ```
+
+Run it from a PowerShell started as administrator. Microsoft's
+[`Mount-DiskImage` reference](https://learn.microsoft.com/en-us/powershell/module/storage/mount-diskimage)
+states that mounting a virtual hard disk requires administrator privileges, unlike mounting an
+`.iso` file.
 
 ### BitLocker inside a virtual hard disk
 
