@@ -8,7 +8,7 @@ An interactive PowerShell script that guides users through creating Windows Dev 
 - **Flexible Creation Methods**: Use free space, shrink an existing drive, or create a `.vhdx` file
 - **Virtual Hard Disk Mode**: Puts the Dev Drive in a `.vhdx` file that Windows can mount on every startup
 - **Smart Drive Selection**: Shows detailed drive information for informed choices
-- **Optional BitLocker**: Encryption that fits the machine, with the recovery key shown before the run goes on
+- **Optional BitLocker**: Encryption that fits the machine, with the recovery key shown before the run goes on and a rejected password asked for again
 - **Advanced Deduplication**: Configure deduplication with optional compression
 - **Compression Options**: Choose LZ4 or ZSTD with customizable compression levels
 - **Real Size Limits**: Shows actual Windows shrinkable limits, not estimates
@@ -205,7 +205,7 @@ E           DevDrive     ReFS           Fixed     Healthy      OK               
 4. **Security Configuration**
    - Optional BitLocker encryption, enabled together with its recovery key in one step
    - The recovery key is printed and has to be acknowledged before the run continues
-   - A password is asked for in virtual hard disk mode only
+   - A password is asked for in virtual hard disk mode only, and asked for again if BitLocker rejects it
    - The domain account protector is added only on a machine joined to an Active Directory domain
    - The recovery key goes to Azure AD only on a device joined to Entra ID
    - Automatic unlocking is set only when the operating system drive is BitLocker-protected

@@ -318,26 +318,38 @@ function Resolve-EntraJoinState {
 
 function Resolve-BitLockerVolumeState {
     <#
-        Says what a volume's own BitLocker status means. Encryption counts as covered while it is
-        still running, not only once the volume reports itself protected.
+        Any status but a fully decrypted one leaves ciphertext on the volume, so encryption that is
+        still running, suspended or being undone counts as covered. Unknown is its own answer.
     #>
     param(
         [AllowNull()][AllowEmptyString()][string]$ProtectionStatus,
-        [AllowNull()][AllowEmptyString()][string]$VolumeStatus
+        [AllowNull()][AllowEmptyString()][string]$VolumeStatus,
+        [switch]$Unknown
     )
 
+    if ($Unknown) {
+        return [PSCustomObject]@{ Known = $false; Protected = $false; HasCiphertext = $false; Covered = $false; Label = 'Unknown' }
+    }
+
     $protected = $ProtectionStatus -eq 'On'
-    $encrypting = $VolumeStatus -in @('EncryptionInProgress', 'FullyEncrypted')
+    $hasCiphertext = -not [string]::IsNullOrWhiteSpace($VolumeStatus) -and $VolumeStatus -ne 'FullyDecrypted'
+    $covered = $protected -or $hasCiphertext
+    $label = 'Clear'
+    if ($covered) {
+        $label = 'Encrypted'
+    }
 
     return [PSCustomObject]@{
-        Protected  = $protected
-        Encrypting = $encrypting
-        Covered    = ($protected -or $encrypting)
+        Known         = $true
+        Protected     = $protected
+        HasCiphertext = $hasCiphertext
+        Covered       = $covered
+        Label         = $label
     }
 }
 
 function Get-BitLockerProtectionState {
-    <# Asks one volume how it is protected; a volume that cannot answer counts as unprotected. #>
+    <# Asks one volume how it is protected; a volume that cannot answer says so, rather than "no". #>
     param([Parameter(Mandatory)][string]$MountPoint)
 
     try {
@@ -346,16 +358,12 @@ function Get-BitLockerProtectionState {
             -VolumeStatus ([string]$volume.VolumeStatus)
     }
     catch {
-        return Resolve-BitLockerVolumeState -ProtectionStatus 'Off' -VolumeStatus 'FullyDecrypted'
+        return Resolve-BitLockerVolumeState -Unknown
     }
 }
 
 function Resolve-BitLockerSetupPlan {
-    <#
-        Decides which protectors this machine can carry, and the lines explaining why. A domain
-        account protector needs a domain the account resolves against, Azure AD backup needs a
-        device joined to Entra ID, and automatic unlocking needs a protected system drive.
-    #>
+    <# Decides which protectors this machine can carry, and the lines explaining why. #>
     param(
         [switch]$DomainJoined,
         [switch]$EntraJoined,
@@ -378,12 +386,15 @@ function Resolve-BitLockerSetupPlan {
         $notes += "The drive is still encrypted and still protected by its recovery key."
     }
 
+    # Kept as their own list so the run can repeat exactly these lines where the backup is skipped.
+    $aadNotes = @()
     if ($EntraJoined) {
-        $notes += "This device is joined to Entra ID, so the recovery key will be backed up to Azure AD."
+        $aadNotes += "This device is joined to Entra ID, so the recovery key will be backed up to Azure AD."
     } else {
-        $notes += "This device is not joined to Entra ID, so the recovery key cannot be backed up to Azure AD."
-        $notes += "It will be stored nowhere but on the volume itself and on the paper you write it on, so keep it."
+        $aadNotes += "This device is not joined to Entra ID, so the recovery key cannot be backed up to Azure AD."
+        $aadNotes += "It will be stored nowhere but on the volume itself and on the paper you write it on, so keep it."
     }
+    $notes += $aadNotes
 
     if ($OsDriveProtected) {
         $notes += "The operating system drive is protected by BitLocker, so this drive can be set to unlock automatically."
@@ -397,6 +408,7 @@ function Resolve-BitLockerSetupPlan {
         UseAdAccountProtector = [bool]$DomainJoined
         UseAadBackup          = [bool]$EntraJoined
         UseAutoUnlock         = [bool]$OsDriveProtected
+        AadNotes              = $aadNotes
         Notes                 = $notes
     }
 }
@@ -480,14 +492,16 @@ function Resolve-BitLockerFailure {
         [AllowEmptyString()][string]$Message,
         [Parameter(Mandatory)][int]$RetryCount,
         [Parameter(Mandatory)][int]$MaxRetries,
+        [ValidateSet('Encrypted', 'Clear', 'Unknown')][string]$VolumeState = 'Unknown',
         [switch]$Unretryable,
-        [switch]$VolumeEncrypted
+        [switch]$PasswordAsked
     )
 
     $exhausted = $RetryCount -ge $MaxRetries
     $canRetry = -not $exhausted -and -not $Unretryable
 
-    if ($Message -match "password.*(complexity|requirements|not.*meet)") {
+    # Only a run that asks for a password can be failing on one, whatever the message mentions.
+    if ($PasswordAsked -and $Message -match "password.*(complexity|requirements|not.*meet)") {
         $lines = @("BitLocker rejected the password due to complexity requirements.")
         if ($canRetry) {
             $lines += "Please try a different password. Attempt $RetryCount of $MaxRetries."
@@ -498,13 +512,67 @@ function Resolve-BitLockerFailure {
     }
 
     $lines = @("BitLocker setup did not finish. Windows reported: $Message")
-    if ($VolumeEncrypted) {
+    if ($VolumeState -eq 'Encrypted') {
         $lines += "The Dev Drive is created and formatted, and BitLocker has already started encrypting it."
-    } else {
+    } elseif ($VolumeState -eq 'Clear') {
         $lines += "The Dev Drive itself is created and formatted, and works without BitLocker."
+    } else {
+        $lines += "The Dev Drive is created and formatted, but its BitLocker state could not be read. Check it with Get-BitLockerVolume before assuming it is unencrypted."
     }
 
     return [PSCustomObject]@{ Kind = 'Other'; Exhausted = $exhausted; CanRetry = $canRetry; Lines = $lines }
+}
+
+function Resolve-BitLockerAdProtectorNeed {
+    <# A domain account protector is added only where the plan allows one and the volume has none. #>
+    param(
+        [AllowNull()][AllowEmptyCollection()][string[]]$ExistingTypes,
+        [switch]$Wanted
+    )
+
+    return [bool]$Wanted -and (@($ExistingTypes) -notcontains 'AdAccountOrGroup')
+}
+
+function Resolve-BitLockerUnlockAction {
+    <#
+        What to do with the volume before automatic unlocking: unlock it, say why this run cannot,
+        or leave it alone. Automatic unlocking is deferred while the volume stays locked.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$MountPoint,
+        [AllowNull()][AllowEmptyString()][string]$LockStatus,
+        [switch]$HasPassword
+    )
+
+    if ($LockStatus -ne 'Locked') {
+        return [PSCustomObject]@{ Action = 'None'; DeferAutoUnlock = $false; Lines = @() }
+    }
+
+    if ($HasPassword) {
+        return [PSCustomObject]@{ Action = 'Unlock'; DeferAutoUnlock = $false; Lines = @() }
+    }
+
+    return [PSCustomObject]@{
+        Action          = 'Explain'
+        DeferAutoUnlock = $true
+        Lines           = @(
+            "Drive $MountPoint is locked and this run holds no password for it, so it cannot be unlocked here."
+            "Unlock it by hand with: manage-bde -unlock $MountPoint -RecoveryPassword <the key above>"
+        )
+    }
+}
+
+function Test-RecoveryKeyAcknowledged {
+    <# Only the acknowledgement word, in any case and with spaces trimmed, lets the run go on. #>
+    param(
+        [AllowNull()][AllowEmptyString()][string]$Answer,
+        [Parameter(Mandatory)][string]$Word
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Answer)) {
+        return $false
+    }
+    return $Answer.Trim() -eq $Word
 }
 
 function Resolve-BitLockerAbandonedAdvice {
@@ -514,19 +582,24 @@ function Resolve-BitLockerAbandonedAdvice {
     #>
     param(
         [Parameter(Mandatory)][string]$MountPoint,
-        [switch]$Encrypted
+        [ValidateSet('Encrypted', 'Clear', 'Unknown')][string]$VolumeState = 'Unknown'
     )
 
-    if ($Encrypted) {
-        return [PSCustomObject]@{ Lines = @(
+    if ($VolumeState -eq 'Encrypted') {
+        return @(
             "Carrying on without finishing BitLocker. Drive $MountPoint is already encrypted."
             "Its recovery key is the only way back into it, so keep the key you wrote down. Read it again with: (Get-BitLockerVolume -MountPoint $MountPoint).KeyProtector"
-        ) }
+        )
     }
 
-    return [PSCustomObject]@{ Lines = @(
-        "Carrying on without BitLocker. Drive $MountPoint is not encrypted, and is created and usable as it is."
-    ) }
+    if ($VolumeState -eq 'Clear') {
+        return @("Carrying on without BitLocker. Drive $MountPoint is not encrypted, and is created and usable as it is.")
+    }
+
+    return @(
+        "Carrying on without finishing BitLocker. The state of drive $MountPoint could not be read, so do not assume it is unencrypted."
+        "Check it, and read its recovery key, with: Get-BitLockerVolume -MountPoint $MountPoint"
+    )
 }
 
 function Request-BitLockerFailureChoice {
@@ -1157,13 +1230,15 @@ if ($mode -eq "FreeSpace") {
 $enableBitLocker = Request-BitLockerChoice -VhdxMode:($mode -eq "Vhdx")
 $SkipBitLocker = -not $enableBitLocker
 
-# The facts BitLocker setup depends on are settled here, before the plan is shown, so the plan
-# promises only what this machine can do. A fact that cannot be read counts as the safe answer.
+# Settled before the plan is shown; a fact that cannot be read counts as the safe answer.
 $bitLockerPlan = $null
 if ($enableBitLocker) {
+    # Both queries below can take a while on a machine that cannot reach its domain controller.
+    Write-Host "Checking what this machine can do with BitLocker (domain, Entra ID, system drive)..." -ForegroundColor Gray
+
     $isDomainJoined = $false
     try {
-        $isDomainJoined = [bool](Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop).PartOfDomain
+        $isDomainJoined = [bool](Get-CimInstance -ClassName Win32_ComputerSystem -OperationTimeoutSec 15 -ErrorAction Stop).PartOfDomain
     }
     catch {
         $isDomainJoined = $false
@@ -1177,8 +1252,13 @@ if ($enableBitLocker) {
         $isEntraJoined = $false
     }
 
-    # Get-BitLockerProtectionState answers "not protected" for a machine without BitLocker at all.
-    $osDriveProtected = (Get-BitLockerProtectionState -MountPoint $env:SystemDrive).Protected
+    $osDriveProtected = $false
+    try {
+        $osDriveProtected = (Get-BitLockerProtectionState -MountPoint $env:SystemDrive).Protected
+    }
+    catch {
+        $osDriveProtected = $false
+    }
 
     $bitLockerPlan = Resolve-BitLockerSetupPlan -DomainJoined:$isDomainJoined -EntraJoined:$isEntraJoined `
         -VhdxMode:($mode -eq "Vhdx") -OsDriveProtected:$osDriveProtected
@@ -1401,7 +1481,6 @@ try {
 
     # BitLocker (conditional)
     if (-not $SkipBitLocker) {
-        # The plan was settled in the configuration phase and shown before the run was confirmed.
         Write-Host "`nBitLocker setup for $devLetterColon" -ForegroundColor Cyan
         foreach ($note in $bitLockerPlan.Notes) {
             Write-Host $note -ForegroundColor Yellow
@@ -1412,6 +1491,8 @@ try {
         $SecurePassword = $null
         $retryCount = 0
         $maxRetries = 10
+        $keyBannerRule = "=" * 64
+        $keyAcknowledgement = "YES"
 
         while (-not $bitLockerSuccess -and -not $bitLockerAbandoned -and $retryCount -lt $maxRetries) {
             # A rejection that a second read of the same volume would repeat is not worth retrying.
@@ -1432,18 +1513,16 @@ try {
                     Add-BitLockerKeyProtector -MountPoint $devLetterColon -PasswordProtector -Password $SecurePassword -ErrorAction Stop
                 }
 
-                if ($protectorPlan.TypesToAdd -contains 'RecoveryPassword') {
-                    # One call turns encryption on and creates the recovery key; adding the recovery protector first made two.
+                # Gated on the volume's own status: a recovery protector alone does not encrypt it.
+                $volumeState = Resolve-BitLockerVolumeState -ProtectionStatus ([string]$bitlocker_volume.ProtectionStatus) `
+                    -VolumeStatus ([string]$bitlocker_volume.VolumeStatus)
+                if (-not $volumeState.Covered) {
+                    # One call turns encryption on and creates the recovery key; adding that protector first made two.
                     Write-Host "Enabling BitLocker on $devLetterColon with a recovery key" -ForegroundColor Green
                     Enable-BitLocker -MountPoint $devLetterColon -RecoveryPasswordProtector -SkipHardwareTest -UsedSpaceOnly -ErrorAction Stop
                 }
 
-                $existingTypes = @($bitlocker_volume.KeyProtector | ForEach-Object { $_.KeyProtectorType })
-                if ($bitLockerPlan.UseAdAccountProtector -and $existingTypes -notcontains 'AdAccountOrGroup') {
-                    Write-Host "Adding BitLockerKeyProtector AdAccountOrGroupProtector for $domain_user" -ForegroundColor Green
-                    Add-BitLockerKeyProtector -MountPoint $devLetterColon -AdAccountOrGroupProtector -AdAccountOrGroup $domain_user -ErrorAction Stop
-                }
-
+                # Shown and acknowledged before any further protector work: that work is what fails.
                 Write-Host "Reading the recovery key back off $devLetterColon" -ForegroundColor Green
                 $bitlocker_volume = Get-BitLockerVolume -MountPoint $devLetterColon -ErrorAction Stop
                 $recoveryProtector = Resolve-BitLockerRecoveryProtector -KeyProtector $bitlocker_volume.KeyProtector -MountPoint $devLetterColon
@@ -1458,37 +1537,45 @@ try {
                 }
 
                 Write-Host ""
-                Write-Host "================================================================" -ForegroundColor Cyan
+                Write-Host $keyBannerRule -ForegroundColor Cyan
                 Write-Host "BITLOCKER RECOVERY KEY FOR $devLetterColon - WRITE IT DOWN NOW" -ForegroundColor Cyan
                 Write-Host $recoveryKey -ForegroundColor White
-                Write-Host "================================================================" -ForegroundColor Cyan
+                Write-Host $keyBannerRule -ForegroundColor Cyan
                 Write-Host ""
-                while ((Read-Host "Type YES once you have written the recovery key down") -ne "YES") {
+                while (-not (Test-RecoveryKeyAcknowledged -Word $keyAcknowledgement `
+                        -Answer (Read-Host "Type $keyAcknowledgement once you have written the recovery key down"))) {
                     Write-Host "The run continues only once the recovery key is written down." -ForegroundColor Yellow
+                }
+
+                $existingTypes = @($bitlocker_volume.KeyProtector | ForEach-Object { [string]$_.KeyProtectorType })
+                $wantsAdProtector = $bitLockerPlan.UseAdAccountProtector
+                if (Resolve-BitLockerAdProtectorNeed -ExistingTypes $existingTypes -Wanted:$wantsAdProtector) {
+                    Write-Host "Adding BitLockerKeyProtector AdAccountOrGroupProtector for $domain_user" -ForegroundColor Green
+                    Add-BitLockerKeyProtector -MountPoint $devLetterColon -AdAccountOrGroupProtector -AdAccountOrGroup $domain_user -ErrorAction Stop
                 }
 
                 if ($bitLockerPlan.UseAadBackup) {
                     Write-Host "Backing up the recovery key to Azure AD" -ForegroundColor Green
                     BackupToAAD-BitLockerKeyProtector -MountPoint $devLetterColon -KeyProtectorId $recoveryProtector.ProtectorId -ErrorAction Stop
                 } else {
-                    Write-Host "Not backing the recovery key up to Azure AD: this device is not joined to Entra ID." -ForegroundColor Yellow
-                    Write-Host "The key is stored nowhere but on the volume itself and on the paper you wrote it on, so keep it." -ForegroundColor Yellow
-                }
-
-                $bitlocker_volume = Get-BitLockerVolume -MountPoint $devLetterColon -ErrorAction Stop
-                $lockedWithoutPassword = $false
-                if ($bitlocker_volume.LockStatus -eq 'Locked') {
-                    if ($SecurePassword) {
-                        Write-Host "Unlocking $devLetterColon" -ForegroundColor Green
-                        Unlock-BitLocker -MountPoint $devLetterColon -Password $SecurePassword -ErrorAction Stop
-                    } else {
-                        $lockedWithoutPassword = $true
-                        Write-Host "Drive $devLetterColon is locked and this run holds no password for it, so it cannot be unlocked here." -ForegroundColor Yellow
-                        Write-Host "Unlock it by hand with: manage-bde -unlock $devLetterColon -RecoveryPassword <the key above>" -ForegroundColor Yellow
+                    Write-Host "Not backing the recovery key up to Azure AD." -ForegroundColor Yellow
+                    foreach ($note in $bitLockerPlan.AadNotes) {
+                        Write-Host $note -ForegroundColor Yellow
                     }
                 }
 
-                if ($bitLockerPlan.UseAutoUnlock -and -not $lockedWithoutPassword) {
+                $bitlocker_volume = Get-BitLockerVolume -MountPoint $devLetterColon -ErrorAction Stop
+                $unlockPlan = Resolve-BitLockerUnlockAction -MountPoint $devLetterColon `
+                    -LockStatus ([string]$bitlocker_volume.LockStatus) -HasPassword:($null -ne $SecurePassword)
+                foreach ($line in $unlockPlan.Lines) {
+                    Write-Host $line -ForegroundColor Yellow
+                }
+                if ($unlockPlan.Action -eq 'Unlock') {
+                    Write-Host "Unlocking $devLetterColon" -ForegroundColor Green
+                    Unlock-BitLocker -MountPoint $devLetterColon -Password $SecurePassword -ErrorAction Stop
+                }
+
+                if ($bitLockerPlan.UseAutoUnlock -and -not $unlockPlan.DeferAutoUnlock) {
                     Write-Host "Enabling BitLockerAutoUnlock" -ForegroundColor Green
                     Enable-BitLockerAutoUnlock -MountPoint $devLetterColon -ErrorAction Stop
                 } elseif ($bitLockerPlan.UseAutoUnlock) {
@@ -1507,9 +1594,10 @@ try {
             catch {
                 $failure = $_
                 $retryCount++
-                $volumeCovered = (Get-BitLockerProtectionState -MountPoint $devLetterColon).Covered
+                $failureState = (Get-BitLockerProtectionState -MountPoint $devLetterColon).Label
+                $passwordAsked = $bitLockerPlan.UsePasswordProtector
                 $verdict = Resolve-BitLockerFailure -Message $failure.Exception.Message -RetryCount $retryCount `
-                    -MaxRetries $maxRetries -Unretryable:$unretryable -VolumeEncrypted:$volumeCovered
+                    -MaxRetries $maxRetries -VolumeState $failureState -Unretryable:$unretryable -PasswordAsked:$passwordAsked
                 foreach ($line in $verdict.Lines) {
                     Write-Host $line -ForegroundColor Red
                 }
@@ -1531,13 +1619,12 @@ try {
             }
         }
 
-        if ($bitLockerAbandoned) {
-            $abandonedCovered = (Get-BitLockerProtectionState -MountPoint $devLetterColon).Covered
-            foreach ($line in (Resolve-BitLockerAbandonedAdvice -MountPoint $devLetterColon -Encrypted:$abandonedCovered).Lines) {
+        # Reached whether the user chose to carry on or the attempts ran out; the drive exists either way.
+        if (-not $bitLockerSuccess) {
+            $abandonedState = (Get-BitLockerProtectionState -MountPoint $devLetterColon).Label
+            foreach ($line in (Resolve-BitLockerAbandonedAdvice -MountPoint $devLetterColon -VolumeState $abandonedState)) {
                 Write-Host $line -ForegroundColor Yellow
             }
-        } elseif (-not $bitLockerSuccess) {
-            throw "Failed to set up BitLocker encryption after $maxRetries attempts."
         }
     } else {
         Write-Host "Skipping BitLocker encryption as requested." -ForegroundColor Yellow
