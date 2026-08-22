@@ -147,7 +147,8 @@ function Get-Win32ErrorText {
 }
 
 function ConvertTo-FlooredGB {
-    # Floor, never round: a displayed maximum must never exceed the real one. Nothing to give reads as 0.
+    # Floor, never round: a displayed maximum must never exceed the real one.
+    # A volume with nothing to give reads as 0, not as a negative.
     param([Parameter(Mandatory)][double]$Bytes)
     if ($Bytes -le 0) { return 0 }
     return [math]::Floor($Bytes / 1GB * 100) / 100
