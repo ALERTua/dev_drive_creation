@@ -697,6 +697,285 @@ function Request-CompressionLevel {
     }
 }
 
+function Resolve-DedupTimeInput {
+    <#
+        Decides what one typed start time means. Takes HH:MM or H:MM on a 24-hour clock and
+        normalises it to HH:MM. Rejection is $null when the answer is good.
+    #>
+    param(
+        [AllowEmptyString()][string]$Answer,
+        [string]$CurrentTime,
+        [switch]$AllowEmpty
+    )
+
+    $result = [PSCustomObject]@{ Rejection = $null; Time = $null }
+
+    if ([string]::IsNullOrWhiteSpace($Answer)) {
+        if ($AllowEmpty -and -not [string]::IsNullOrWhiteSpace($CurrentTime)) {
+            $result.Time = $CurrentTime
+            return $result
+        }
+        $result.Rejection = 'Empty'
+        return $result
+    }
+
+    $match = [regex]::Match($Answer.Trim(), '^([01]?[0-9]|2[0-3]):([0-5][0-9])$')
+    if (-not $match.Success) {
+        $result.Rejection = 'InvalidTime'
+        return $result
+    }
+
+    $result.Time = '{0:00}:{1}' -f [int]$match.Groups[1].Value, $match.Groups[2].Value
+    return $result
+}
+
+function Resolve-DedupTimeListInput {
+    <#
+        Decides what a typed comma separated list of start times means. Trims each entry, turns away
+        a repeated time, and returns the times in ascending order.
+    #>
+    param(
+        [AllowEmptyString()][string]$Answer,
+        [string[]]$CurrentTimes,
+        [switch]$AllowEmpty,
+        [int]$MaxTimes = 4
+    )
+
+    $result = [PSCustomObject]@{ Rejection = $null; Times = $null }
+
+    if ([string]::IsNullOrWhiteSpace($Answer)) {
+        if ($AllowEmpty) {
+            $result.Times = $CurrentTimes
+            return $result
+        }
+        $result.Rejection = 'Empty'
+        return $result
+    }
+
+    $entries = @($Answer -split ',')
+    if (@($entries | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count -eq 0) {
+        $result.Rejection = 'Empty'
+        return $result
+    }
+    if ($entries.Count -gt $MaxTimes) {
+        # More entries than this create overlapping jobs rather than a useful schedule.
+        $result.Rejection = 'TooMany'
+        return $result
+    }
+
+    $times = @()
+    foreach ($entry in $entries) {
+        # A blank entry between two commas is a typo, not a request to keep anything.
+        $verdict = Resolve-DedupTimeInput -Answer $entry
+        if ($verdict.Rejection) {
+            $result.Rejection = 'InvalidTime'
+            return $result
+        }
+        if ($times -contains $verdict.Time) {
+            $result.Rejection = 'DuplicateTime'
+            return $result
+        }
+        $times += $verdict.Time
+    }
+
+    $result.Times = @($times | Sort-Object)
+    return $result
+}
+
+function Resolve-DedupDayInput {
+    <#
+        Decides what a typed weekday means. Takes a full day name or its three-letter form in any
+        case, and returns the spelling the scheduler cmdlet expects.
+    #>
+    param(
+        [AllowEmptyString()][string]$Answer,
+        [string]$CurrentDay,
+        [switch]$AllowEmpty
+    )
+
+    $result = [PSCustomObject]@{ Rejection = $null; Day = $null }
+
+    if ([string]::IsNullOrWhiteSpace($Answer)) {
+        if ($AllowEmpty) {
+            $result.Day = $CurrentDay
+            return $result
+        }
+        $result.Rejection = 'Empty'
+        return $result
+    }
+
+    $wanted = $Answer.Trim()
+    foreach ($day in [System.Enum]::GetNames([System.DayOfWeek])) {
+        if ($wanted -eq $day -or $wanted -eq $day.Substring(0, 3)) {
+            $result.Day = $day
+            return $result
+        }
+    }
+
+    $result.Rejection = 'InvalidDay'
+    return $result
+}
+
+function Format-DedupTimeList {
+    <# Joins start times the way a sentence reads them: "11:00 and 17:00". #>
+    param([Parameter(Mandatory)][string[]]$Times)
+
+    if ($Times.Count -eq 1) {
+        return $Times[0]
+    }
+    return (($Times[0..($Times.Count - 2)] -join ', ') + ' and ' + $Times[-1])
+}
+
+function Format-DedupScheduleSummary {
+    <# The two lines saying when the deduplication jobs run, shown while choosing and in the plan. #>
+    param(
+        [Parameter(Mandatory)][string[]]$DailyTimes,
+        [Parameter(Mandatory)][string]$DailyDaysLabel,
+        [Parameter(Mandatory)][string]$WeeklyDay,
+        [Parameter(Mandatory)][string]$WeeklyStart,
+        [Parameter(Mandatory)][int]$WeeksInterval
+    )
+
+    $weeks = if ($WeeksInterval -eq 1) { "every 1 week" } else { "every $WeeksInterval weeks" }
+
+    return @(
+        "  Daily optimization : $DailyDaysLabel at $(Format-DedupTimeList -Times $DailyTimes)"
+        "  Weekly maintenance : $WeeklyDay at $WeeklyStart, $weeks"
+    )
+}
+
+function Resolve-DedupScheduleReminder {
+    <#
+        The fixed lines telling the user where these schedule times live and how to change them
+        later. Points at the times just chosen instead of trying to tell which task is which.
+    #>
+    param(
+        [Parameter(Mandatory)][string[]]$DailyTimes,
+        [Parameter(Mandatory)][string]$WeeklyDay,
+        [Parameter(Mandatory)][string]$WeeklyStart,
+        [Parameter(Mandatory)][string]$TaskTreePath
+    )
+
+    return @(
+        "Deduplication runs on a schedule kept in Task Scheduler, under:"
+        "  $TaskTreePath"
+        ""
+        "Times just chosen: $(Format-DedupTimeList -Times $DailyTimes) daily, $WeeklyDay at $WeeklyStart weekly."
+        ""
+        "To change the times later, press Win+R, type taskschd.msc and press Ctrl+Shift+Enter to open"
+        "it as administrator, then open that folder and find the tasks whose Triggers column matches"
+        "the times above. Edit them on the Triggers tab. Leave the Actions tab alone - that is what"
+        "actually runs the deduplication."
+        ""
+        "Other tasks in that folder may belong to Windows or to earlier runs."
+    )
+}
+
+function Request-DedupSchedule {
+    <#
+        The one question about when the deduplication jobs run, with three follow-ups for a user who
+        wants to pick the times. Returns the daily start times, the weekly day and its start time.
+    #>
+    param(
+        [Parameter(Mandatory)][string[]]$DailyTimes,
+        [Parameter(Mandatory)][string]$DailyDaysLabel,
+        [Parameter(Mandatory)][string]$WeeklyDay,
+        [Parameter(Mandatory)][string]$WeeklyStart,
+        [Parameter(Mandatory)][int]$WeeksInterval,
+        [Parameter(Mandatory)][int]$DailyDurationHours,
+        [Parameter(Mandatory)][int]$DailyCpuPercent
+    )
+
+    $chosenTimes = $DailyTimes
+    $chosenDay = $WeeklyDay
+    $chosenStart = $WeeklyStart
+
+    Write-Host "`n=== DEDUPLICATION SCHEDULE ===" -ForegroundColor Cyan
+    Write-Host ""
+    foreach ($line in (Format-DedupScheduleSummary -DailyTimes $chosenTimes -DailyDaysLabel $DailyDaysLabel `
+                -WeeklyDay $chosenDay -WeeklyStart $chosenStart -WeeksInterval $WeeksInterval)) {
+        Write-Host $line -ForegroundColor White
+    }
+    Write-Host ""
+    Write-Host "The daily job runs on mains power only, for up to $DailyDurationHours hours, using at most $DailyCpuPercent% of the CPU." -ForegroundColor White
+    Write-Host "1. Use these times (recommended)" -ForegroundColor White
+    Write-Host "2. Choose the times myself" -ForegroundColor White
+    Write-Host ""
+
+    while ($true) {
+        $choice = Read-Host "Enter your choice (1 or 2)"
+        if ($choice -eq "1" -or $choice -eq "2") {
+            break
+        }
+        Write-Host "Invalid choice. Please enter 1 or 2." -ForegroundColor Red
+    }
+
+    if ($choice -eq "2") {
+        $maxDailyTimes = 4
+        while ($true) {
+            Write-Host "`nStart times for the daily optimization, comma separated, 24-hour HH:MM (for example 08:15,13:00)." -ForegroundColor Cyan
+            $answer = Read-Host "Press Enter to keep $($chosenTimes -join ',')"
+            $verdict = Resolve-DedupTimeListInput -Answer $answer -CurrentTimes $chosenTimes -AllowEmpty -MaxTimes $maxDailyTimes
+
+            if ($verdict.Rejection -eq 'Empty') {
+                Write-Host "No time given. Enter at least one time as HH:MM, for example 08:15,13:00." -ForegroundColor Red
+                continue
+            }
+            if ($verdict.Rejection -eq 'InvalidTime') {
+                Write-Host "Invalid time. Enter it as HH:MM on a 24-hour clock, for example 08:15." -ForegroundColor Red
+                continue
+            }
+            if ($verdict.Rejection -eq 'DuplicateTime') {
+                Write-Host "Repeated time. Enter each start time only once." -ForegroundColor Red
+                continue
+            }
+            if ($verdict.Rejection -eq 'TooMany') {
+                Write-Host "Too many times. Overlapping jobs waste effort; enter at most $maxDailyTimes." -ForegroundColor Red
+                continue
+            }
+
+            $chosenTimes = $verdict.Times
+            break
+        }
+
+        while ($true) {
+            Write-Host "`nDay for the weekly maintenance." -ForegroundColor Cyan
+            $answer = Read-Host "Press Enter to keep $chosenDay"
+            $verdict = Resolve-DedupDayInput -Answer $answer -CurrentDay $chosenDay -AllowEmpty
+
+            if ($verdict.Rejection) {
+                Write-Host "Invalid day. Enter one day name, for example Monday." -ForegroundColor Red
+                continue
+            }
+
+            $chosenDay = $verdict.Day
+            break
+        }
+
+        while ($true) {
+            Write-Host "`nStart time for the weekly maintenance, 24-hour HH:MM." -ForegroundColor Cyan
+            $answer = Read-Host "Press Enter to keep $chosenStart"
+            $verdict = Resolve-DedupTimeInput -Answer $answer -CurrentTime $chosenStart -AllowEmpty
+
+            if ($verdict.Rejection) {
+                Write-Host "Invalid time. Enter it as HH:MM on a 24-hour clock, for example 08:15." -ForegroundColor Red
+                continue
+            }
+
+            $chosenStart = $verdict.Time
+            break
+        }
+
+        Write-Host ""
+        foreach ($line in (Format-DedupScheduleSummary -DailyTimes $chosenTimes -DailyDaysLabel $DailyDaysLabel `
+                    -WeeklyDay $chosenDay -WeeklyStart $chosenStart -WeeksInterval $WeeksInterval)) {
+            Write-Host $line -ForegroundColor Green
+        }
+    }
+
+    return [PSCustomObject]@{ DailyTimes = $chosenTimes; WeeklyDay = $chosenDay; WeeklyStart = $chosenStart }
+}
+
 function Resolve-DevDriveSizeInput {
     <#
         Decides what one typed answer to the size question means. Kept free of Read-Host and of
@@ -1121,11 +1400,20 @@ $RunInitialJob = $true
 $SkipBitLocker = $false
 $SkipDeduplication = $false
 
-# Weekly ReFS dedup scrub schedule. Read by both the plan summary and the actual call below, so the
-# two cannot say different things about when the job runs.
+# ReFS dedup schedule defaults, changeable by the user below. Read by both the plan summary and the
+# actual calls, so the two cannot say different things about when the jobs run.
+$DedupStartTimes = @("11:00", "17:00")
 $ScrubDays = "Monday"
 $ScrubStart = "17:30"
 $ScrubWeeksInterval = 1
+
+# Load tuning that stays fixed: the daily job's days, duration and CPU cap, and where its tasks live.
+$DedupDailyDays = "Monday,Tuesday,Wednesday,Thursday,Friday"
+$DedupDailyDaysLabel = "Monday-Friday" # kept beside $DedupDailyDays by hand, not derived from it
+$DedupDailyDurationHours = 2
+$DedupDailyCpuPercent = 60
+$DedupTaskPath = "\Microsoft\Windows\ReFsDedupSvc\"
+$DedupTaskTreePath = "Task Scheduler Library > " + (($DedupTaskPath.Trim('\') -split '\\') -join ' > ')
 
 # Interactive mode only - Gather all information first
 Write-Host "`n=== GATHERING CONFIGURATION ===" -ForegroundColor Cyan
@@ -1347,6 +1635,16 @@ if ($dedupChoice -eq "None") {
     Write-Host "Selected deduplication only (no compression)" -ForegroundColor Green
 }
 
+# Ask when the deduplication jobs should run
+if (-not $SkipDeduplication) {
+    $dedupSchedule = Request-DedupSchedule -DailyTimes $DedupStartTimes -DailyDaysLabel $DedupDailyDaysLabel `
+        -WeeklyDay $ScrubDays -WeeklyStart $ScrubStart -WeeksInterval $ScrubWeeksInterval `
+        -DailyDurationHours $DedupDailyDurationHours -DailyCpuPercent $DedupDailyCpuPercent
+    $DedupStartTimes = $dedupSchedule.DailyTimes
+    $ScrubDays = $dedupSchedule.WeeklyDay
+    $ScrubStart = $dedupSchedule.WeeklyStart
+}
+
 # Display summary and ask for confirmation
 Write-Host "`n"
 Write-Host "===============================================================================" -ForegroundColor Cyan
@@ -1388,8 +1686,10 @@ if (-not $SkipDeduplication) {
     } else {
         Write-Host "* Enable ReFS deduplication only (no compression)" -ForegroundColor White
     }
-    Write-Host "* Schedule daily optimization jobs at 11:00 and 17:00 (AC power only)" -ForegroundColor White
-    Write-Host "* Schedule weekly maintenance job every $ScrubDays at $ScrubStart" -ForegroundColor White
+    foreach ($line in (Format-DedupScheduleSummary -DailyTimes $DedupStartTimes -DailyDaysLabel $DedupDailyDaysLabel `
+                -WeeklyDay $ScrubDays -WeeklyStart $ScrubStart -WeeksInterval $ScrubWeeksInterval)) {
+        Write-Host "* $($line.Trim())" -ForegroundColor White
+    }
 } else {
     Write-Host "* Skip deduplication and compression setup" -ForegroundColor White
 }
@@ -1710,9 +2010,9 @@ try {
         # Define common schedule parameters
         $baseScheduleParams = @{
             Volume            = "$devLetterColon"
-            Days              = "Monday,Tuesday,Wednesday,Thursday,Friday"
-            Duration          = New-TimeSpan -Hours 2
-            CpuPercentage     = 60
+            Days              = $DedupDailyDays
+            Duration          = New-TimeSpan -Hours $DedupDailyDurationHours
+            CpuPercentage     = $DedupDailyCpuPercent
         }
 
         # Add compression parameters only if not Dedup-only mode
@@ -1723,14 +2023,11 @@ try {
             }
         }
 
-        # Define start times
-        $startTimes = @("11:00", "17:00")
-
-        foreach ($time in $startTimes) {
+        foreach ($time in $DedupStartTimes) {
             $scheduleParams = $baseScheduleParams.Clone()
             $scheduleParams.Start = $time
 
-            Write-Host "Scheduling deduplication job at $time (2h)" -ForegroundColor Green
+            Write-Host "Scheduling deduplication job at $time (${DedupDailyDurationHours}h)" -ForegroundColor Green
             Set-ReFSDedupSchedule @scheduleParams -ErrorAction Stop
         }
 
@@ -1740,7 +2037,7 @@ try {
         Write-Host "Configuring deduplication tasks to run only on AC power..." -ForegroundColor Green
         try {
             # Find all ReFS deduplication tasks
-            $dedupTasks = Get-ScheduledTask | Where-Object {$_.TaskPath -Like "\Microsoft\Windows\ReFsDedupSvc\" -And $_.TaskName -ne "Initialization" -And $_.State -ne "Disabled"}
+            $dedupTasks = Get-ScheduledTask | Where-Object {$_.TaskPath -Like $DedupTaskPath -And $_.TaskName -ne "Initialization" -And $_.State -ne "Disabled"}
 
             $configuredTasks = 0
             $taskFailures = @()
@@ -1775,6 +2072,13 @@ try {
         Write-Host "Scheduling deduplication scrub jobs" -ForegroundColor Green
         Set-ReFSDedupScrubSchedule -Volume "$devLetterColon" -Days $ScrubDays -Start $ScrubStart -WeeksInterval $ScrubWeeksInterval -ErrorAction Stop
         Write-Host "Scheduled weekly scrub job on $ScrubDays at $ScrubStart" -ForegroundColor Green
+
+        Write-Host ""
+        foreach ($line in (Resolve-DedupScheduleReminder -DailyTimes $DedupStartTimes `
+                    -WeeklyDay $ScrubDays -WeeklyStart $ScrubStart -TaskTreePath $DedupTaskTreePath)) {
+            Write-Host $line -ForegroundColor Cyan
+        }
+        Write-Host ""
 
         if ($RunInitialJob) {
             $jobParams = @{

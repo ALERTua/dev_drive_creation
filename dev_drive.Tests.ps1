@@ -87,6 +87,19 @@ Describe 'The script itself' {
             Should -BeNullOrEmpty
     }
 
+    # A user who picked their own times was shown 11:00 and 17:00 in the plan, because the line was
+    # a literal. Only the source can be checked: the plan is printed by the linear part.
+    It 'builds the plan summary schedule lines with the same formatter as the schedule question' {
+        $content = Get-Content -Path $script:ScriptPath -Raw
+        $content | Should -Match 'Format-DedupScheduleSummary -DailyTimes \$DedupStartTimes'
+        $content | Should -Not -Match '\* Schedule daily optimization jobs at 11:00 and 17:00'
+    }
+
+    It 'schedules the daily jobs from the same variable the plan summary shows' {
+        $content = Get-Content -Path $script:ScriptPath -Raw
+        $content | Should -Match 'foreach \(\$time in \$DedupStartTimes\)'
+    }
+
     It 'checks the fsutil devdrv trust exit code before declaring the drive trusted' {
         $content = Get-Content -Path $script:ScriptPath -Raw
         $content | Should -Match '(?ms)fsutil devdrv trust "\$devLetterColon" \| Out-Null\s*\r?\n\s*if \(\$LASTEXITCODE'
@@ -1096,5 +1109,296 @@ Describe 'Resolve-RerunAdvice' {
 
     It 'returns plain lines rather than an object to unwrap' {
         Resolve-RerunAdvice -ShrunkDriveLetter $null | Should -BeOfType [string]
+    }
+}
+
+Describe 'Resolve-DedupTimeInput' {
+    It 'rejects <Answer> as <Rejection>' -TestCases @(
+        @{ Answer = '';       Rejection = 'Empty' }
+        @{ Answer = '   ';    Rejection = 'Empty' }
+        @{ Answer = 'abc';    Rejection = 'InvalidTime' }
+        @{ Answer = '24:00';  Rejection = 'InvalidTime' }
+        @{ Answer = '25:00';  Rejection = 'InvalidTime' }
+        @{ Answer = '12:60';  Rejection = 'InvalidTime' }
+        @{ Answer = '12:5';   Rejection = 'InvalidTime' }
+        @{ Answer = '011:00'; Rejection = 'InvalidTime' }
+        @{ Answer = '1200';   Rejection = 'InvalidTime' }
+        @{ Answer = '12.30';  Rejection = 'InvalidTime' }
+        @{ Answer = '-1:00';  Rejection = 'InvalidTime' }
+        @{ Answer = '8:15pm'; Rejection = 'InvalidTime' }
+    ) {
+        (Resolve-DedupTimeInput -Answer $Answer).Rejection | Should -Be $Rejection
+    }
+
+    It 'accepts <Answer> as <Expected>' -TestCases @(
+        @{ Answer = '00:00';   Expected = '00:00' }
+        @{ Answer = '0:00';    Expected = '00:00' }
+        @{ Answer = '8:15';    Expected = '08:15' }
+        @{ Answer = '08:15';   Expected = '08:15' }
+        @{ Answer = '9:05';    Expected = '09:05' }
+        @{ Answer = '13:00';   Expected = '13:00' }
+        @{ Answer = '23:59';   Expected = '23:59' }
+        @{ Answer = ' 8:15 ';  Expected = '08:15' }
+    ) {
+        $verdict = Resolve-DedupTimeInput -Answer $Answer
+        $verdict.Rejection | Should -BeNullOrEmpty
+        $verdict.Time | Should -Be $Expected
+    }
+
+    Context 'when an empty answer means keeping the current time' {
+        It 'returns the current time for <Answer>' -TestCases @(
+            @{ Answer = '' }
+            @{ Answer = '   ' }
+        ) {
+            $verdict = Resolve-DedupTimeInput -Answer $Answer -CurrentTime '17:30' -AllowEmpty
+            $verdict.Rejection | Should -BeNullOrEmpty
+            $verdict.Time | Should -Be '17:30'
+        }
+
+        It 'still rejects a time that is not a time' {
+            (Resolve-DedupTimeInput -Answer '99:99' -CurrentTime '17:30' -AllowEmpty).Rejection |
+                Should -Be 'InvalidTime'
+        }
+
+        It 'rejects an empty answer when there is no current time to fall back to' {
+            (Resolve-DedupTimeInput -Answer '' -AllowEmpty).Rejection | Should -Be 'Empty'
+        }
+    }
+}
+
+Describe 'Resolve-DedupTimeListInput' {
+    It 'rejects <Answer> as <Rejection>' -TestCases @(
+        @{ Answer = '';               Rejection = 'Empty' }
+        @{ Answer = '   ';            Rejection = 'Empty' }
+        @{ Answer = ',';              Rejection = 'Empty' }
+        @{ Answer = ' , ';            Rejection = 'Empty' }
+        @{ Answer = 'abc';            Rejection = 'InvalidTime' }
+        @{ Answer = '11:00,25:00';    Rejection = 'InvalidTime' }
+        @{ Answer = '11:00,,17:00';   Rejection = 'InvalidTime' }
+        @{ Answer = '11:00,17:00,';   Rejection = 'InvalidTime' }
+        @{ Answer = '11:00,11:00';    Rejection = 'DuplicateTime' }
+        @{ Answer = '8:15,08:15';     Rejection = 'DuplicateTime' }
+        @{ Answer = '1:00,2:00,3:00,4:00,5:00'; Rejection = 'TooMany' }
+    ) {
+        (Resolve-DedupTimeListInput -Answer $Answer).Rejection | Should -Be $Rejection
+    }
+
+    It 'accepts a single time' {
+        $verdict = Resolve-DedupTimeListInput -Answer '9:00'
+        $verdict.Rejection | Should -BeNullOrEmpty
+        @($verdict.Times) | Should -Be @('09:00')
+    }
+
+    It 'accepts the maximum of four times' {
+        $verdict = Resolve-DedupTimeListInput -Answer '1:00,2:00,3:00,4:00'
+        $verdict.Rejection | Should -BeNullOrEmpty
+        @($verdict.Times).Count | Should -Be 4
+    }
+
+    It 'trims the spaces around each entry' {
+        (Resolve-DedupTimeListInput -Answer ' 8:15 , 13:00 ').Times | Should -Be @('08:15', '13:00')
+    }
+
+    It 'returns the times in ascending order whatever order they were typed in' {
+        (Resolve-DedupTimeListInput -Answer '17:00,8:15,13:00').Times |
+            Should -Be @('08:15', '13:00', '17:00')
+    }
+
+    Context 'when an empty answer means keeping the current times' {
+        It 'returns the current times for <Answer>' -TestCases @(
+            @{ Answer = '' }
+            @{ Answer = '   ' }
+        ) {
+            $verdict = Resolve-DedupTimeListInput -Answer $Answer -CurrentTimes @('11:00', '17:00') -AllowEmpty
+            $verdict.Rejection | Should -BeNullOrEmpty
+            $verdict.Times | Should -Be @('11:00', '17:00')
+        }
+
+        It 'still rejects a list of nothing but separators' {
+            (Resolve-DedupTimeListInput -Answer ',,' -CurrentTimes @('11:00') -AllowEmpty).Rejection |
+                Should -Be 'Empty'
+        }
+    }
+}
+
+Describe 'Resolve-DedupDayInput' {
+    It 'rejects <Answer> as <Rejection>' -TestCases @(
+        @{ Answer = '';         Rejection = 'Empty' }
+        @{ Answer = '   ';      Rejection = 'Empty' }
+        @{ Answer = 'Funday';   Rejection = 'InvalidDay' }
+        @{ Answer = 'Mo';       Rejection = 'InvalidDay' }
+        @{ Answer = 'Mondays';  Rejection = 'InvalidDay' }
+        @{ Answer = 'Thurs';    Rejection = 'InvalidDay' }
+        @{ Answer = '1';        Rejection = 'InvalidDay' }
+    ) {
+        (Resolve-DedupDayInput -Answer $Answer).Rejection | Should -Be $Rejection
+    }
+
+    It 'accepts <Answer> as <Expected>' -TestCases @(
+        @{ Answer = 'Monday';    Expected = 'Monday' }
+        @{ Answer = 'monday';    Expected = 'Monday' }
+        @{ Answer = 'MONDAY';    Expected = 'Monday' }
+        @{ Answer = 'Mon';       Expected = 'Monday' }
+        @{ Answer = 'tue';       Expected = 'Tuesday' }
+        @{ Answer = 'WED';       Expected = 'Wednesday' }
+        @{ Answer = 'thursday';  Expected = 'Thursday' }
+        @{ Answer = ' fri ';     Expected = 'Friday' }
+        @{ Answer = 'Sat';       Expected = 'Saturday' }
+        @{ Answer = 'sunday';    Expected = 'Sunday' }
+    ) {
+        $verdict = Resolve-DedupDayInput -Answer $Answer
+        $verdict.Rejection | Should -BeNullOrEmpty
+        $verdict.Day | Should -BeExactly $Expected
+    }
+
+    Context 'when an empty answer means keeping the current day' {
+        It 'returns the current day for <Answer>' -TestCases @(
+            @{ Answer = '' }
+            @{ Answer = '   ' }
+        ) {
+            $verdict = Resolve-DedupDayInput -Answer $Answer -CurrentDay 'Monday' -AllowEmpty
+            $verdict.Rejection | Should -BeNullOrEmpty
+            $verdict.Day | Should -Be 'Monday'
+        }
+
+        It 'still rejects a word that is not a day' {
+            (Resolve-DedupDayInput -Answer 'someday' -CurrentDay 'Monday' -AllowEmpty).Rejection |
+                Should -Be 'InvalidDay'
+        }
+    }
+}
+
+Describe 'Format-DedupTimeList' {
+    It 'reads <Times> as <Expected>' -TestCases @(
+        @{ Times = @('11:00');                   Expected = '11:00' }
+        @{ Times = @('11:00', '17:00');          Expected = '11:00 and 17:00' }
+        @{ Times = @('08:15', '11:00', '17:00'); Expected = '08:15, 11:00 and 17:00' }
+    ) {
+        Format-DedupTimeList -Times $Times | Should -Be $Expected
+    }
+
+    It 'throws for an empty array' {
+        { Format-DedupTimeList -Times @() } | Should -Throw
+    }
+}
+
+Describe 'Format-DedupScheduleSummary' {
+    It 'names the days, the daily times, the weekly day and its start' {
+        $lines = Format-DedupScheduleSummary -DailyTimes @('11:00', '17:00') -DailyDaysLabel 'Monday-Friday' `
+            -WeeklyDay 'Monday' -WeeklyStart '17:30' -WeeksInterval 1
+        $lines.Count | Should -Be 2
+        $lines[0] | Should -Be '  Daily optimization : Monday-Friday at 11:00 and 17:00'
+        $lines[1] | Should -Be '  Weekly maintenance : Monday at 17:30, every 1 week'
+    }
+
+    It 'shows the times the user chose rather than the defaults' {
+        $lines = Format-DedupScheduleSummary -DailyTimes @('08:15', '13:00') -DailyDaysLabel 'Monday-Friday' `
+            -WeeklyDay 'Saturday' -WeeklyStart '09:00' -WeeksInterval 1
+        $lines[0] | Should -Match '08:15 and 13:00'
+        $lines[1] | Should -Match 'Saturday at 09:00'
+    }
+
+    It 'says weeks in the plural for an interval above one' {
+        $lines = Format-DedupScheduleSummary -DailyTimes @('11:00') -DailyDaysLabel 'Monday-Friday' `
+            -WeeklyDay 'Monday' -WeeklyStart '17:30' -WeeksInterval 2
+        $lines[1] | Should -Match 'every 2 weeks'
+    }
+}
+
+Describe 'Resolve-DedupScheduleReminder' {
+    BeforeAll {
+        $script:TreePath = 'Task Scheduler Library > Microsoft > Windows > ReFsDedupSvc'
+    }
+
+    It 'names the times just chosen so the right task can be found by its Triggers column' {
+        $lines = (Resolve-DedupScheduleReminder -DailyTimes @('08:15', '13:00') -WeeklyDay 'Monday' `
+                -WeeklyStart '17:30' -TaskTreePath $script:TreePath) -join "`n"
+        $lines | Should -Match '08:15 and 13:00 daily'
+        $lines | Should -Match 'Monday at 17:30 weekly'
+    }
+
+    It 'gives the folder location, the admin steps and the Actions tab warning' {
+        $lines = (Resolve-DedupScheduleReminder -DailyTimes @('11:00', '17:00') -WeeklyDay 'Monday' `
+                -WeeklyStart '17:30' -TaskTreePath $script:TreePath) -join "`n"
+        $lines | Should -Match ([regex]::Escape($script:TreePath))
+        $lines | Should -Match 'taskschd\.msc'
+        $lines | Should -Match 'Ctrl\+Shift\+Enter'
+        $lines | Should -Match 'Triggers tab'
+        $lines | Should -Match 'Leave the Actions tab alone'
+        $lines | Should -Match 'may belong to Windows or to earlier runs'
+    }
+
+    It 'returns plain lines rather than an object to unwrap' {
+        Resolve-DedupScheduleReminder -DailyTimes @('11:00') -WeeklyDay 'Monday' -WeeklyStart '17:30' `
+            -TaskTreePath $script:TreePath | Should -BeOfType [string]
+    }
+}
+
+Describe 'Request-DedupSchedule' {
+    BeforeAll {
+        # The menu text is not under test here, only what the answers do to the three fields.
+        Mock Write-Host { }
+    }
+
+    It 'keeps the offered times when the user takes them' {
+        Mock Read-Host { '1' }
+        $chosen = Request-DedupSchedule -DailyTimes @('11:00', '17:00') -DailyDaysLabel 'Monday-Friday' `
+            -WeeklyDay 'Monday' -WeeklyStart '17:30' -WeeksInterval 1 -DailyDurationHours 2 -DailyCpuPercent 60
+        $chosen.DailyTimes | Should -Be @('11:00', '17:00')
+        $chosen.WeeklyDay | Should -Be 'Monday'
+        $chosen.WeeklyStart | Should -Be '17:30'
+    }
+
+    It 'takes the three answers when the user picks the times' {
+        $script:answers = @('2', '08:15,13:00', 'sat', '9:00')
+        $script:index = 0
+        Mock Read-Host { $script:answers[$script:index++] }
+        $chosen = Request-DedupSchedule -DailyTimes @('11:00', '17:00') -DailyDaysLabel 'Monday-Friday' `
+            -WeeklyDay 'Monday' -WeeklyStart '17:30' -WeeksInterval 1 -DailyDurationHours 2 -DailyCpuPercent 60
+        $chosen.DailyTimes | Should -Be @('08:15', '13:00')
+        $chosen.WeeklyDay | Should -Be 'Saturday'
+        $chosen.WeeklyStart | Should -Be '09:00'
+    }
+
+    It 'keeps each current value when the answer is empty' {
+        $script:answers = @('2', '', '', '')
+        $script:index = 0
+        Mock Read-Host { $script:answers[$script:index++] }
+        $chosen = Request-DedupSchedule -DailyTimes @('11:00', '17:00') -DailyDaysLabel 'Monday-Friday' `
+            -WeeklyDay 'Monday' -WeeklyStart '17:30' -WeeksInterval 1 -DailyDurationHours 2 -DailyCpuPercent 60
+        $chosen.DailyTimes | Should -Be @('11:00', '17:00')
+        $chosen.WeeklyDay | Should -Be 'Monday'
+        $chosen.WeeklyStart | Should -Be '17:30'
+    }
+
+    It 'keeps asking until each answer is one it can use' {
+        $script:answers = @('9', '2', '11:00,11:00', 'noon', '08:15', 'someday', 'Tue', '99:99', '7:30')
+        $script:index = 0
+        Mock Read-Host { $script:answers[$script:index++] }
+        $chosen = Request-DedupSchedule -DailyTimes @('11:00', '17:00') -DailyDaysLabel 'Monday-Friday' `
+            -WeeklyDay 'Monday' -WeeklyStart '17:30' -WeeksInterval 1 -DailyDurationHours 2 -DailyCpuPercent 60
+        $chosen.DailyTimes | Should -Be @('08:15')
+        $chosen.WeeklyDay | Should -Be 'Tuesday'
+        $chosen.WeeklyStart | Should -Be '07:30'
+        $script:index | Should -Be 9
+    }
+
+    It 'rejects too many daily times and asks again' {
+        $script:answers = @('2', '1:00,2:00,3:00,4:00,5:00', '08:15', 'Tue', '07:30')
+        $script:index = 0
+        Mock Read-Host { $script:answers[$script:index++] }
+        $chosen = Request-DedupSchedule -DailyTimes @('11:00', '17:00') -DailyDaysLabel 'Monday-Friday' `
+            -WeeklyDay 'Monday' -WeeklyStart '17:30' -WeeksInterval 1 -DailyDurationHours 2 -DailyCpuPercent 60
+        $chosen.DailyTimes | Should -Be @('08:15')
+    }
+
+    It 'says the daily job, not both jobs, run on mains power for a duration and CPU cap it names' {
+        Mock Read-Host { '1' }
+        Request-DedupSchedule -DailyTimes @('11:00', '17:00') -DailyDaysLabel 'Monday-Friday' `
+            -WeeklyDay 'Monday' -WeeklyStart '17:30' -WeeksInterval 1 -DailyDurationHours 3 -DailyCpuPercent 45 |
+            Out-Null
+        Should -Invoke Write-Host -ParameterFilter {
+            $Object -match 'The daily job runs on mains power only, for up to 3 hours, using at most 45% of the CPU\.'
+        }
     }
 }
