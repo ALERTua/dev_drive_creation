@@ -1028,9 +1028,9 @@ function Resolve-VhdxMountAdvice {
     }
 
     $opening = if ($AutoAttachRequested) {
-        "Automatic mounting was NOT enabled, so this Dev Drive is gone after every restart."
+        "Automatic mounting was NOT enabled, so this Dev Drive's mount point is gone after every restart."
     } else {
-        "You chose to mount this Dev Drive yourself, so it is gone after every restart."
+        "You chose to mount this Dev Drive yourself, so its mount point is gone after every restart."
     }
 
     return @(
