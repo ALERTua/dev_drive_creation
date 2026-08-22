@@ -125,11 +125,8 @@ Describe 'The script itself' {
         $backupAt | Should -BeGreaterThan $bannerAt
     }
 
-    It 'resizes to the answer itself and keeps no shrink-amount variable' {
-        # Asking for an amount is the double-shrink defect: the same answer twice takes it twice.
-        $content = Get-Content -Path $script:ScriptPath -Raw
-        $content | Should -Match '\$targetSize = \[math\]::Round\(\$TargetDriveGB \* 1GB\)'
-        $content | Should -Not -Match '\$ShrinkGB'
+    It 'never tells the user to just try again' {
+        Select-String -Path $script:ScriptPath -Pattern 'try again' | Should -BeNullOrEmpty
     }
 
     It 'checks the target against the size Windows itself reports as the minimum, before it resizes' {
@@ -144,7 +141,7 @@ Describe 'The script itself' {
 
     It 'ends the run on a plain refusal, not a throw, when the target is below what Windows allows' {
         # The guard fires before Resize-Partition ever runs, so this must not fall into the catch
-        # that warns the disks may already have changed.
+        # that would otherwise warn a shrink already happened.
         $content = Get-Content -Path $script:ScriptPath -Raw
         $guardAt = $content.IndexOf('if ($targetSize -lt $minSize)')
         $blockEnd = $content.IndexOf('Write-Host "Resizing Partition')
@@ -153,26 +150,38 @@ Describe 'The script itself' {
         $guardBlock | Should -Match 'exit 1'
     }
 
-    It 'names the Windows minimum in that refusal with the ceiling helper, not a bare Round' {
+    It 'names both the target and the Windows minimum in that refusal with the rounding helpers' {
         $content = Get-Content -Path $script:ScriptPath -Raw
         $guardAt = $content.IndexOf('if ($targetSize -lt $minSize)')
         $blockEnd = $content.IndexOf('Write-Host "Resizing Partition')
         $guardBlock = $content.Substring($guardAt, $blockEnd - $guardAt)
+        $guardBlock | Should -Match 'ConvertTo-FlooredGB -Bytes \$targetSize'
         $guardBlock | Should -Match 'ConvertTo-CeilingedGB -Bytes \$minSize'
     }
 
-    It 'asks the shrink question with the reworded prompt and a note true under both refusals' {
-        # The note must hold whether Windows' own floor or the Dev Drive minimum is what rejected
-        # the answer, so it names the drive's current size and says nothing about either minimum.
+    It 'shows the resize target and its sizes with the rounding helpers, not a bare Math.Round' {
+        # Scoped to the try block's resize section, not the earlier drive-selection prompt, which
+        # has its own bare Round calls outside this change's reach.
         $content = Get-Content -Path $script:ScriptPath -Raw
-        $content | Should -Match ([regex]::Escape('-Question "$driveIsNow. Enter the size it should end up as in GB"'))
-        $content | Should -Match ([regex]::Escape('-Note "$driveIsNow. This number is the size the drive should end up as, not an amount to cut from it."'))
+        $blockStart = $content.IndexOf('# Use stored partition information to avoid redundant API calls')
+        $blockEnd = $content.IndexOf('# Create Dev Drive from the freed space')
+        $blockStart | Should -BeGreaterThan 0
+        $blockEnd | Should -BeGreaterThan $blockStart
+        $block = $content.Substring($blockStart, $blockEnd - $blockStart)
+        $block | Should -Not -Match '\[math\]::Round\([^)]*/ 1GB, 2\)'
     }
 
-    It 'never takes the recovery protector id straight off the volume' {
-        # -ExpandProperty hands back an array as readily as one value, which is the defect itself.
-        Select-String -Path $script:ScriptPath -Pattern 'ExpandProperty KeyProtectorId' |
-            Should -BeNullOrEmpty
+    It 'records the shrunk drive letter right after the resize, before anything else can throw' {
+        $content = Get-Content -Path $script:ScriptPath -Raw
+        $resizeAt = $content.IndexOf('Resize-Partition -DiskNumber $diskNum -PartitionNumber $partitionInfo.PartitionNumber')
+        $recordAt = $content.IndexOf('$ShrunkDriveLetter = $DriveLetter')
+        $resizeAt | Should -BeGreaterThan 0
+        $recordAt | Should -BeGreaterThan $resizeAt
+    }
+
+    It 'sets the shrunk-drive variable to a known value before the try block that might throw first' {
+        Select-String -Path $script:ScriptPath -Pattern '^\$ShrunkDriveLetter = \$null' |
+            Should -Not -BeNullOrEmpty
     }
 }
 
@@ -1064,116 +1073,28 @@ Describe 'Resolve-VhdxMountAdvice' {
     }
 }
 
-Describe 'Resolve-ShrinkTargetRange' {
-    It 'offers every size between the Windows minimum and a whole Dev Drive freed' {
-        $range = Resolve-ShrinkTargetRange -CurrentGB 500 -WindowsMinGB 120 -DevDriveMinGB 50
-        $range.Rejection | Should -BeNullOrEmpty
-        $range.MinTargetGB | Should -Be 120
-        $range.MaxTargetGB | Should -Be 450
-        $range.MaxFreeableGB | Should -Be 380
+Describe 'Resolve-RerunAdvice' {
+    It 'says the run does not resume, and never says to just try again' {
+        $lines = (Resolve-RerunAdvice -ShrunkDriveLetter $null) -join "`n"
+        $lines | Should -Match 'does not resume'
+        $lines | Should -Not -Match 'try again'
     }
 
-    It 'rounds the Windows minimum up, never down' {
-        $range = Resolve-ShrinkTargetRange -CurrentGB 500 -WindowsMinGB 120.01 -DevDriveMinGB 50
-        $range.MinTargetGB | Should -Be 121
-        $range.MaxFreeableGB | Should -Be 379
+    It 'says nothing about a shrunk drive when nothing was shrunk' -TestCases @(
+        @{ ShrunkDriveLetter = $null }
+        @{ ShrunkDriveLetter = '' }
+    ) {
+        $lines = (Resolve-RerunAdvice -ShrunkDriveLetter $ShrunkDriveLetter) -join "`n"
+        $lines | Should -Not -Match 'shrunk'
     }
 
-    It 'accepts a drive that can free exactly one Dev Drive' {
-        $range = Resolve-ShrinkTargetRange -CurrentGB 170 -WindowsMinGB 120 -DevDriveMinGB 50
-        $range.Rejection | Should -BeNullOrEmpty
-        $range.MaxTargetGB | Should -Be $range.MinTargetGB
+    It 'names the shrunk drive and warns a second run takes the same amount off it again' {
+        $lines = (Resolve-RerunAdvice -ShrunkDriveLetter 'C') -join ' '
+        $lines | Should -Match 'Drive C: has already been shrunk'
+        $lines | Should -Match 'off it a second time'
     }
 
-    It 'refuses a drive that is one gigabyte short of a Dev Drive' {
-        $range = Resolve-ShrinkTargetRange -CurrentGB 169 -WindowsMinGB 120 -DevDriveMinGB 50
-        $range.Rejection | Should -Be 'BelowDevDriveMinimum'
-        $range.MaxFreeableGB | Should -Be 49
-    }
-
-    It 'refuses a drive already at the smallest size Windows allows' {
-        $range = Resolve-ShrinkTargetRange -CurrentGB 120 -WindowsMinGB 120 -DevDriveMinGB 50
-        $range.Rejection | Should -Be 'BelowDevDriveMinimum'
-        $range.MaxFreeableGB | Should -Be 0
-    }
-
-    It 'never reports a negative amount as freeable' {
-        # Rounding the minimum up can put it above a partition that is already at its floor.
-        $range = Resolve-ShrinkTargetRange -CurrentGB 120.2 -WindowsMinGB 120.2 -DevDriveMinGB 50
-        $range.MaxFreeableGB | Should -Be 0
-        $range.Rejection | Should -Be 'BelowDevDriveMinimum'
-    }
-
-    It 'keeps the fraction of a current size that is not a whole number' {
-        $range = Resolve-ShrinkTargetRange -CurrentGB 3613.28 -WindowsMinGB 2796.92 -DevDriveMinGB 50
-        $range.Rejection | Should -BeNullOrEmpty
-        $range.MinTargetGB | Should -Be 2797
-        $range.MaxTargetGB | Should -Be 3563.28
-        $range.MaxFreeableGB | Should -Be 816.28
-    }
-
-    It 'refuses a fractional drive that is a fraction short of a Dev Drive' {
-        $range = Resolve-ShrinkTargetRange -CurrentGB 169.75 -WindowsMinGB 120 -DevDriveMinGB 50
-        $range.Rejection | Should -Be 'BelowDevDriveMinimum'
-        $range.MaxFreeableGB | Should -Be 49.75
-    }
-
-    It 'puts the answer of a run that already shrank out of range on the next run' {
-        $accepted = 439
-        $first = Resolve-ShrinkTargetRange -CurrentGB 500 -WindowsMinGB 120 -DevDriveMinGB 50
-        (Resolve-DevDriveSizeInput -Answer "$accepted" -MinGB $first.MinTargetGB -MaxGB $first.MaxTargetGB).SizeGB |
-            Should -Be $accepted
-
-        $second = Resolve-ShrinkTargetRange -CurrentGB $accepted -WindowsMinGB 120 -DevDriveMinGB 50
-        (Resolve-DevDriveSizeInput -Answer "$accepted" -MinGB $second.MinTargetGB -MaxGB $second.MaxTargetGB).Rejection |
-            Should -Be 'AboveMaximum'
-    }
-}
-
-Describe 'Request-DevDriveSizeGB' {
-    BeforeEach {
-        $script:answers = @('600', '400')
-        $script:index = 0
-        $script:said = @()
-        $script:asked = @()
-        Mock Read-Host { $script:asked += $Prompt; $script:answers[$script:index++] }
-        Mock Write-Host { $script:said += $Object }
-    }
-
-    It 'adds the note under the refusal of a too-large answer' {
-        Request-DevDriveSizeGB -MinGB 120 -MaxGB 450 -Subject 'Final size for drive D' `
-            -Note 'Drive D: is 500 GB now.' | Should -Be 400
-        $script:said | Should -HaveCount 2
-        $script:said[0] | Should -Be 'Final size for drive D cannot exceed 450 GB. Please enter a smaller value.'
-        $script:said[1] | Should -Be 'Drive D: is 500 GB now.'
-    }
-
-    It 'adds the note under the refusal of an answer typed as an amount out of habit' {
-        # 199 is a plausible amount to take off, and far below any size the drive may end up as.
-        $script:answers = @('199', '3414.28')
-        Request-DevDriveSizeGB -MinGB 2797 -MaxGB 3563.28 -Subject 'Final size for drive D' `
-            -Note 'Drive D: is 3613.28 GB now.' | Should -Be 3414.28
-        $script:said | Should -HaveCount 2
-        $script:said[0] | Should -Be 'Final size for drive D must be at least 2797 GB. Please enter a larger value.'
-        $script:said[1] | Should -Be 'Drive D: is 3613.28 GB now.'
-    }
-
-    It 'refuses without a second line when no note was given' {
-        Request-DevDriveSizeGB -MinGB 120 -MaxGB 450 -Subject 'Dev Drive size' | Should -Be 400
-        $script:said | Should -HaveCount 1
-        $script:said[0] | Should -Be 'Dev Drive size cannot exceed 450 GB. Please enter a smaller value.'
-    }
-
-    It 'asks the question it was given rather than naming the subject' {
-        $script:answers = @('400')
-        Request-DevDriveSizeGB -MinGB 120 -MaxGB 450 -Subject 'Final size for drive D' `
-            -Question 'Drive D: is 500 GB now. Enter the size it should end up as in GB' | Should -Be 400
-        $script:asked[0] | Should -Be 'Drive D: is 500 GB now. Enter the size it should end up as in GB (min: 120, max: 450)'
-    }
-
-    It 'falls back to the subject when no question was given' {
-        $script:answers = @('400')
-        Request-DevDriveSizeGB -MinGB 120 -MaxGB 450 -Subject 'Dev Drive size' | Should -Be 400
-        $script:asked[0] | Should -Be 'Enter Dev Drive size in GB (min: 120, max: 450)'
+    It 'returns plain lines rather than an object to unwrap' {
+        Resolve-RerunAdvice -ShrunkDriveLetter $null | Should -BeOfType [string]
     }
 }

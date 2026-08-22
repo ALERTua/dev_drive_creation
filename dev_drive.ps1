@@ -744,75 +744,37 @@ function Resolve-DevDriveSizeInput {
     return $result
 }
 
-function Resolve-ShrinkTargetRange {
-    <#
-        Bounds for the question "what size should this drive end up as". Rejection fires when even
-        the smallest size Windows allows would not free a whole Dev Drive.
-    #>
-    param(
-        [Parameter(Mandatory)][decimal]$CurrentGB,
-        [Parameter(Mandatory)][decimal]$WindowsMinGB,
-        [Parameter(Mandatory)][decimal]$DevDriveMinGB
-    )
-
-    # Ceiling, never round: Resize-Partition refuses anything below the reported minimum.
-    $minTargetGB = [decimal][math]::Ceiling($WindowsMinGB)
-
-    # Kept decimal, and clamped without Math.Max: a bare zero there would bind the Int32
-    # overload and round the answer up, which is what this figure must never do.
-    $freeableGB = $CurrentGB - $minTargetGB
-    if ($freeableGB -lt 0) { $freeableGB = [decimal]0 }
-
-    $result = [PSCustomObject]@{
-        Rejection     = $null
-        MinTargetGB   = $minTargetGB
-        MaxTargetGB   = $CurrentGB - $DevDriveMinGB
-        MaxFreeableGB = $freeableGB
-    }
-    if ($result.MaxTargetGB -lt $minTargetGB) {
-        $result.Rejection = 'BelowDevDriveMinimum'
-    }
-    return $result
-}
-
 function Request-DevDriveSizeGB {
     <#
-        The one size question for all three creation modes. -Subject names the answer in the
-        refusals and so must be a noun phrase; -Question rewords the prompt when that is not
-        plain enough. -MaxIsAdvisory warns instead of rejecting, for an expanding virtual disk.
+        The one size question for all three creation modes. -MaxIsAdvisory warns instead of
+        rejecting, for a dynamically expanding disk that is allowed to outgrow its host volume.
     #>
     param(
         [Parameter(Mandatory)][decimal]$MaxGB,
         [Parameter(Mandatory)][string]$Subject,
         [decimal]$MinGB = $script:DevDriveMinSizeGB,
-        [string]$Question = '',
-        [string]$Note = '',
         [switch]$AllowMaxOnEmpty,
         [switch]$MaxIsAdvisory
     )
 
     $maxHint = if ($AllowMaxOnEmpty) { "max: $MaxGB, press Enter for max" } else { "max: $MaxGB" }
-    $asked = if ($Question) { $Question } else { "Enter $Subject in GB" }
 
-    # Subject opens every refusal, so it must be capitalised.
     while ($true) {
-        $answer = Read-Host "$asked (min: $MinGB, $maxHint)"
+        $answer = Read-Host "Enter $Subject in GB (min: $MinGB, $maxHint)"
 
         $verdict = Resolve-DevDriveSizeInput -Answer $answer -MinGB $MinGB -MaxGB $MaxGB `
             -AllowEmpty:$AllowMaxOnEmpty -MaxIsAdvisory:$MaxIsAdvisory
 
         if ($verdict.Rejection -eq 'NotANumber') {
-            Write-Host "$Subject must be a positive decimal number. Please try again." -ForegroundColor Red
+            Write-Host "Invalid $Subject. Please enter a positive decimal number." -ForegroundColor Red
             continue
         }
         if ($verdict.Rejection -eq 'BelowMinimum') {
             Write-Host "$Subject must be at least $MinGB GB. Please enter a larger value." -ForegroundColor Red
-            if ($Note) { Write-Host $Note -ForegroundColor Red }
             continue
         }
         if ($verdict.Rejection -eq 'AboveMaximum') {
             Write-Host "$Subject cannot exceed $MaxGB GB. Please enter a smaller value." -ForegroundColor Red
-            if ($Note) { Write-Host $Note -ForegroundColor Red }
             continue
         }
 
@@ -1108,6 +1070,26 @@ function Request-AutoAttachChoice {
     }
 }
 
+function Resolve-RerunAdvice {
+    <#
+        What the closing failure message says about running again. A run never resumes - it always
+        starts from the beginning - so shrink mode has to warn when a resize already happened.
+    #>
+    param([AllowNull()][AllowEmptyString()][string]$ShrunkDriveLetter)
+
+    $lines = @(
+        "Check the error above, undo whatever this run already changed, and only then run it again."
+        "This script does not resume: every run starts from the beginning."
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($ShrunkDriveLetter)) {
+        $lines += "Drive ${ShrunkDriveLetter}: has already been shrunk."
+        $lines += "Running again with the same answer takes that much off it a second time."
+    }
+
+    return $lines
+}
+
 Write-Host "Dev Drive creation script with BitLocker encryption and ReFS deduplication." -ForegroundColor Green
 
 # Check Windows version. Read in two steps: a missing value leaves nothing to take CurrentBuild off.
@@ -1247,37 +1229,29 @@ if ($mode -eq "FreeSpace") {
 
                 # Get the real shrinkable size from Windows
                 Write-Host "Getting Partition shrinkable size information (this may take ~30 seconds)..." -ForegroundColor Cyan
-                $partitionInfo = $null
                 try {
                     $partitionInfo = Get-Partition -DriveLetter $DriveLetter -ErrorAction Stop
                     $supportedSizes = $partitionInfo | Get-PartitionSupportedSize -ErrorAction Stop
-                    $currentPartitionGB = ConvertTo-FlooredGB -Bytes $partitionInfo.Size
-                    $shrinkRange = Resolve-ShrinkTargetRange -CurrentGB $currentPartitionGB `
-                        -WindowsMinGB ($supportedSizes.SizeMin / 1GB) -DevDriveMinGB $DevDriveMinSizeGB
+                    $minSizeGB = [math]::Round($supportedSizes.SizeMin / 1GB, 2)
+                    $realMaxShrinkableBytes = $partitionInfo.Size - $supportedSizes.SizeMin
+                    # Floor (not round) so the displayed/accepted maximum is never above the real shrinkable size
+                    $realMaxShrinkableGB = ConvertTo-FlooredGB -Bytes $realMaxShrinkableBytes
 
                     Write-Host "Shrinkable size information:" -ForegroundColor Yellow
-                    Write-Host "  Current partition size: $currentPartitionGB GB" -ForegroundColor White
-                    Write-Host "  Smallest size Windows allows: $($shrinkRange.MinTargetGB) GB" -ForegroundColor White
-                    Write-Host "  Maximum shrinkable: $($shrinkRange.MaxFreeableGB) GB" -ForegroundColor Green
+                    Write-Host "  Current partition size: $([math]::Round($partitionInfo.Size / 1GB, 2)) GB" -ForegroundColor White
+                    Write-Host "  Minimum partition size: $minSizeGB GB" -ForegroundColor White
+                    Write-Host "  Maximum shrinkable: $realMaxShrinkableGB GB" -ForegroundColor Green
                     Write-Host ""
                     Write-Host "Note: Windows allows shrinking by the size of starting from the end of the drive disk space to the nearest written file block. Disk Fragmentation can affect this. If Windows does not allow for a drive to be shrunk, please use third-party tools (e.g. AOMEI)." -ForegroundColor Gray
                     Write-Host ""
                 }
                 catch {
                     Write-Host "Could not determine real shrinkable size. Using estimated values." -ForegroundColor Yellow
-                    # Resize-Partition takes a partition size, so prefer the partition's own over the volume's.
-                    $currentSizeBytes = if ($partitionInfo) { $partitionInfo.Size } else { $driveOnDisk.Size }
-                    if (-not $partitionInfo) {
-                        Write-Host "The partition size is unknown too, so this uses the size of the volume inside it; both the freed space and the Dev Drive built from it may come out a few MB larger than planned." -ForegroundColor Yellow
-                    }
-                    $currentPartitionGB = ConvertTo-FlooredGB -Bytes $currentSizeBytes
-                    # Windows never answered: guess its floor as the used space plus the spare.
-                    # Left free to go negative, so a volume with less spare than that is refused below.
-                    $estimatedMinBytes = $currentSizeBytes - ($driveOnDisk.SizeRemaining - $ShrinkSpareBytes)
-                    $shrinkRange = Resolve-ShrinkTargetRange -CurrentGB $currentPartitionGB `
-                        -WindowsMinGB ($estimatedMinBytes / 1GB) -DevDriveMinGB $DevDriveMinSizeGB
-                    Write-Host "Estimated maximum shrinkable: $($shrinkRange.MaxFreeableGB) GB" -ForegroundColor Green
-                    # Null again so the partition details are fetched afresh before the resize
+                    # Left free to go negative: the Dev Drive minimum check below then refuses the volume.
+                    $realMaxShrinkableBytes = $driveOnDisk.SizeRemaining - $ShrinkSpareBytes
+                    $realMaxShrinkableGB = ConvertTo-FlooredGB -Bytes $realMaxShrinkableBytes
+                    Write-Host "Estimated maximum shrinkable: $realMaxShrinkableGB GB" -ForegroundColor Green
+                    # Set partitionInfo to null so we know to get it again later
                     $partitionInfo = $null
                 }
 
@@ -1290,23 +1264,18 @@ if ($mode -eq "FreeSpace") {
         }
     }
 
-    if ($shrinkRange.Rejection) {
+    if ($realMaxShrinkableBytes -lt ($DevDriveMinSizeGB * 1GB)) {
         if ($partitionInfo) {
-            Write-Host "Drive $DriveLetter can only be shrunk by $($shrinkRange.MaxFreeableGB) GB, which is below the $DevDriveMinSizeGB GB minimum required for a Dev Drive." -ForegroundColor Red
+            Write-Host "Drive $DriveLetter can only be shrunk by $realMaxShrinkableGB GB, which is below the $DevDriveMinSizeGB GB minimum required for a Dev Drive." -ForegroundColor Red
         } else {
-            Write-Host "Drive $DriveLetter can only be shrunk by an estimated $($shrinkRange.MaxFreeableGB) GB, which is below the $DevDriveMinSizeGB GB minimum required for a Dev Drive." -ForegroundColor Red
+            Write-Host "Drive $DriveLetter can only be shrunk by an estimated $realMaxShrinkableGB GB, which is below the $DevDriveMinSizeGB GB minimum required for a Dev Drive." -ForegroundColor Red
         }
         Write-Host "Exiting. Please choose a different drive or use free space mode, then run the script again." -ForegroundColor Yellow
         exit 1
     }
 
-    # A size to end up as, not an amount: the same answer twice leaves a drive already that size.
-    $driveIsNow = "Drive $DriveLetter`: is $currentPartitionGB GB now"
-    $TargetDriveGB = Request-DevDriveSizeGB -MinGB $shrinkRange.MinTargetGB -MaxGB $shrinkRange.MaxTargetGB `
-        -Subject "Final size for drive $DriveLetter" `
-        -Question "$driveIsNow. Enter the size it should end up as in GB" `
-        -Note "$driveIsNow. This number is the size the drive should end up as, not an amount to cut from it."
-    $SizeGB = $currentPartitionGB - $TargetDriveGB
+    $ShrinkGB = Request-DevDriveSizeGB -MaxGB $realMaxShrinkableGB -Subject 'Shrink amount'
+    $SizeGB = $ShrinkGB  # The Dev Drive fills exactly the space that was freed
 } else { # Vhdx
     # Compile the interop now rather than after every question, so a machine that forbids Add-Type
     # fails before the user has answered anything.
@@ -1387,7 +1356,7 @@ Write-Host "" -ForegroundColor Cyan
 
 # Unified action list with all details
 if ($mode -eq "ShrinkDrive") {
-    Write-Host "* Shrink Drive $DriveLetter ($driveLabel) from $currentPartitionGB GB to $TargetDriveGB GB, freeing $SizeGB GB" -ForegroundColor White
+    Write-Host "* Shrink Drive $DriveLetter ($driveLabel) by $ShrinkGB GB to free up space" -ForegroundColor White
 }
 if ($mode -eq "Vhdx") {
     Write-Host "* Create a $SizeGB GB $VhdxDiskType virtual hard disk at $VhdxPath" -ForegroundColor White
@@ -1443,6 +1412,8 @@ Write-Host "`nStarting Dev Drive creation..." -ForegroundColor Green
 $VhdxAtBootGranted = $false
 # Repeated at the end: printed once at attach time, it scrolls away behind formatting and dedup.
 $VhdxMountAdvice = @()
+# The catch below reads this to know whether a shrink already resized a partition.
+$ShrunkDriveLetter = $null
 
 try {
     if ($mode -eq "FreeSpace") {
@@ -1487,6 +1458,8 @@ try {
         if ($partitionInfo) {
             # We already have the partition info from the shrinkable size check
             $diskNum = $partitionInfo.DiskNumber
+            $maxSize = $supportedSizes.SizeMax
+            $minSize = $supportedSizes.SizeMin
             Write-Host "Using previously retrieved partition information for drive $DriveLetter" -ForegroundColor Green
         } else {
             # Fallback: get partition info if we couldn't get it earlier
@@ -1494,27 +1467,23 @@ try {
             $partitionInfo = Get-Partition -DriveLetter $DriveLetter -ErrorAction Stop
             $diskNum = $partitionInfo.DiskNumber
             $supportedSizes = $partitionInfo | Get-PartitionSupportedSize -ErrorAction Stop
+            $maxSize = $supportedSizes.SizeMax
+            $minSize = $supportedSizes.SizeMin
         }
-        $maxSize = $supportedSizes.SizeMax
-        $minSize = $supportedSizes.SizeMin
 
         Write-Host "Maximum size for $DriveLetter`: $(ConvertTo-FlooredGB -Bytes $maxSize) GB" -ForegroundColor Green
-        $targetSize = [math]::Round($TargetDriveGB * 1GB)
+        $targetSize = $maxSize - [math]::Round($ShrinkGB * 1GB, 2)
         Write-Host "Target size after shrinking: $(ConvertTo-FlooredGB -Bytes $targetSize) GB" -ForegroundColor Green
-        if ($targetSize -le 0 -or $targetSize -gt $maxSize) {
-            throw "Cannot shrink drive $DriveLetter to $TargetDriveGB GB; that size is not possible for this partition."
-        }
-        # The estimated path guessed this floor, so it can sit below the one Windows now reports.
-        # Nothing has touched the disk yet, so this exits plainly rather than throwing into the catch.
         if ($targetSize -lt $minSize) {
-            Write-Host "Cannot shrink drive $DriveLetter to $TargetDriveGB GB; Windows will not take it below $(ConvertTo-CeilingedGB -Bytes $minSize) GB." -ForegroundColor Red
+            Write-Host "Cannot shrink drive $DriveLetter to $(ConvertTo-FlooredGB -Bytes $targetSize) GB; Windows will not take it below $(ConvertTo-CeilingedGB -Bytes $minSize) GB." -ForegroundColor Red
             Write-Host "Exiting. Please choose a different drive or use free space mode, then run the script again." -ForegroundColor Yellow
             exit 1
         }
 
         Write-Host "Resizing Partition $($partitionInfo.PartitionNumber) of disk $diskNum to $(ConvertTo-FlooredGB -Bytes $targetSize) GB ..." -ForegroundColor Green
         Resize-Partition -DiskNumber $diskNum -PartitionNumber $partitionInfo.PartitionNumber -Size $targetSize -ErrorAction Stop
-        Write-Host "Shrunk drive $DriveLetter to $TargetDriveGB GB, freeing $SizeGB GB" -ForegroundColor Green
+        $ShrunkDriveLetter = $DriveLetter
+        Write-Host "Shrunk drive $DriveLetter by $ShrinkGB GB" -ForegroundColor Green
 
         # Create Dev Drive from the freed space
         Write-Host "Creating a new partition from the freed space on disk $diskNum" -ForegroundColor Green
@@ -1850,8 +1819,7 @@ catch {
     Write-Host $_.Exception.Message -ForegroundColor Yellow
 
     # A .vhdx created before the failure stays attached, and may already be set to attach at startup.
-    $vhdxLeftBehind = ($mode -eq "Vhdx") -and $VhdxPath -and (Test-Path -LiteralPath $VhdxPath)
-    if ($vhdxLeftBehind) {
+    if ($mode -eq "Vhdx" -and $VhdxPath -and (Test-Path -LiteralPath $VhdxPath)) {
         Write-Host "Left behind: $VhdxPath, still attached." -ForegroundColor Yellow
         if ($VhdxAtBootGranted) {
             Write-Host "It is also registered to attach on every startup. Dismounting clears that." -ForegroundColor Yellow
@@ -1859,16 +1827,8 @@ catch {
         Write-Host "To remove it: Dismount-DiskImage -ImagePath '$VhdxPath'; Remove-Item -LiteralPath '$VhdxPath'" -ForegroundColor Yellow
     }
 
-    if ($mode -eq "Vhdx") {
-        if ($vhdxLeftBehind) {
-            Write-Host "No partition on a physical disk was changed, so removing that file undoes this run." -ForegroundColor Yellow
-        } else {
-            Write-Host "Nothing was left behind on a physical disk." -ForegroundColor Yellow
-        }
-        Write-Host "Please check the error message and try again." -ForegroundColor Yellow
-    } else {
-        Write-Host "This run may already have changed the disks, and running it again starts from the beginning," -ForegroundColor Yellow
-        Write-Host "so repeating it is not safe until the disks have been checked in Disk Management (diskmgmt.msc)." -ForegroundColor Yellow
+    foreach ($line in (Resolve-RerunAdvice -ShrunkDriveLetter $ShrunkDriveLetter)) {
+        Write-Host $line -ForegroundColor Yellow
     }
     exit 1
 }
