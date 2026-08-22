@@ -43,7 +43,7 @@ This script runs in interactive mode and will guide you through the entire Dev D
 6. **Compression Configuration**: Select format (LZ4/ZSTD) and level (1-9 for ZSTD)
 7. **Deduplication Schedule**: Keep the suggested times, or set them yourself
 
-In virtual hard disk mode, step 2 is skipped; instead you are asked for the file path, the disk type, the size and whether to mount the file automatically on startup. There is no press-Enter-for- maximum there, and the size has a 50 GB floor. See [Virtual hard disk mode](#virtual-hard-disk-mode).
+In virtual hard disk mode, step 2 is skipped; instead you are asked for the file path, the disk type, the size and whether to mount the file automatically on startup. There is no press-Enter-for-maximum there, and the size has a 50 GB floor. See [Virtual hard disk mode](#virtual-hard-disk-mode).
 
 ### Interactive Flow:
 
