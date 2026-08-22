@@ -64,6 +64,17 @@ Describe 'The script itself' {
         [int]$line.Matches[0].Groups[1].Value | Should -Be 50
     }
 
+    It 'declares the shrink head-room exactly once' {
+        (Select-String -Path $script:ScriptPath -Pattern '^\$ShrinkSpareBytes\s*=' ).Count | Should -Be 1
+    }
+
+    It 'never lets an untyped 0 choose the overload of a Math comparison' {
+        # A bare 0 is an Int32, so Max/Min bind their Int32 overload: the other argument is rounded,
+        # and a byte count too big for an Int32 throws instead.
+        Select-String -Path $script:ScriptPath -Pattern '\[math\]::(Max|Min)\(\s*0\s*,' |
+            Should -BeNullOrEmpty
+    }
+
     It 'exits non-zero when the Windows build is too old' {
         $content = Get-Content -Path $script:ScriptPath -Raw
         $matched = $content -match '(?ms)Write-Error "Your Windows build.*?\r?\n\s*exit\s+(\d+)'
@@ -378,6 +389,19 @@ Describe 'ConvertTo-FlooredGB' {
     It 'never reports more gigabytes than there are bytes' {
         $bytes = [uint64](49.996 * 1GB)
         (ConvertTo-FlooredGB -Bytes $bytes) * 1GB | Should -BeLessOrEqual $bytes
+    }
+
+    It 'reports <Bytes> bytes as 0 rather than as a negative size' -TestCases @(
+        @{ Bytes = -1 }
+        @{ Bytes = -5GB }
+        @{ Bytes = 1GB - 5GB }
+    ) {
+        ConvertTo-FlooredGB -Bytes $Bytes | Should -Be 0
+    }
+
+    It 'answers for a byte count far above the Int32 range' {
+        # 3.5 TB of free space less the shrink head-room: the size of a real disk, not of an Int32.
+        ConvertTo-FlooredGB -Bytes (3.5TB - 5GB) | Should -Be 3579
     }
 }
 

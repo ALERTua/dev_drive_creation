@@ -148,7 +148,9 @@ function Get-Win32ErrorText {
 
 function ConvertTo-FlooredGB {
     # Floor, never round: a displayed maximum must never exceed the real one.
+    # A volume with nothing to give reads as 0, not as a negative.
     param([Parameter(Mandatory)][double]$Bytes)
+    if ($Bytes -le 0) { return 0 }
     return [math]::Floor($Bytes / 1GB * 100) / 100
 }
 
@@ -1081,6 +1083,9 @@ $DevDriveMinSizeGB = 50
 # Head-room kept on the volume hosting a fixed size .vhdx, so it is never filled to the last byte.
 $VhdxHostSpareBytes = 1GB
 
+# Head-room left on a shrunk volume, so an estimate never offers to take its last free byte.
+$ShrinkSpareBytes = 5GB
+
 # Set default values for deduplication and compression settings
 $DedupMode = 'Dedup'
 $CompressionFormat = 'LZ4'
@@ -1176,7 +1181,8 @@ if ($mode -eq "FreeSpace") {
         # Not $sizeGB: names are case-insensitive here, and $SizeGB is the Dev Drive size.
         $volSizeGB = [math]::Round($vol.Size / 1GB, 2)
         $freeGB = [math]::Round($vol.SizeRemaining / 1GB, 2)
-        $shrinkableGB = [math]::Max(0, $freeGB - 5)
+        # From bytes, not from the already-rounded $freeGB, so the listed figure is never above the real one.
+        $shrinkableGB = ConvertTo-FlooredGB -Bytes ($vol.SizeRemaining - $ShrinkSpareBytes)
 
         Write-Host "  Drive $letter`: $($vol.FileSystemLabel)" -ForegroundColor Yellow
         Write-Host "    Total: $volSizeGB GB | Free: $freeGB GB | Shrinkable: ~$shrinkableGB GB" -ForegroundColor White
@@ -1214,7 +1220,8 @@ if ($mode -eq "FreeSpace") {
                 }
                 catch {
                     Write-Host "Could not determine real shrinkable size. Using estimated values." -ForegroundColor Yellow
-                    $realMaxShrinkableBytes = [math]::Max(0, $driveOnDisk.SizeRemaining - (5 * 1GB))
+                    # Left free to go negative: the Dev Drive minimum check below then refuses the volume.
+                    $realMaxShrinkableBytes = $driveOnDisk.SizeRemaining - $ShrinkSpareBytes
                     $realMaxShrinkableGB = ConvertTo-FlooredGB -Bytes $realMaxShrinkableBytes
                     Write-Host "Estimated maximum shrinkable: $realMaxShrinkableGB GB" -ForegroundColor Green
                     # Set partitionInfo to null so we know to get it again later
