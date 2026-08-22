@@ -2,6 +2,8 @@
 
 An interactive PowerShell script that guides users through creating Windows Dev Drives with customizable BitLocker encryption and ReFS deduplication settings.
 
+This script automates work you are expected to be able to do by hand: it assumes you understand what it touches - partitions, ReFS, BitLocker and scheduled tasks - and that you can carry out and reverse every step yourself. It does not resume after a failure and undoes nothing for you, so it is not a tool for learning any of that.
+
 ## Features
 
 - **Interactive Setup**: Step-by-step guided creation process
