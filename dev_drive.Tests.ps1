@@ -75,6 +75,18 @@ Describe 'The script itself' {
             Should -BeNullOrEmpty
     }
 
+    It 'prints the intro banner right after the administrator requirement and before the Windows build check' {
+        # The admin requirement is a #Requires statement, enforced before any script statement
+        # runs, so nothing can print ahead of it; this checks the banner is the very next thing.
+        $content = Get-Content -Path $script:ScriptPath -Raw
+        $adminCheckAt = $content.IndexOf('#Requires -RunAsAdministrator')
+        $bannerCallAt = $content.LastIndexOf('Resolve-AutomationBanner')
+        $buildCheckAt = $content.IndexOf('# Check Windows version')
+        $adminCheckAt | Should -BeGreaterThan -1
+        $bannerCallAt | Should -BeGreaterThan $adminCheckAt
+        $buildCheckAt | Should -BeGreaterThan $bannerCallAt
+    }
+
     It 'exits non-zero when the Windows build is too old' {
         $content = Get-Content -Path $script:ScriptPath -Raw
         $matched = $content -match '(?ms)Write-Error "Your Windows build.*?\r?\n\s*exit\s+(\d+)'
@@ -824,6 +836,25 @@ Describe 'Resolve-BitLockerProtectorPlan' {
         $plan.Rejection | Should -Be 'Multiple'
         $plan.Message | Should -Match 'will not guess'
         $plan.TypesToAdd | Should -Not -Contain 'RecoveryPassword'
+    }
+}
+
+Describe 'Resolve-AutomationBanner' {
+    It 'returns the agreed warning about what the script assumes of the person running it' {
+        $lines = Resolve-AutomationBanner
+        $lines | Should -Be @(
+            "This script AUTOMATES work you are expected to be able to do by hand."
+            ""
+            "It assumes you understand what it touches - partitions, ReFS, BitLocker and scheduled"
+            "tasks - and that you can carry out every step it takes, and reverse it, yourself. It"
+            "does not resume after a failure, and it undoes nothing for you."
+            ""
+            "This is not a tool for learning any of that."
+        )
+    }
+
+    It 'returns plain lines rather than an object to unwrap' {
+        Resolve-AutomationBanner | Should -BeOfType [string]
     }
 }
 

@@ -317,6 +317,22 @@ function Request-BitLockerChoice {
     }
 }
 
+function Resolve-AutomationBanner {
+    <#
+        The warning printed before any check, so a run about to be refused still says up front
+        what this script assumes of the person running it. Wording is agreed and must not drift.
+    #>
+    return @(
+        "This script AUTOMATES work you are expected to be able to do by hand."
+        ""
+        "It assumes you understand what it touches - partitions, ReFS, BitLocker and scheduled"
+        "tasks - and that you can carry out every step it takes, and reverse it, yourself. It"
+        "does not resume after a failure, and it undoes nothing for you."
+        ""
+        "This is not a tool for learning any of that."
+    )
+}
+
 function Resolve-EntraJoinState {
     <# Reads AzureAdJoined out of dsregcmd output; anything else, including no output, means no. #>
     param([AllowNull()][AllowEmptyCollection()][string[]]$StatusLines)
@@ -1370,7 +1386,9 @@ function Resolve-RerunAdvice {
     return $lines
 }
 
-Write-Host "Dev Drive creation script with BitLocker encryption and ReFS deduplication." -ForegroundColor Green
+foreach ($line in (Resolve-AutomationBanner)) {
+    Write-Host $line -ForegroundColor Yellow
+}
 
 # Check Windows version. Read in two steps: a missing value leaves nothing to take CurrentBuild off.
 $buildKey = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -Name CurrentBuild -ErrorAction SilentlyContinue
