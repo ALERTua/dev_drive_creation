@@ -8,7 +8,7 @@ An interactive PowerShell script that guides users through creating Windows Dev 
 - **Flexible Creation Methods**: Use free space, shrink an existing drive, or create a `.vhdx` file
 - **Virtual Hard Disk Mode**: Puts the Dev Drive in a `.vhdx` file that Windows can mount on every startup
 - **Smart Drive Selection**: Shows detailed drive information for informed choices
-- **Optional BitLocker**: Choose encryption with automatic retry on password rejection
+- **Optional BitLocker**: Encryption that fits the machine, with the recovery key shown before the run goes on and a rejected password asked for again
 - **Advanced Deduplication**: Configure deduplication with optional compression
 - **Compression Options**: Choose LZ4 or ZSTD with customizable compression levels
 - **Real Size Limits**: Shows actual Windows shrinkable limits, not estimates
@@ -38,7 +38,7 @@ This script runs in interactive mode and will guide you through the entire Dev D
 1. **Creation Method**: Free space on a disk, shrinking an existing drive, or a `.vhdx` file
 2. **Drive Selection**: Shows all physical drives with size and free space information
 3. **Size Configuration**: Enter Dev Drive size (minimum 50 GB; in free-space mode press Enter for the maximum)
-4. **BitLocker Setup**: Optional encryption with automatic password retry
+4. **BitLocker Setup**: Optional encryption, with the recovery key shown and acknowledged
 5. **Deduplication Options**: Choose deduplication level and compression settings
 6. **Compression Configuration**: Select format (LZ4/ZSTD) and level (1-9 for ZSTD)
 
@@ -203,9 +203,14 @@ E           DevDrive     ReFS           Fixed     Healthy      OK               
    - Validates input against actual Windows constraints, including the 50 GB Dev Drive minimum
 
 4. **Security Configuration**
-   - Optional BitLocker encryption with strong password requirements
-   - Automatic retry if password is rejected by BitLocker
-   - Azure AD backup for recovery keys
+   - Optional BitLocker encryption, enabled together with its recovery key in one step
+   - The recovery key is printed and has to be acknowledged before the run continues
+   - A password is asked for in virtual hard disk mode only, and asked for again if BitLocker rejects it
+   - The domain account protector is added only on a machine joined to an Active Directory domain
+   - The recovery key goes to Azure AD only on a device joined to Entra ID
+   - Automatic unlocking is set only when the operating system drive is BitLocker-protected
+   - What the machine can actually do is checked before the plan is shown, and listed in it
+   - A BitLocker failure offers a choice: retry, carry on without it, or stop
 
 5. **Storage Optimization Setup**
    - Choose deduplication level (none, deduplication-only, or with compression)
@@ -267,11 +272,20 @@ startup, with the same drive letter and its trusted Dev Drive status intact. Tha
 Windows's own bookkeeping — writing it by hand does not enable anything.
 
 Older Windows builds may reject the flag. If that happens the script says so, attaches the disk
-anyway, and you get a working Dev Drive that needs mounting by hand after each restart:
+anyway, and you get a working Dev Drive that needs mounting by hand after each restart.
+
+Whenever the disk will not be mounted for you — because Windows refused the flag, or because you
+declined automatic mounting — the script prints the command, once when the disk is attached and
+again at the end so it does not scroll away:
 
 ```powershell
 Mount-DiskImage -ImagePath 'D:\DevDrive.vhdx' -StorageType VHDX -Access ReadWrite
 ```
+
+Run it from a PowerShell started as administrator. Microsoft's
+[`Mount-DiskImage` reference](https://learn.microsoft.com/en-us/powershell/module/storage/mount-diskimage)
+states that mounting a virtual hard disk requires administrator privileges, unlike mounting an
+`.iso` file.
 
 ### BitLocker inside a virtual hard disk
 
@@ -291,9 +305,11 @@ against a deduplicated Dev Drive without a backup.
 
 ## Security Notes
 
-- Requires complex password (8+ chars, upper/lower/digit/special)
-- BitLocker recovery key backed up to Azure AD
-- Auto-unlock enabled for convenience
+- Requires a complex password (8+ chars, upper/lower/digit/special) where one is asked for
+- BitLocker recovery key printed for you to write down, and backed up to Azure AD on an Entra ID device
+- On a device outside Entra ID the key exists only on the volume and on your paper copy, so keep it
+- Auto-unlock enabled where Windows allows it, meaning the operating system drive is protected too
+- Without an Active Directory domain the drive is still encrypted and still has its recovery key
 - Drive marked as trusted for development workloads
 
 ## Scheduled Jobs
