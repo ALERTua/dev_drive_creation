@@ -25,6 +25,12 @@ BeforeAll {
     }
 
     Initialize-VirtDiskInterop
+
+    # Stands in for one entry of a BitLocker volume's KeyProtector list.
+    function New-Protector {
+        param([string]$Type, [string]$Id)
+        return [PSCustomObject]@{ KeyProtectorType = $Type; KeyProtectorId = $Id }
+    }
 }
 
 Describe 'The script itself' {
@@ -70,6 +76,31 @@ Describe 'The script itself' {
     It 'prints a plan summary line when BitLocker is skipped' {
         Select-String -Path $script:ScriptPath -Pattern '\* Skip BitLocker encryption' |
             Should -Not -BeNullOrEmpty
+    }
+
+    It 'creates the recovery key with Enable-BitLocker instead of a separate protector' {
+        $content = Get-Content -Path $script:ScriptPath -Raw
+        $content | Should -Match 'Enable-BitLocker -MountPoint \$devLetterColon -RecoveryPasswordProtector'
+        $content | Should -Not -Match 'Add-BitLockerKeyProtector[^\r\n]*-RecoveryPasswordProtector'
+    }
+
+    It 'keeps asking until the recovery key is acknowledged' {
+        # A single if would let one wrong answer through, so the loop itself is what is asserted.
+        $content = Get-Content -Path $script:ScriptPath -Raw
+        $content | Should -Match '(?ms)Write-Host \$recoveryKey.{0,400}?while \(\(Read-Host "Type YES[^\r\n]*\) -ne "YES"\)'
+    }
+
+    It 'settles the BitLocker facts before it prints the plan for confirmation' {
+        $content = Get-Content -Path $script:ScriptPath -Raw
+        $planLine = $content.IndexOf('$bitLockerPlan = Resolve-BitLockerSetupPlan')
+        $summaryLine = $content.IndexOf('* Enable BitLocker encryption for the Dev Drive')
+        $planLine | Should -BeGreaterThan 0
+        $summaryLine | Should -BeGreaterThan $planLine
+    }
+
+    It 'backs the recovery key up to Azure AD only when the plan says so' {
+        $content = Get-Content -Path $script:ScriptPath -Raw
+        $content | Should -Match "(?ms)if \(\`$bitLockerPlan\.UseAadBackup\) \{[^\r\n]*\r?\n[^\r\n]*\r?\n\s*BackupToAAD-BitLockerKeyProtector"
     }
 }
 
@@ -346,5 +377,390 @@ Describe 'Get-Win32ErrorText' {
 
     It 'includes the message Windows gives for the code' {
         Get-Win32ErrorText -Code 5 | Should -Match 'Access is denied'
+    }
+}
+
+Describe 'Resolve-BitLockerSetupPlan' {
+    It 'asks for a password only in virtual hard disk mode' -TestCases @(
+        @{ Vhdx = $true;  Expected = $true }
+        @{ Vhdx = $false; Expected = $false }
+    ) {
+        (Resolve-BitLockerSetupPlan -VhdxMode:$Vhdx).UsePasswordProtector | Should -Be $Expected
+    }
+
+    It 'adds the domain account protector only on a domain-joined machine' -TestCases @(
+        @{ Joined = $true;  Expected = $true }
+        @{ Joined = $false; Expected = $false }
+    ) {
+        (Resolve-BitLockerSetupPlan -DomainJoined:$Joined).UseAdAccountProtector | Should -Be $Expected
+    }
+
+    It 'turns on automatic unlocking only when the operating system drive is protected' -TestCases @(
+        @{ Protected = $true;  Expected = $true }
+        @{ Protected = $false; Expected = $false }
+    ) {
+        (Resolve-BitLockerSetupPlan -OsDriveProtected:$Protected).UseAutoUnlock | Should -Be $Expected
+    }
+
+    It 'says why a machine outside a domain gets no domain protector, and that the drive is still safe' {
+        $notes = (Resolve-BitLockerSetupPlan -DomainJoined:$false).Notes -join "`n"
+        $notes | Should -Match 'not joined to an Active Directory domain'
+        $notes | Should -Match 'still encrypted and still protected by its recovery key'
+    }
+
+    It 'says a domain protector is coming when the machine is joined' {
+        $notes = (Resolve-BitLockerSetupPlan -DomainJoined:$true).Notes -join "`n"
+        $notes | Should -Match 'joined to an Active Directory domain'
+        $notes | Should -Not -Match 'not joined to an Active Directory domain'
+    }
+
+    It 'backs the key up to Azure AD only on a device joined to Entra ID' -TestCases @(
+        @{ Entra = $true;  Expected = $true }
+        @{ Entra = $false; Expected = $false }
+    ) {
+        (Resolve-BitLockerSetupPlan -EntraJoined:$Entra).UseAadBackup | Should -Be $Expected
+    }
+
+    It 'says the key goes to Azure AD when the device is joined to Entra ID' {
+        $notes = (Resolve-BitLockerSetupPlan -EntraJoined:$true).Notes -join "`n"
+        $notes | Should -Match 'joined to Entra ID'
+        $notes | Should -Not -Match 'not joined to Entra ID'
+    }
+
+    It 'warns that nothing else holds the key when the device is outside Entra ID' {
+        $notes = (Resolve-BitLockerSetupPlan -EntraJoined:$false).Notes -join "`n"
+        $notes | Should -Match 'not joined to Entra ID'
+        $notes | Should -Match 'nowhere but on the volume itself and on the paper'
+    }
+
+    It 'names the operating system drive as the reason automatic unlocking is skipped' {
+        $notes = (Resolve-BitLockerSetupPlan -OsDriveProtected:$false).Notes -join "`n"
+        $notes | Should -Match 'operating system drive'
+        $notes | Should -Match 'unlocked by hand'
+    }
+
+    It 'says automatic unlocking is available when the operating system drive is protected' {
+        $notes = (Resolve-BitLockerSetupPlan -OsDriveProtected:$true).Notes -join "`n"
+        $notes | Should -Match 'unlock automatically'
+        $notes | Should -Not -Match 'unlocked by hand'
+    }
+
+    It 'warns about the password prompt in virtual hard disk mode' {
+        (Resolve-BitLockerSetupPlan -VhdxMode:$true).Notes -join "`n" | Should -Match 'password will be asked for'
+    }
+
+    It 'says no password is coming for a partition' {
+        (Resolve-BitLockerSetupPlan -VhdxMode:$false).Notes -join "`n" | Should -Match 'No BitLocker password'
+    }
+
+    It 'explains every one of the four decisions whatever the machine looks like' -TestCases @(
+        @{ Joined = $true;  Entra = $true;  Vhdx = $true;  Protected = $true }
+        @{ Joined = $false; Entra = $false; Vhdx = $false; Protected = $false }
+        @{ Joined = $true;  Entra = $false; Vhdx = $true;  Protected = $false }
+        @{ Joined = $false; Entra = $true;  Vhdx = $false; Protected = $true }
+    ) {
+        $plan = Resolve-BitLockerSetupPlan -DomainJoined:$Joined -EntraJoined:$Entra `
+            -VhdxMode:$Vhdx -OsDriveProtected:$Protected
+        foreach ($decision in @('password', 'Active Directory domain', 'Entra ID', 'operating system drive|unlock automatically')) {
+            @($plan.Notes | Where-Object { $_ -match $decision }).Count | Should -BeGreaterThan 0 -Because "the $decision decision needs a note"
+        }
+    }
+}
+
+Describe 'Resolve-BitLockerFailure' {
+    It 'recognises <Description> as a rejected password' -TestCases @(
+        @{ Description = 'a complexity complaint'
+           Message = 'The password does not meet the password complexity requirements.' }
+        @{ Description = 'a requirements complaint'; Message = 'Password requirements not met.' }
+    ) {
+        (Resolve-BitLockerFailure -Message $Message -RetryCount 1 -MaxRetries 10).Kind | Should -Be 'Password'
+    }
+
+    It 'counts the attempts left before giving up' {
+        $verdict = Resolve-BitLockerFailure -Message 'password complexity' -RetryCount 3 -MaxRetries 10
+        $verdict.Exhausted | Should -BeFalse
+        $verdict.CanRetry | Should -BeTrue
+        ($verdict.Lines -join "`n") | Should -Match 'Attempt 3 of 10'
+    }
+
+    It 'gives up once the attempts are used up' {
+        $verdict = Resolve-BitLockerFailure -Message 'password complexity' -RetryCount 10 -MaxRetries 10
+        $verdict.Exhausted | Should -BeTrue
+        $verdict.CanRetry | Should -BeFalse
+        ($verdict.Lines -join "`n") | Should -Match 'Maximum retry attempts reached'
+    }
+
+    It 'treats anything else as a failure the user has to decide about' {
+        # 0x80090034 says nothing about a password, so it must not be sorted as one.
+        $verdict = Resolve-BitLockerFailure -Message 'Encryption failed. (0x80090034)' -RetryCount 1 -MaxRetries 10
+        $verdict.Kind | Should -Be 'Other'
+        $verdict.Exhausted | Should -BeFalse
+        $verdict.CanRetry | Should -BeTrue
+    }
+
+    It 'counts the attempts for a failure that is not about a password either' {
+        $verdict = Resolve-BitLockerFailure -Message 'Encryption failed. (0x80090034)' -RetryCount 10 -MaxRetries 10
+        $verdict.Kind | Should -Be 'Other'
+        $verdict.Exhausted | Should -BeTrue
+        $verdict.CanRetry | Should -BeFalse
+    }
+
+    It 'refuses a retry that would only repeat itself' {
+        $verdict = Resolve-BitLockerFailure -Message 'carries 2 BitLocker recovery keys' `
+            -RetryCount 1 -MaxRetries 10 -Unretryable
+        $verdict.Exhausted | Should -BeFalse
+        $verdict.CanRetry | Should -BeFalse
+    }
+
+    It 'refuses a password retry too once the error cannot change' {
+        $verdict = Resolve-BitLockerFailure -Message 'password complexity' -RetryCount 1 -MaxRetries 10 -Unretryable
+        $verdict.Kind | Should -Be 'Password'
+        $verdict.CanRetry | Should -BeFalse
+        ($verdict.Lines -join "`n") | Should -Not -Match 'Attempt 1 of 10'
+    }
+
+    It 'repeats what Windows said and says the drive works without BitLocker while it is unencrypted' {
+        $lines = (Resolve-BitLockerFailure -Message 'Encryption failed. (0x80090034)' -RetryCount 1 -MaxRetries 10).Lines -join "`n"
+        $lines | Should -Match '0x80090034'
+        $lines | Should -Match 'works without BitLocker'
+    }
+
+    It 'does not claim the drive works without BitLocker once encryption has started' {
+        $lines = (Resolve-BitLockerFailure -Message 'Encryption failed. (0x80090034)' `
+            -RetryCount 1 -MaxRetries 10 -VolumeEncrypted).Lines -join "`n"
+        $lines | Should -Match 'already started encrypting'
+        $lines | Should -Not -Match 'works without BitLocker'
+    }
+
+    It 'does not throw on an empty message' {
+        { Resolve-BitLockerFailure -Message '' -RetryCount 1 -MaxRetries 10 } | Should -Not -Throw
+        (Resolve-BitLockerFailure -Message '' -RetryCount 1 -MaxRetries 10).Kind | Should -Be 'Other'
+    }
+}
+
+Describe 'Resolve-BitLockerRecoveryProtector' {
+    It 'reports no recovery key on a volume with <Description>' -TestCases @(
+        @{ Description = 'no protectors at all'; Protectors = @() }
+        @{ Description = 'only a password protector'
+           Protectors = @([PSCustomObject]@{ KeyProtectorType = 'Password'; KeyProtectorId = '{PWD}' }) }
+    ) {
+        $verdict = Resolve-BitLockerRecoveryProtector -KeyProtector $Protectors -MountPoint 'X:'
+        $verdict.Rejection | Should -Be 'None'
+        $verdict.ProtectorId | Should -BeNullOrEmpty
+        $verdict.Message | Should -Match 'X: carries no BitLocker recovery key'
+    }
+
+    It 'does not throw when the volume reports no protectors at all' {
+        { Resolve-BitLockerRecoveryProtector -KeyProtector $null -MountPoint 'X:' } | Should -Not -Throw
+        (Resolve-BitLockerRecoveryProtector -KeyProtector $null -MountPoint 'X:').Rejection | Should -Be 'None'
+    }
+
+    It 'returns the one recovery key it finds' {
+        $protectors = @(
+            New-Protector -Type 'Password' -Id '{PWD}'
+            New-Protector -Type 'RecoveryPassword' -Id '{REC}'
+            New-Protector -Type 'AdAccountOrGroup' -Id '{SID}'
+        )
+        $verdict = Resolve-BitLockerRecoveryProtector -KeyProtector $protectors -MountPoint 'X:'
+        $verdict.Rejection | Should -BeNullOrEmpty
+        $verdict.ProtectorId | Should -Be '{REC}'
+    }
+
+    It 'returns that id as one value, never as an array' {
+        # An array here is the defect itself: BackupToAAD-BitLockerKeyProtector takes a single string.
+        $protectors = @((New-Protector -Type 'RecoveryPassword' -Id '{REC}'))
+        (Resolve-BitLockerRecoveryProtector -KeyProtector $protectors -MountPoint 'X:').ProtectorId |
+            Should -BeOfType [string]
+    }
+
+    It 'refuses to choose between two recovery keys' {
+        $protectors = @(
+            New-Protector -Type 'RecoveryPassword' -Id '{FIRST}'
+            New-Protector -Type 'RecoveryPassword' -Id '{SECOND}'
+        )
+        $verdict = Resolve-BitLockerRecoveryProtector -KeyProtector $protectors -MountPoint 'X:'
+        $verdict.Rejection | Should -Be 'Multiple'
+        $verdict.ProtectorId | Should -BeNullOrEmpty
+        $verdict.ProtectorIds | Should -HaveCount 2
+    }
+
+    It 'names both keys and a way out in the refusal' {
+        $protectors = @(
+            New-Protector -Type 'RecoveryPassword' -Id '{FIRST}'
+            New-Protector -Type 'RecoveryPassword' -Id '{SECOND}'
+        )
+        $message = (Resolve-BitLockerRecoveryProtector -KeyProtector $protectors -MountPoint 'X:').Message
+        $message | Should -Match '\{FIRST\}'
+        $message | Should -Match '\{SECOND\}'
+        $message | Should -Match 'Remove-BitLockerKeyProtector'
+    }
+}
+
+Describe 'Resolve-BitLockerProtectorPlan' {
+    It 'adds both protectors to a freshly formatted volume' {
+        $plan = Resolve-BitLockerProtectorPlan -KeyProtector @() -MountPoint 'X:'
+        $plan.Rejection | Should -BeNullOrEmpty
+        $plan.TypesToAdd | Should -Contain 'Password'
+        $plan.TypesToAdd | Should -Contain 'RecoveryPassword'
+        $plan.RecoveryProtectorId | Should -BeNullOrEmpty
+    }
+
+    It 'keeps a recovery key it did not create, and backs that one up' {
+        $plan = Resolve-BitLockerProtectorPlan -MountPoint 'X:' `
+            -KeyProtector @((New-Protector -Type 'RecoveryPassword' -Id '{REC}'))
+        $plan.TypesToAdd | Should -Not -Contain 'RecoveryPassword'
+        $plan.RecoveryProtectorId | Should -Be '{REC}'
+        $plan.TypesToAdd | Should -Contain 'Password'
+    }
+
+    It 'does not add a second password protector' {
+        $plan = Resolve-BitLockerProtectorPlan -MountPoint 'X:' `
+            -KeyProtector @((New-Protector -Type 'Password' -Id '{PWD}'))
+        $plan.TypesToAdd | Should -Not -Contain 'Password'
+        $plan.TypesToAdd | Should -Contain 'RecoveryPassword'
+    }
+
+    It 'adds nothing to a volume that already carries both' {
+        $protectors = @(
+            New-Protector -Type 'Password' -Id '{PWD}'
+            New-Protector -Type 'RecoveryPassword' -Id '{REC}'
+        )
+        $plan = Resolve-BitLockerProtectorPlan -KeyProtector $protectors -MountPoint 'X:'
+        $plan.TypesToAdd | Should -Not -Contain 'Password'
+        $plan.TypesToAdd | Should -Not -Contain 'RecoveryPassword'
+    }
+
+    It 'ignores protector types this script never adds' {
+        $protectors = @(
+            New-Protector -Type 'Tpm' -Id '{TPM}'
+            New-Protector -Type 'AdAccountOrGroup' -Id '{SID}'
+        )
+        $plan = Resolve-BitLockerProtectorPlan -KeyProtector $protectors -MountPoint 'X:'
+        $plan.TypesToAdd | Should -Contain 'Password'
+        $plan.TypesToAdd | Should -Contain 'RecoveryPassword'
+    }
+
+    It 'stops the run when the volume already carries two recovery keys' {
+        $protectors = @(
+            New-Protector -Type 'RecoveryPassword' -Id '{FIRST}'
+            New-Protector -Type 'RecoveryPassword' -Id '{SECOND}'
+        )
+        $plan = Resolve-BitLockerProtectorPlan -KeyProtector $protectors -MountPoint 'X:'
+        $plan.Rejection | Should -Be 'Multiple'
+        $plan.Message | Should -Match 'will not guess'
+        $plan.TypesToAdd | Should -Not -Contain 'RecoveryPassword'
+    }
+}
+
+Describe 'Resolve-EntraJoinState' {
+    It 'reads the joined state out of the line dsregcmd prints' {
+        $status = @('', '+----------------------------------+', 'AzureAdJoined : YES', 'EnterpriseJoined : NO', 'DomainJoined : NO')
+        Resolve-EntraJoinState -StatusLines $status | Should -BeTrue
+    }
+
+    It 'accepts the indentation dsregcmd uses' {
+        Resolve-EntraJoinState -StatusLines @('             AzureAdJoined :  YES  ') | Should -BeTrue
+    }
+
+    It 'says no for <Description>' -TestCases @(
+        @{ Description = 'a device that is not joined'; Lines = @('AzureAdJoined : NO') }
+        @{ Description = 'output without the line at all'; Lines = @('DomainJoined : NO') }
+        @{ Description = 'no output, as when the tool is missing'; Lines = @() }
+        @{ Description = 'nothing at all'; Lines = $null }
+        @{ Description = 'a line that only mentions the word'; Lines = @('AzureAdJoined is not YES here') }
+    ) {
+        Resolve-EntraJoinState -StatusLines $Lines | Should -BeFalse
+    }
+}
+
+Describe 'Resolve-BitLockerVolumeState' {
+    It 'calls a protected volume covered' {
+        $state = Resolve-BitLockerVolumeState -ProtectionStatus 'On' -VolumeStatus 'FullyEncrypted'
+        $state.Protected | Should -BeTrue
+        $state.Covered | Should -BeTrue
+    }
+
+    It 'counts encryption still running as covered even while protection reports off' {
+        $state = Resolve-BitLockerVolumeState -ProtectionStatus 'Off' -VolumeStatus 'EncryptionInProgress'
+        $state.Protected | Should -BeFalse
+        $state.Encrypting | Should -BeTrue
+        $state.Covered | Should -BeTrue
+    }
+
+    It 'calls a decrypted volume neither protected nor covered' {
+        $state = Resolve-BitLockerVolumeState -ProtectionStatus 'Off' -VolumeStatus 'FullyDecrypted'
+        $state.Protected | Should -BeFalse
+        $state.Encrypting | Should -BeFalse
+        $state.Covered | Should -BeFalse
+    }
+
+    It 'treats a volume that reported nothing as unprotected' {
+        $state = Resolve-BitLockerVolumeState -ProtectionStatus '' -VolumeStatus ''
+        $state.Covered | Should -BeFalse
+    }
+
+    It 'does not count decryption in progress as covered' {
+        (Resolve-BitLockerVolumeState -ProtectionStatus 'Off' -VolumeStatus 'DecryptionInProgress').Covered |
+            Should -BeFalse
+    }
+}
+
+Describe 'Resolve-BitLockerAbandonedAdvice' {
+    It 'says the drive is usable as it is when nothing was encrypted' {
+        $lines = (Resolve-BitLockerAbandonedAdvice -MountPoint 'X:').Lines -join "`n"
+        $lines | Should -Match 'X: is not encrypted'
+        $lines | Should -Not -Match 'recovery key'
+    }
+
+    It 'never claims an encrypted drive works without BitLocker' {
+        $lines = (Resolve-BitLockerAbandonedAdvice -MountPoint 'X:' -Encrypted).Lines -join "`n"
+        $lines | Should -Match 'X: is already encrypted'
+        $lines | Should -Match 'recovery key is the only way back'
+        $lines | Should -Not -Match 'not encrypted'
+    }
+
+    It 'tells the user how to read the key again' {
+        $lines = (Resolve-BitLockerAbandonedAdvice -MountPoint 'X:' -Encrypted).Lines -join "`n"
+        $lines | Should -Match 'Get-BitLockerVolume -MountPoint X:'
+    }
+}
+
+Describe 'Request-BitLockerFailureChoice' {
+    BeforeAll {
+        # The menu text is not under test here, only which answer maps to which decision.
+        Mock Write-Host { }
+    }
+
+    It 'maps answer <Answer> to <Expected> when a retry is on offer' -TestCases @(
+        @{ Answer = '1'; Expected = 'Retry' }
+        @{ Answer = '2'; Expected = 'Continue' }
+        @{ Answer = '3'; Expected = 'Stop' }
+    ) {
+        Mock Read-Host { $Answer }
+        Request-BitLockerFailureChoice -AllowRetry | Should -Be $Expected
+    }
+
+    It 'maps answer <Answer> to <Expected> when a retry would be pointless' -TestCases @(
+        @{ Answer = '1'; Expected = 'Continue' }
+        @{ Answer = '2'; Expected = 'Stop' }
+    ) {
+        Mock Read-Host { $Answer }
+        Request-BitLockerFailureChoice | Should -Be $Expected
+    }
+
+    It 'rejects the third answer when only two choices are on offer' {
+        $script:answers = @('3', '1')
+        $script:index = 0
+        Mock Read-Host { $script:answers[$script:index++] }
+        Request-BitLockerFailureChoice | Should -Be 'Continue'
+        $script:index | Should -Be 2
+    }
+
+    It 'keeps asking until the answer is one of the choices' {
+        $script:answers = @('', 'yes', '4', '2')
+        $script:index = 0
+        Mock Read-Host { $script:answers[$script:index++] }
+        Request-BitLockerFailureChoice -AllowRetry | Should -Be 'Continue'
+        $script:index | Should -Be 4
     }
 }
