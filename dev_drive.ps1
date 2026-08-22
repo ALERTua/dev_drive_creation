@@ -2034,7 +2034,11 @@ try {
 
         Write-Host "Scheduled daily dedup jobs" -ForegroundColor Green
 
-        # Configure deduplication tasks to run only on AC power
+        Write-Host "Scheduling deduplication scrub jobs" -ForegroundColor Green
+        Set-ReFSDedupScrubSchedule -Volume "$devLetterColon" -Days $ScrubDays -Start $ScrubStart -WeeksInterval $ScrubWeeksInterval -ErrorAction Stop
+        Write-Host "Scheduled weekly scrub job on $ScrubDays at $ScrubStart" -ForegroundColor Green
+
+        # Runs after every job this pass schedules, so the weekly task exists when this walks the folder.
         Write-Host "Configuring deduplication tasks to run only on AC power..." -ForegroundColor Green
         try {
             # Find all ReFS deduplication tasks
@@ -2069,10 +2073,6 @@ try {
             Write-Host "Could not configure AC power condition for deduplication tasks: $($_.Exception.Message)" -ForegroundColor Yellow
             Write-Host "Tasks will run on any power source." -ForegroundColor Yellow
         }
-
-        Write-Host "Scheduling deduplication scrub jobs" -ForegroundColor Green
-        Set-ReFSDedupScrubSchedule -Volume "$devLetterColon" -Days $ScrubDays -Start $ScrubStart -WeeksInterval $ScrubWeeksInterval -ErrorAction Stop
-        Write-Host "Scheduled weekly scrub job on $ScrubDays at $ScrubStart" -ForegroundColor Green
 
         Write-Host ""
         foreach ($line in (Resolve-DedupScheduleReminder -DailyTimes $DedupStartTimes `

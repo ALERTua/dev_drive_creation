@@ -108,6 +108,14 @@ Describe 'The script itself' {
             '-WeeklyDay \$ScrubDays -WeeklyStart \$ScrubStart')
     }
 
+    It 'configures the mains-power condition only after the weekly maintenance job it must cover' {
+        $content = Get-Content -Path $script:ScriptPath -Raw
+        $weeklyAt = $content.IndexOf('Set-ReFSDedupScrubSchedule -Volume "$devLetterColon"')
+        $acPowerAt = $content.IndexOf('Configuring deduplication tasks to run only on AC power')
+        $weeklyAt | Should -BeGreaterThan 0
+        $acPowerAt | Should -BeGreaterThan $weeklyAt
+    }
+
     It 'checks the fsutil devdrv trust exit code before declaring the drive trusted' {
         $content = Get-Content -Path $script:ScriptPath -Raw
         $content | Should -Match '(?ms)fsutil devdrv trust "\$devLetterColon" \| Out-Null\s*\r?\n\s*if \(\$LASTEXITCODE'
