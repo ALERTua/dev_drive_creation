@@ -43,10 +43,7 @@ This script runs in interactive mode and will guide you through the entire Dev D
 6. **Compression Configuration**: Select format (LZ4/ZSTD) and level (1-9 for ZSTD)
 7. **Deduplication Schedule**: Keep the suggested times, or set them yourself
 
-In virtual hard disk mode, step 2 is skipped; instead you are asked for the file path, the disk
-type, the size and whether to mount the file automatically on startup. There is no press-Enter-for-
-maximum there, and the size has a 50 GB floor.
-See [Virtual hard disk mode](#virtual-hard-disk-mode).
+In virtual hard disk mode, step 2 is skipped; instead you are asked for the file path, the disk type, the size and whether to mount the file automatically on startup. There is no press-Enter-for-maximum there, and the size has a 50 GB floor. See [Virtual hard disk mode](#virtual-hard-disk-mode).
 
 ### Interactive Flow:
 
@@ -217,14 +214,10 @@ E           DevDrive     ReFS           Fixed     Healthy      OK               
    - Choose deduplication level (none, deduplication-only, or with compression)
    - Select compression format (LZ4 for speed, ZSTD for better compression)
    - Configure compression level (1-9 for ZSTD, affects CPU usage)
-   - Keep the suggested schedule, or set three fields yourself: the daily start times
-     (comma separated, 24-hour HH:MM, up to four), the weekly maintenance day, and its start time
-   - Each of the three takes Enter to keep the value shown; choosing your own times gets the
-     result repeated back, taking the defaults does not
-   - The daily job's days, its two-hour limit, its 60% CPU share and its AC-power condition
-     are fixed and are not asked about
-   - After the jobs are created the script says where to change the times later, in Task
-     Scheduler under Microsoft > Windows > ReFsDedupSvc
+   - Keep the suggested schedule, or set three fields yourself: the daily start times (comma separated, 24-hour HH:MM, up to four), the weekly maintenance day, and its start time
+   - Each of the three takes Enter to keep the value shown; choosing your own times gets the result repeated back, taking the defaults does not
+   - The daily job's days, its two-hour limit, its 60% CPU share and its AC-power condition are fixed and are not asked about
+   - After the jobs are created the script says where to change the times later, in Task Scheduler under Microsoft > Windows > ReFsDedupSvc
    - The daily jobs are automatically scheduled to run only on AC power
 
 6. **Dev Drive Creation & Setup**
@@ -243,74 +236,42 @@ E           DevDrive     ReFS           Fixed     Healthy      OK               
 
 ## Virtual hard disk mode
 
-Instead of repartitioning a physical disk, this mode puts the Dev Drive inside a `.vhdx` file on a
-volume you already have. It is the same thing Windows Settings offers as **Create new VHD**, which
-is useful when the Settings app is not an option — for example on machines where elevation comes
-from a tool that cannot launch Settings elevated.
+Instead of repartitioning a physical disk, this mode puts the Dev Drive inside a `.vhdx` file on a volume you already have. It is the same thing Windows Settings offers as **Create new VHD**, which is useful when the Settings app is not an option — for example on machines where elevation comes from a tool that cannot launch Settings elevated.
 
 The script asks for four things:
 
-- **Path** of the `.vhdx` file. The folder must already exist, the file must not, and the volume
-  hosting it must be a fixed disk — Windows does not support a Dev Drive inside a `.vhdx` on a
-  removable disk. A per-user directory keeps the Dev Drive from being shared unintentionally.
-- **Disk type**. *Dynamically expanding* grows as data is written and is what Microsoft recommends.
-  *Fixed size* claims the whole file up front, which takes minutes rather than seconds and cannot be
-  interrupted once started.
-- **Size**, at least 50 GB. That is Microsoft's documented minimum for any Dev Drive. For a fixed
-  size disk the size cannot exceed the host volume's free space less 1 GB of head-room; for a dynamically expanding
-  one a larger limit is allowed with a warning.
+- **Path** of the `.vhdx` file. The folder must already exist, the file must not, and the volume hosting it must be a fixed disk — Windows does not support a Dev Drive inside a `.vhdx` on a removable disk. A per-user directory keeps the Dev Drive from being shared unintentionally.
+- **Disk type**. *Dynamically expanding* grows as data is written and is what Microsoft recommends. *Fixed size* claims the whole file up front, which takes minutes rather than seconds and cannot be interrupted once started.
+- **Size**, at least 50 GB. That is Microsoft's documented minimum for any Dev Drive. For a fixed size disk the size cannot exceed the host volume's free space less 1 GB of head-room; for a dynamically expanding one a larger limit is allowed with a warning.
 - **Automatic mounting** on startup.
 
-The file is created and attached through `virtdisk.dll` directly, not with `diskpart` or
-`Mount-DiskImage`. The reason is automatic mounting, described below. Everything after that — ReFS
-formatting, the trusted flag, BitLocker, deduplication — is identical to the other two modes.
+The file is created and attached through `virtdisk.dll` directly, not with `diskpart` or `Mount-DiskImage`. The reason is automatic mounting, described below. Everything after that — ReFS formatting, the trusted flag, BitLocker, deduplication — is identical to the other two modes.
 
 ### Automatic mounting
 
-A `.vhdx` attached the ordinary way does not survive a restart, and no PowerShell cmdlet can change
-that. Automatic mounting has to be requested when the disk is attached, by passing
-`ATTACH_VIRTUAL_DISK_FLAG_AT_BOOT` to
-[`AttachVirtualDisk`](https://learn.microsoft.com/en-us/windows/win32/api/virtdisk/nf-virtdisk-attachvirtualdisk).
-Neither `diskpart` nor `Mount-DiskImage` passes it; until now only the Windows Settings **Disks &
-volumes** page did, which is why a Dev Drive created there comes back after a restart and one
-created from a script does not.
+A `.vhdx` attached the ordinary way does not survive a restart, and no PowerShell cmdlet can change that. Automatic mounting has to be requested when the disk is attached, by passing `ATTACH_VIRTUAL_DISK_FLAG_AT_BOOT` to [`AttachVirtualDisk`](https://learn.microsoft.com/en-us/windows/win32/api/virtdisk/nf-virtdisk-attachvirtualdisk). Neither `diskpart` nor `Mount-DiskImage` passes it; until now only the Windows Settings **Disks & volumes** page did, which is why a Dev Drive created there comes back after a restart and one created from a script does not.
 
-The script calls that API itself. Windows then records the file under
-`HKLM\SYSTEM\CurrentControlSet\Control\AutoAttachVirtualDisks` on its own and reattaches it on every
-startup, with the same drive letter and its trusted Dev Drive status intact. That registry entry is
-Windows's own bookkeeping — writing it by hand does not enable anything.
+The script calls that API itself. Windows then records the file under `HKLM\SYSTEM\CurrentControlSet\Control\AutoAttachVirtualDisks` on its own and reattaches it on every startup, with the same drive letter and its trusted Dev Drive status intact. That registry entry is Windows's own bookkeeping — writing it by hand does not enable anything.
 
-Older Windows builds may reject the flag. If that happens the script says so, attaches the disk
-anyway, and you get a working Dev Drive that needs mounting by hand after each restart.
+Older Windows builds may reject the flag. If that happens the script says so, attaches the disk anyway, and you get a working Dev Drive that needs mounting by hand after each restart.
 
-Whenever the disk will not be mounted for you — because Windows refused the flag, or because you
-declined automatic mounting — the script prints the command, once when the disk is attached and
-again at the end so it does not scroll away:
+Whenever the disk will not be mounted for you — because Windows refused the flag, or because you declined automatic mounting — the script prints the command, once when the disk is attached and again at the end so it does not scroll away:
 
 ```powershell
 Mount-DiskImage -ImagePath 'D:\DevDrive.vhdx' -StorageType VHDX -Access ReadWrite
 ```
 
-Run it from a PowerShell started as administrator. Microsoft's
-[`Mount-DiskImage` reference](https://learn.microsoft.com/en-us/powershell/module/storage/mount-diskimage)
-states that mounting a virtual hard disk requires administrator privileges, unlike mounting an
-`.iso` file.
+Run it from a PowerShell started as administrator. Microsoft's [`Mount-DiskImage` reference](https://learn.microsoft.com/en-us/powershell/module/storage/mount-diskimage) states that mounting a virtual hard disk requires administrator privileges, unlike mounting an `.iso` file.
 
 ### BitLocker inside a virtual hard disk
 
-Microsoft's documentation states that a `.vhdx` is already covered by BitLocker on the volume that
-hosts it, and that enabling BitLocker on the mounted virtual disk is unnecessary. The script says so
-before asking, but leaves the choice to you.
+Microsoft's documentation states that a `.vhdx` is already covered by BitLocker on the volume that hosts it, and that enabling BitLocker on the mounted virtual disk is unnecessary. The script says so before asking, but leaves the choice to you.
 
 ### Deduplication inside a virtual hard disk
 
-Deduplication works on the ReFS volume inside the file and frees space there as it does on a
-partition. The `.vhdx` file itself does **not** shrink — it keeps the largest size it has ever
-reached, and a deduplication run adds a little to it for its own bookkeeping.
+Deduplication works on the ReFS volume inside the file and frees space there as it does on a partition. The `.vhdx` file itself does **not** shrink — it keeps the largest size it has ever reached, and a deduplication run adds a little to it for its own bookkeeping.
 
-Reclaiming that space on the host means compacting the file, and there are reports of data
-corruption when compacting a `.vhdx` whose contents are deduplicated. Do not run `compact vdisk`
-against a deduplicated Dev Drive without a backup.
+Reclaiming that space on the host means compacting the file, and there are reports of data corruption when compacting a `.vhdx` whose contents are deduplicated. Do not run `compact vdisk` against a deduplicated Dev Drive without a backup.
 
 ## Security Notes
 
@@ -327,18 +288,11 @@ By default the script creates two daily deduplication jobs and one weekly mainte
 - 11:00 AM and 5:00 PM daily, Monday-Friday, **only on AC power** (2 hours duration, 60% CPU limit each)
 - Monday at 5:30 PM weekly (maintenance pass, every week)
 
-The daily start times, the weekly maintenance day and its start time are asked for during the run,
-so there is no need to edit the script to move them. Everything else about the jobs is fixed.
+The daily start times, the weekly maintenance day and its start time are asked for during the run, so there is no need to edit the script to move them. Everything else about the jobs is fixed.
 
 ## Development
 
-Run `install-hooks.cmd` once to turn on a tracked `git` pre-commit hook (`.githooks/pre-commit`).
-It runs the same three checks as `.github/workflows/ci.yml` against your working tree before each
-commit - parsing `dev_drive.ps1`, PSScriptAnalyzer with `PSScriptAnalyzerSettings.psd1`, and the
-Pester suite - and refuses the commit if any of them fails, saying which one and why. A single
-commit can still skip it with `git commit --no-verify`; to remove the hook entirely, run
-`git config --unset core.hooksPath`. Unlike CI, it uses whichever PSScriptAnalyzer/Pester versions
-are already installed locally rather than CI's pinned ones.
+Run `install-hooks.cmd` once to turn on a tracked `git` pre-commit hook (`.githooks/pre-commit`). It runs the same three checks as `.github/workflows/ci.yml` against your working tree before each commit - parsing `dev_drive.ps1`, PSScriptAnalyzer with `PSScriptAnalyzerSettings.psd1`, and the Pester suite - and refuses the commit if any of them fails, saying which one and why. A single commit can still skip it with `git commit --no-verify`; to remove the hook entirely, run `git config --unset core.hooksPath`. Unlike CI, it uses whichever PSScriptAnalyzer/Pester versions are already installed locally rather than CI's pinned ones.
 
 ## Troubleshooting
 
