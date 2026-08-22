@@ -125,16 +125,19 @@ Describe 'The script itself' {
         $backupAt | Should -BeGreaterThan $bannerAt
     }
 
-    It 'asks the shrink question as a size to end up as, not as an amount' {
+    It 'resizes to the answer itself and keeps no shrink-amount variable' {
         # Asking for an amount is the double-shrink defect: the same answer twice takes it twice.
         $content = Get-Content -Path $script:ScriptPath -Raw
-        $content | Should -Match '-Subject "the size drive \$DriveLetter`: should end up as"'
-        $content | Should -Not -Match "-Subject 'Shrink amount'"
+        $content | Should -Match '\$targetSize = \[math\]::Round\(\$TargetDriveGB \* 1GB\)'
+        $content | Should -Not -Match '\$ShrinkGB'
     }
 
-    It 'shrinks to the size that was asked for' {
+    It 'checks the target against the Windows minimum before it resizes' {
         $content = Get-Content -Path $script:ScriptPath -Raw
-        $content | Should -Match '\$targetSize = \[math\]::Round\(\$TargetDriveGB \* 1GB\)'
+        $guardAt = $content.IndexOf('if ($targetSize -lt $minSize)')
+        $resizeAt = $content.IndexOf('Resize-Partition -DiskNumber $diskNum')
+        $guardAt | Should -BeGreaterThan 0
+        $resizeAt | Should -BeGreaterThan $guardAt
     }
 
     It 'never takes the recovery protector id straight off the volume' {
@@ -1048,11 +1051,43 @@ Describe 'Resolve-ShrinkTargetRange' {
         $range.Rejection | Should -Be 'BelowDevDriveMinimum'
     }
 
+    It 'keeps the fraction of a current size that is not a whole number' {
+        $range = Resolve-ShrinkTargetRange -CurrentGB 3613.28 -WindowsMinGB 2796.92 -DevDriveMinGB 50
+        $range.Rejection | Should -BeNullOrEmpty
+        $range.MinTargetGB | Should -Be 2797
+        $range.MaxTargetGB | Should -Be 3563.28
+        $range.MaxFreeableGB | Should -Be 816.28
+    }
+
+    It 'refuses a fractional drive that is a fraction short of a Dev Drive' {
+        $range = Resolve-ShrinkTargetRange -CurrentGB 169.75 -WindowsMinGB 120 -DevDriveMinGB 50
+        $range.Rejection | Should -Be 'BelowDevDriveMinimum'
+        $range.MaxFreeableGB | Should -Be 49.75
+    }
+
     It 'puts the answer of a run that already shrank out of range on the next run' {
+        $accepted = 439
         $first = Resolve-ShrinkTargetRange -CurrentGB 500 -WindowsMinGB 120 -DevDriveMinGB 50
-        $first.MaxTargetGB | Should -BeGreaterOrEqual 439
-        $second = Resolve-ShrinkTargetRange -CurrentGB 439 -WindowsMinGB 120 -DevDriveMinGB 50
-        $second.MaxTargetGB | Should -BeLessThan 439
+        (Resolve-DevDriveSizeInput -Answer "$accepted" -MinGB $first.MinTargetGB -MaxGB $first.MaxTargetGB).SizeGB |
+            Should -Be $accepted
+
+        $second = Resolve-ShrinkTargetRange -CurrentGB $accepted -WindowsMinGB 120 -DevDriveMinGB 50
+        (Resolve-DevDriveSizeInput -Answer "$accepted" -MinGB $second.MinTargetGB -MaxGB $second.MaxTargetGB).Rejection |
+            Should -Be 'AboveMaximum'
+    }
+}
+
+Describe 'Resolve-FreedSpaceGB' {
+    It 'frees the gap between the size now and the size asked for' {
+        Resolve-FreedSpaceGB -CurrentGB 3613.28 -TargetGB 3414.28 | Should -Be 199
+    }
+
+    It 'frees nothing when the answer is the size the drive already is' {
+        Resolve-FreedSpaceGB -CurrentGB 439 -TargetGB 439 | Should -Be 0
+    }
+
+    It 'keeps the fraction when only one of the two sizes has one' {
+        Resolve-FreedSpaceGB -CurrentGB 500.25 -TargetGB 400 | Should -Be 100.25
     }
 }
 
@@ -1061,20 +1096,45 @@ Describe 'Request-DevDriveSizeGB' {
         $script:answers = @('600', '400')
         $script:index = 0
         $script:said = @()
-        Mock Read-Host { $script:answers[$script:index++] }
+        $script:asked = @()
+        Mock Read-Host { $script:asked += $Prompt; $script:answers[$script:index++] }
         Mock Write-Host { $script:said += $Object }
     }
 
     It 'adds the note under the refusal of a too-large answer' {
-        Request-DevDriveSizeGB -MinGB 120 -MaxGB 450 -Subject 'the size drive D: should end up as' `
-            -MaxNote 'Drive D: is 500 GB now.' | Should -Be 400
+        Request-DevDriveSizeGB -MinGB 120 -MaxGB 450 -Subject 'Final size for drive D' `
+            -Note 'Drive D: is 500 GB now.' | Should -Be 400
         $script:said | Should -HaveCount 2
+        $script:said[0] | Should -Be 'Final size for drive D cannot exceed 450 GB. Please enter a smaller value.'
         $script:said[1] | Should -Be 'Drive D: is 500 GB now.'
+    }
+
+    It 'adds the note under the refusal of an answer typed as an amount out of habit' {
+        # 199 is a plausible amount to take off, and far below any size the drive may end up as.
+        $script:answers = @('199', '3414.28')
+        Request-DevDriveSizeGB -MinGB 2797 -MaxGB 3563.28 -Subject 'Final size for drive D' `
+            -Note 'Drive D: is 3613.28 GB now.' | Should -Be 3414.28
+        $script:said | Should -HaveCount 2
+        $script:said[0] | Should -Be 'Final size for drive D must be at least 2797 GB. Please enter a larger value.'
+        $script:said[1] | Should -Be 'Drive D: is 3613.28 GB now.'
     }
 
     It 'refuses without a second line when no note was given' {
         Request-DevDriveSizeGB -MinGB 120 -MaxGB 450 -Subject 'Dev Drive size' | Should -Be 400
         $script:said | Should -HaveCount 1
-        $script:said[0] | Should -Match 'cannot exceed 450 GB'
+        $script:said[0] | Should -Be 'Dev Drive size cannot exceed 450 GB. Please enter a smaller value.'
+    }
+
+    It 'asks the question it was given rather than naming the subject' {
+        $script:answers = @('400')
+        Request-DevDriveSizeGB -MinGB 120 -MaxGB 450 -Subject 'Final size for drive D' `
+            -Question 'Drive D: is 500 GB now. Enter the size it should end up as in GB' | Should -Be 400
+        $script:asked[0] | Should -Be 'Drive D: is 500 GB now. Enter the size it should end up as in GB (min: 120, max: 450)'
+    }
+
+    It 'falls back to the subject when no question was given' {
+        $script:answers = @('400')
+        Request-DevDriveSizeGB -MinGB 120 -MaxGB 450 -Subject 'Dev Drive size' | Should -Be 400
+        $script:asked[0] | Should -Be 'Enter Dev Drive size in GB (min: 120, max: 450)'
     }
 }

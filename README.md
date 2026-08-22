@@ -100,8 +100,7 @@ Shrinkable size information:
                                                                                                              
 Note: Windows allows shrinking by the size of starting from the end of the drive disk space to the nearest written file block. Disk Fragmentation can affect this. If Windows does not allow for a drive to be shrunk, please use third-party tools (e.g. AOMEI).                                                                      
                                                                                                              
-Drive D: is 3613.28 GB now.                                                                          
-Enter the size drive D: should end up as in GB (min: 2797, max: 3563.28): 3414.28                    
+Drive D: is 3613.28 GB now. Enter the size it should end up as in GB (min: 2797, max: 3563.28): 3414.28
                                                                                                              
 Do you want to enable BitLocker encryption for the Dev Drive?                                                
 BitLocker provides security but may impact performance.
