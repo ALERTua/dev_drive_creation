@@ -1386,6 +1386,65 @@ function Resolve-RerunAdvice {
     return $lines
 }
 
+function Get-VolumeWriteState {
+    <#
+        Writes one file and removes it. A volume mounted read-only by policy looks ordinary to
+        Get-Volume, so an actual write is the only answer that can be trusted.
+    #>
+    param([Parameter(Mandatory)][string]$MountPoint)
+
+    $probe = Join-Path $MountPoint ".devdrive-write-test"
+    try {
+        [System.IO.File]::WriteAllText($probe, 'probe')
+        Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue
+        return [PSCustomObject]@{ Writable = $true; Reason = '' }
+    }
+    catch {
+        # A .NET call wraps its own error, so only the base exception carries what Windows said.
+        return [PSCustomObject]@{ Writable = $false; Reason = $_.Exception.GetBaseException().Message }
+    }
+}
+
+function Resolve-WriteProtectionAdvice {
+    <#
+        Why a freshly created Dev Drive refuses writes. An unencrypted volume names the policy that
+        mounts such drives read-only; anything else says the cause is unknown rather than guessing.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$MountPoint,
+        [ValidateSet('Encrypted', 'Clear', 'Unknown')][string]$VolumeState = 'Unknown',
+        [AllowNull()][AllowEmptyString()][string]$Reason
+    )
+
+    # Offered in every branch: a partition carrying the read-only flag refuses writes whatever
+    # BitLocker is doing.
+    $partitionCheck = "Check whether the partition itself is marked read-only: Get-Partition -DriveLetter $($MountPoint.TrimEnd(':')) | Format-List IsReadOnly, DiskNumber"
+
+    $lines = @("Drive $MountPoint was created, but nothing can be written to it.")
+    if (-not [string]::IsNullOrWhiteSpace($Reason)) {
+        $lines += "Windows said: $Reason"
+    }
+
+    if ($VolumeState -eq 'Clear') {
+        $lines += "The drive is not encrypted, and this machine may be set to deny write access to fixed drives that BitLocker does not protect."
+        $lines += "If that setting is on, Windows mounts every unencrypted fixed data drive read-only, and finishing BitLocker on $MountPoint would make it writable."
+        $lines += "Read it on a machine managed from the cloud with: Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\PolicyManager\current\device\BitLocker' -ErrorAction SilentlyContinue"
+        $lines += "Read it on a machine managed by group policy with: Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\FVE' -ErrorAction SilentlyContinue"
+        $lines += $partitionCheck
+    } elseif ($VolumeState -eq 'Encrypted') {
+        $lines += "The drive is encrypted, so the setting that mounts unencrypted drives read-only does not explain this."
+        $lines += $partitionCheck
+        $lines += "A locked volume refuses writes too: manage-bde -status $MountPoint"
+    } else {
+        $lines += "The encryption state of the drive could not be read, so the cause cannot be narrowed down here."
+        $lines += "Start with: manage-bde -status $MountPoint"
+        $lines += $partitionCheck
+    }
+
+    $lines += "Drive $MountPoint stays as it is. Nothing more can be set up on it while it refuses writes."
+    return $lines
+}
+
 foreach ($line in (Resolve-AutomationBanner)) {
     Write-Host $line -ForegroundColor Yellow
 }
@@ -2019,6 +2078,21 @@ try {
         Write-Host "Skipping BitLocker encryption as requested." -ForegroundColor Yellow
     }
 
+
+    # Before deduplication: on a read-only volume every cmdlet after this fails without naming the cause.
+    Write-Host "Checking that $devLetterColon can be written to" -ForegroundColor Green
+    $writeState = Get-VolumeWriteState -MountPoint $devLetterColon
+    if ($writeState.Writable) {
+        Write-Host "Drive $devLetterColon accepts writes." -ForegroundColor Green
+    } else {
+        $encryptionState = (Get-BitLockerProtectionState -MountPoint $devLetterColon).Label
+        Write-Host ""
+        foreach ($line in (Resolve-WriteProtectionAdvice -MountPoint $devLetterColon -VolumeState $encryptionState -Reason $writeState.Reason)) {
+            Write-Host $line -ForegroundColor Red
+        }
+        # Thrown rather than exited: the closing advice about a shrunk drive and a left-behind .vhdx lives in the catch.
+        throw "Drive $devLetterColon is read-only. See the explanation above."
+    }
 
     # Enable Deduplication + Compression (conditional)
     if (-not $SkipDeduplication) {

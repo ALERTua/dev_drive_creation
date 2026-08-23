@@ -224,6 +224,25 @@ Describe 'The script itself' {
         Select-String -Path $script:ScriptPath -Pattern '^\$ShrunkDriveLetter = \$null' |
             Should -Not -BeNullOrEmpty
     }
+
+    It 'checks that the drive accepts writes after BitLocker and before deduplication' {
+        $content = Get-Content -Path $script:ScriptPath -Raw
+        $bitLockerAt = $content.IndexOf('Skipping BitLocker encryption as requested')
+        $writeCheckAt = $content.IndexOf('$writeState = Get-VolumeWriteState')
+        $dedupAt = $content.IndexOf('Enable-ReFSDedup -Volume')
+        $bitLockerAt | Should -BeGreaterThan 0
+        $writeCheckAt | Should -BeGreaterThan $bitLockerAt
+        $dedupAt | Should -BeGreaterThan $writeCheckAt
+    }
+
+    It 'throws on a read-only drive rather than exiting, so the closing advice still runs' {
+        $content = Get-Content -Path $script:ScriptPath -Raw
+        $checkAt = $content.IndexOf('$writeState = Get-VolumeWriteState')
+        $blockEnd = $content.IndexOf('# Enable Deduplication + Compression')
+        $checkBlock = $content.Substring($checkAt, $blockEnd - $checkAt)
+        $checkBlock | Should -Match 'throw'
+        $checkBlock | Should -Not -Match 'exit 1'
+    }
 }
 
 Describe 'Layout of the structures passed to virtdisk.dll' {
@@ -1460,5 +1479,87 @@ Describe 'Request-DedupSchedule' {
         Should -Invoke Write-Host -ParameterFilter {
             $Object -match 'The daily job runs on mains power only, for up to 3 hours, using at most 45% of the CPU\.'
         }
+    }
+}
+
+Describe 'Resolve-WriteProtectionAdvice' {
+    It 'names the drive and says nothing can be written to it' {
+        (Resolve-WriteProtectionAdvice -MountPoint 'X:' -VolumeState 'Clear') -join "`n" |
+            Should -Match 'Drive X:.*nothing can be written'
+    }
+
+    It 'blames the BitLocker write-access setting only when the drive is unencrypted' {
+        $lines = (Resolve-WriteProtectionAdvice -MountPoint 'X:' -VolumeState 'Clear') -join "`n"
+        $lines | Should -Match 'deny write access to fixed drives'
+        $lines | Should -Match 'PolicyManager'
+        $lines | Should -Match 'Microsoft.FVE'
+    }
+
+    It 'keeps that blame conditional, since the setting is never read' {
+        $lines = (Resolve-WriteProtectionAdvice -MountPoint 'X:' -VolumeState 'Clear') -join "`n"
+        $lines | Should -Match 'may be set to deny'
+        $lines | Should -Match 'If that setting is on'
+        $lines | Should -Not -Match 'is what makes it writable'
+    }
+
+    It 'rules that setting out when the drive is encrypted' {
+        $lines = (Resolve-WriteProtectionAdvice -MountPoint 'X:' -VolumeState 'Encrypted') -join "`n"
+        $lines | Should -Match 'does not explain this'
+        $lines | Should -Not -Match 'PolicyManager'
+    }
+
+    It 'narrows nothing down when the encryption state could not be read' {
+        $lines = (Resolve-WriteProtectionAdvice -MountPoint 'X:' -VolumeState 'Unknown') -join "`n"
+        $lines | Should -Match 'could not be read'
+        $lines | Should -Not -Match 'deny write access'
+    }
+
+    It 'assumes nothing when no state is passed' {
+        (Resolve-WriteProtectionAdvice -MountPoint 'X:') -join "`n" | Should -Match 'could not be read'
+    }
+
+    It 'quotes what Windows said when there is a message, and stays silent when there is not' {
+        (Resolve-WriteProtectionAdvice -MountPoint 'X:' -VolumeState 'Clear' -Reason 'Media is write-protected') -join "`n" |
+            Should -Match 'Windows said: Media is write-protected'
+        (Resolve-WriteProtectionAdvice -MountPoint 'X:' -VolumeState 'Clear') -join "`n" |
+            Should -Not -Match 'Windows said'
+    }
+
+    It 'offers the partition read-only check whatever BitLocker is doing' {
+        foreach ($state in @('Clear', 'Encrypted', 'Unknown')) {
+            (Resolve-WriteProtectionAdvice -MountPoint 'X:' -VolumeState $state) -join "`n" |
+                Should -Match 'Get-Partition -DriveLetter X \|'
+        }
+    }
+
+    It 'says the drive stays and nothing more can be set up, whatever the state' {
+        foreach ($state in @('Clear', 'Encrypted', 'Unknown')) {
+            $lines = (Resolve-WriteProtectionAdvice -MountPoint 'X:' -VolumeState $state) -join "`n"
+            $lines | Should -Match 'Drive X: stays as it is'
+            $lines | Should -Match 'Nothing more can be set up'
+        }
+    }
+
+    It 'returns plain lines rather than an object to unwrap' {
+        Resolve-WriteProtectionAdvice -MountPoint 'X:' -VolumeState 'Clear' | Should -BeOfType [string]
+    }
+}
+
+Describe 'Get-VolumeWriteState' {
+    It 'reports a writable location as writable and leaves nothing behind' {
+        $result = Get-VolumeWriteState -MountPoint $TestDrive
+        $result.Writable | Should -BeTrue
+        $result.Reason | Should -BeNullOrEmpty
+        Get-ChildItem -LiteralPath $TestDrive -Force | Should -BeNullOrEmpty
+    }
+
+    It 'reports a location it cannot write to' {
+        (Get-VolumeWriteState -MountPoint (Join-Path $TestDrive 'no-such-folder')).Writable | Should -BeFalse
+    }
+
+    It 'gives what Windows said, not the .NET wrapper around it' {
+        $reason = (Get-VolumeWriteState -MountPoint (Join-Path $TestDrive 'no-such-folder')).Reason
+        $reason | Should -Not -BeNullOrEmpty
+        $reason | Should -Not -Match 'Exception calling'
     }
 }
