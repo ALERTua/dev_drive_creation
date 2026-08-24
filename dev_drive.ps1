@@ -293,13 +293,20 @@ function Add-VirtualDiskAttachment {
 }
 
 function Request-BitLockerChoice {
-    param([switch]$VhdxMode)
+    param(
+        [switch]$VhdxMode,
+        [string[]]$Notes
+    )
 
     Write-Host "`nDo you want to enable BitLocker encryption for the Dev Drive?" -ForegroundColor Cyan
     Write-Host "BitLocker provides security but may impact performance." -ForegroundColor White
     if ($VhdxMode) {
         Write-Host "If the volume hosting the .vhdx file is itself encrypted, its contents are already" -ForegroundColor Yellow
         Write-Host "covered, and Microsoft does not recommend encrypting the virtual disk as well." -ForegroundColor Yellow
+    }
+    # Printed before the menu, so a machine that makes encryption mandatory says so before the answer.
+    foreach ($note in $Notes) {
+        Write-Host $note -ForegroundColor Yellow
     }
     Write-Host "1. Yes, enable BitLocker encryption" -ForegroundColor White
     Write-Host "2. No, skip BitLocker encryption" -ForegroundColor White
@@ -401,16 +408,75 @@ function Get-BitLockerAutoUnlockState {
     }
 }
 
+function Get-FixedDriveWritePolicy {
+    <# Reads FDVDenyWriteAccess where it takes effect, whatever channel delivered it. Absent means
+       not set; Unknown means the read did not succeed, or answered something unreadable. #>
+    param([string]$Path = $script:FixedDriveWritePolicyPath)
+
+    try {
+        if (-not (Test-Path -Path $Path -ErrorAction Stop)) { return 'Allow' }
+        $key = Get-ItemProperty -Path $Path -ErrorAction Stop
+        if ($null -eq $key.PSObject.Properties['FDVDenyWriteAccess']) { return 'Allow' }
+
+        # A value of another type is an answer this cannot read, not an answer of "not set".
+        $value = $key.FDVDenyWriteAccess
+        if ($value -isnot [int] -and $value -isnot [long]) { return 'Unknown' }
+        if ($value -eq 1) { return 'Deny' }
+        return 'Allow'
+    }
+    catch {
+        return 'Unknown'
+    }
+}
+
+function Resolve-WriteAccessPolicyAdvice {
+    <# What the setting means for this run: without BitLocker such a machine mounts the Dev Drive
+       read-only. -Skipping is for the plan, where the answer is already known. #>
+    param(
+        [Parameter(Mandatory)][ValidateSet('Deny', 'Allow', 'Unknown')][string]$Policy,
+        [string]$PolicyPath = $script:FixedDriveWritePolicyPath,
+        [switch]$Skipping
+    )
+
+    if ($Policy -eq 'Allow') {
+        return @()
+    }
+
+    if ($Policy -eq 'Unknown') {
+        $lines = @("This machine's setting on unencrypted fixed drives could not be read, so it is not known whether the Dev Drive will accept writes without BitLocker.")
+        $lines += "Read it with: Get-ItemProperty '$PolicyPath' -Name FDVDenyWriteAccess -ErrorAction SilentlyContinue"
+        return $lines
+    }
+
+    $lines = @("This machine denies write access to fixed drives that BitLocker does not protect (FDVDenyWriteAccess is 1).")
+    if ($Skipping) {
+        $lines += "So this Dev Drive will mount read-only, and nothing can be written to it."
+        $lines += "The run will stop at the write check once the drive exists. Enable BitLocker, or change that setting first."
+    } else {
+        $lines += "So a Dev Drive without BitLocker would mount read-only here, with nothing able to be written to it."
+    }
+    return $lines
+}
+
 function Resolve-BitLockerSetupPlan {
     <# Decides which protectors this machine can carry, and the lines explaining why. #>
     param(
         [switch]$DomainJoined,
         [switch]$EntraJoined,
         [switch]$VhdxMode,
-        [switch]$OsDriveProtected
+        [switch]$OsDriveProtected,
+        [ValidateSet('Deny', 'Allow', 'Unknown')][string]$WritePolicy = 'Allow'
     )
 
     $notes = @()
+
+    # Warned on Unknown too: a read that failed is not evidence that the setting is off.
+    if ($WritePolicy -eq 'Deny') {
+        $notes += "Until this finishes the drive is read-only, because this machine denies writes to fixed drives BitLocker does not protect."
+    }
+    if ($WritePolicy -ne 'Allow') {
+        $notes += "Windows may put up its own prompt to encrypt the drive while this runs. Leave it alone - this run is already encrypting, and answering it only produces an error."
+    }
 
     if ($VhdxMode) {
         $notes += "The Dev Drive lives in a virtual hard disk, so a BitLocker password will be asked for: it unlocks the volume after the file is mounted."
@@ -1896,7 +1962,9 @@ function Resolve-WriteProtectionAdvice {
     param(
         [Parameter(Mandatory)][string]$MountPoint,
         [ValidateSet('Encrypted', 'Clear', 'Unknown')][string]$VolumeState = 'Unknown',
-        [AllowNull()][AllowEmptyString()][string]$Reason
+        [AllowNull()][AllowEmptyString()][string]$Reason,
+        [ValidateSet('Deny', 'Allow', 'Unknown')][string]$WritePolicy = 'Unknown',
+        [string]$PolicyPath = $script:FixedDriveWritePolicyPath
     )
 
     # Offered in every branch: a partition carrying the read-only flag refuses writes whatever
@@ -1909,10 +1977,17 @@ function Resolve-WriteProtectionAdvice {
     }
 
     if ($VolumeState -eq 'Clear') {
-        $lines += "The drive is not encrypted, and this machine may be set to deny write access to fixed drives that BitLocker does not protect."
-        $lines += "If that setting is on, Windows mounts every unencrypted fixed data drive read-only, and finishing BitLocker on $MountPoint would make it writable."
-        $lines += "Read it on a machine managed from the cloud with: Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\PolicyManager\current\device\BitLocker' -ErrorAction SilentlyContinue"
-        $lines += "Read it on a machine managed by group policy with: Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\FVE' -ErrorAction SilentlyContinue"
+        # The setting was read before the plan, so this names a likely cause instead of listing suspects.
+        if ($WritePolicy -eq 'Deny') {
+            $lines += "This machine denies write access to fixed drives that BitLocker does not protect, and $MountPoint is not encrypted. That is almost certainly the cause."
+            $lines += "Encrypt this volume to make it writable, without creating it again: Enable-BitLocker -MountPoint $MountPoint -RecoveryPasswordProtector -UsedSpaceOnly"
+        } elseif ($WritePolicy -eq 'Allow') {
+            $lines += "The drive is not encrypted, but this machine does not report that setting as on, so it does not look like the cause."
+        } else {
+            $lines += "The drive is not encrypted, and this machine may be set to deny write access to fixed drives that BitLocker does not protect."
+            $lines += "If that setting is on, Windows mounts every unencrypted fixed data drive read-only, and encrypting $MountPoint would make it writable."
+            $lines += "Read it with: Get-ItemProperty '$PolicyPath' -Name FDVDenyWriteAccess -ErrorAction SilentlyContinue"
+        }
         $lines += $partitionCheck
     } elseif ($VolumeState -eq 'Encrypted') {
         $lines += "The drive is encrypted, so the setting that mounts unencrypted drives read-only does not explain this."
@@ -1946,6 +2021,10 @@ if ($windows_build -ge $windows_build_min) {
 
 # Microsoft's documented minimum size for a Dev Drive volume (https://learn.microsoft.com/en-us/windows/dev-drive/)
 $DevDriveMinSizeGB = 50
+
+# Where "deny write access to fixed drives not protected by BitLocker" takes effect. PolicyManager
+# was empty on the machine that reported this, so the effective path is the one to read.
+$FixedDriveWritePolicyPath = 'HKLM:\SYSTEM\CurrentControlSet\Policies\Microsoft\FVE'
 
 # The name offered on the Enter key.
 $DevDriveDefaultLabel = "DevDrive"
@@ -2147,8 +2226,12 @@ if ($mode -eq "FreeSpace") {
 # Asked here rather than in each mode: the name is the same question whatever created the volume.
 $DevDriveLabel = Request-DevDriveLabel -Default $DevDriveDefaultLabel -MaxLength $DevDriveLabelMaxLength
 
+# Read before the question, not after: on a machine with this setting the answer is not a preference.
+$WritePolicy = Get-FixedDriveWritePolicy
+
 # Ask about BitLocker encryption
-$enableBitLocker = Request-BitLockerChoice -VhdxMode:($mode -eq "Vhdx")
+$enableBitLocker = Request-BitLockerChoice -VhdxMode:($mode -eq "Vhdx") `
+    -Notes (Resolve-WriteAccessPolicyAdvice -Policy $WritePolicy)
 $SkipBitLocker = -not $enableBitLocker
 
 # Settled before the plan is shown; a fact that cannot be read counts as the safe answer.
@@ -2182,7 +2265,7 @@ if ($enableBitLocker) {
     }
 
     $bitLockerPlan = Resolve-BitLockerSetupPlan -DomainJoined:$isDomainJoined -EntraJoined:$isEntraJoined `
-        -VhdxMode:($mode -eq "Vhdx") -OsDriveProtected:$osDriveProtected
+        -VhdxMode:($mode -eq "Vhdx") -OsDriveProtected:$osDriveProtected -WritePolicy $WritePolicy
 }
 
 # Ask about deduplication
@@ -2247,6 +2330,10 @@ if (-not $SkipBitLocker) {
     }
 } else {
     Write-Host "* Skip BitLocker encryption" -ForegroundColor White
+    # Said here, before anything exists, rather than left for the write check to discover afterwards.
+    foreach ($line in (Resolve-WriteAccessPolicyAdvice -Policy $WritePolicy -Skipping)) {
+        Write-Host "  - $line" -ForegroundColor Yellow
+    }
 }
 
 if (-not $SkipDeduplication) {
@@ -2600,7 +2687,8 @@ try {
     } else {
         $encryptionState = (Get-BitLockerProtectionState -MountPoint $devLetterColon).Label
         Write-Host ""
-        foreach ($line in (Resolve-WriteProtectionAdvice -MountPoint $devLetterColon -VolumeState $encryptionState -Reason $writeState.Reason)) {
+        foreach ($line in (Resolve-WriteProtectionAdvice -MountPoint $devLetterColon -VolumeState $encryptionState `
+                    -Reason $writeState.Reason -WritePolicy $WritePolicy)) {
             Write-Host $line -ForegroundColor Red
         }
         # Thrown rather than exited: the closing advice about a shrunk drive and a left-behind .vhdx lives in the catch.

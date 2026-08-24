@@ -339,6 +339,39 @@ Describe 'The script itself' {
         ([regex]::Matches($content, '\$MaxLength = \d')).Count | Should -Be 0
     }
 
+    It 'reads the write-access setting before it asks about BitLocker, and whatever the answer' {
+        # The four other machine facts are read only when BitLocker is chosen. This one decides
+        # whether declining leaves an unusable drive, so it has to be read either way, and first.
+        $content = Get-Content -Path $script:ScriptPath -Raw
+        $readAt = $content.IndexOf('$WritePolicy = Get-FixedDriveWritePolicy')
+        $askAt = $content.IndexOf('$enableBitLocker = Request-BitLockerChoice')
+        $gateAt = $content.IndexOf('if ($enableBitLocker) {')
+        $readAt | Should -BeGreaterThan 0
+        $askAt | Should -BeGreaterThan $readAt
+        $gateAt | Should -BeGreaterThan $readAt
+        # Read unconditionally: a run that declines BitLocker needs this fact most of all.
+        ([regex]::Matches($content, '(?m)^\$WritePolicy = Get-FixedDriveWritePolicy')).Count | Should -Be 1
+        # And handed to the question, or the person answers without knowing it.
+        $content | Should -Match '-Notes \(Resolve-WriteAccessPolicyAdvice -Policy \$WritePolicy\)'
+    }
+
+    It 'keeps the policy registry path in one place rather than beside every use of it' {
+        $content = Get-Content -Path $script:ScriptPath -Raw
+        ([regex]::Matches($content, '(?m)^\$FixedDriveWritePolicyPath\s*=')).Count | Should -Be 1
+        ([regex]::Matches($content, 'CurrentControlSet\\Policies\\Microsoft\\FVE')).Count | Should -Be 1
+        ([regex]::Matches($content, '\$PolicyPath = \$script:FixedDriveWritePolicyPath')).Count | Should -Be 2
+    }
+
+    It 'states the setting in the plan when BitLocker is being skipped' {
+        # Nothing exists yet at that point, so the run can still be declined over it.
+        $content = Get-Content -Path $script:ScriptPath -Raw
+        $skipAt = $content.IndexOf('* Skip BitLocker encryption')
+        $adviceAt = $content.IndexOf('Resolve-WriteAccessPolicyAdvice -Policy $WritePolicy', $skipAt)
+        $confirmAt = $content.IndexOf('Are you ready to proceed')
+        $adviceAt | Should -BeGreaterThan $skipAt
+        $confirmAt | Should -BeGreaterThan $adviceAt
+    }
+
     It 'never tells the user to just try again' {
         Select-String -Path $script:ScriptPath -Pattern 'try again' | Should -BeNullOrEmpty
     }
@@ -1006,12 +1039,164 @@ Describe 'Get-Win32ErrorText' {
     }
 }
 
+Describe 'Request-BitLockerChoice' {
+    BeforeAll {
+        Mock Write-Host { }
+    }
+
+    It 'returns <Expected> for answer <Answer>' -TestCases @(
+        @{ Answer = '1'; Expected = $true }
+        @{ Answer = '2'; Expected = $false }
+    ) {
+        Mock Read-Host { $Answer }
+        Request-BitLockerChoice | Should -Be $Expected
+    }
+
+    It 'keeps asking until the answer is one of the two' {
+        $script:answers = @('yes', '3', '2')
+        $script:index = 0
+        Mock Read-Host { $script:answers[$script:index++] }
+        Request-BitLockerChoice | Should -BeFalse
+        $script:index | Should -Be 3
+    }
+
+    It 'prints what it was given about this machine before the menu' {
+        # A machine where encryption is mandatory has to say so before the answer, not after.
+        Mock Read-Host { '1' }
+        Request-BitLockerChoice -Notes @('This machine denies write access to unprotected fixed drives.') | Out-Null
+        Should -Invoke Write-Host -ParameterFilter { $Object -match 'denies write access' }
+    }
+
+    It 'prints nothing extra when there is nothing to say' {
+        Mock Read-Host { '1' }
+        Request-BitLockerChoice | Out-Null
+        Should -Not -Invoke Write-Host -ParameterFilter { $Object -match 'denies write access' }
+    }
+}
+
+Describe 'Get-FixedDriveWritePolicy' {
+    BeforeAll {
+        $script:TestKeyRoot = 'HKCU:\Software\DevDriveTests'
+        $script:FakeKey = "$script:TestKeyRoot\FVE"
+    }
+
+    AfterAll {
+        # The whole branch, not just the leaf, so the suite leaves the user's hive as it found it.
+        if (Test-Path -Path $script:TestKeyRoot) { Remove-Item -Path $script:TestKeyRoot -Recurse -Force }
+    }
+
+    BeforeEach {
+        if (Test-Path -Path $script:FakeKey) { Remove-Item -Path $script:FakeKey -Recurse -Force }
+    }
+
+    It 'reads the setting as on when the value is 1' {
+        New-Item -Path $script:FakeKey -Force | Out-Null
+        New-ItemProperty -Path $script:FakeKey -Name 'FDVDenyWriteAccess' -Value 1 -PropertyType DWord -Force | Out-Null
+        Get-FixedDriveWritePolicy -Path $script:FakeKey | Should -Be 'Deny'
+    }
+
+    It 'reads the setting as off when the value is 0' {
+        New-Item -Path $script:FakeKey -Force | Out-Null
+        New-ItemProperty -Path $script:FakeKey -Name 'FDVDenyWriteAccess' -Value 0 -PropertyType DWord -Force | Out-Null
+        Get-FixedDriveWritePolicy -Path $script:FakeKey | Should -Be 'Allow'
+    }
+
+    It 'treats a key without the value as the setting not being set' {
+        # The ordinary case on an unmanaged machine, and it must not read as "could not be read".
+        New-Item -Path $script:FakeKey -Force | Out-Null
+        Get-FixedDriveWritePolicy -Path $script:FakeKey | Should -Be 'Allow'
+    }
+
+    It 'treats a missing key the same way' {
+        Get-FixedDriveWritePolicy -Path "$script:TestKeyRoot\NoSuchKey" | Should -Be 'Allow'
+    }
+
+    It 'answers Unknown for a value of a type it cannot read, rather than reading it as off' {
+        # A string where a number belongs is an answer this cannot understand, not an absent setting.
+        New-Item -Path $script:FakeKey -Force | Out-Null
+        New-ItemProperty -Path $script:FakeKey -Name 'FDVDenyWriteAccess' -Value 'yes' -PropertyType String -Force | Out-Null
+        Get-FixedDriveWritePolicy -Path $script:FakeKey | Should -Be 'Unknown'
+    }
+
+    It 'reads a number that is neither 0 nor 1 as the setting not denying writes' {
+        New-Item -Path $script:FakeKey -Force | Out-Null
+        New-ItemProperty -Path $script:FakeKey -Name 'FDVDenyWriteAccess' -Value 2 -PropertyType DWord -Force | Out-Null
+        Get-FixedDriveWritePolicy -Path $script:FakeKey | Should -Be 'Allow'
+    }
+
+    It 'answers Unknown when the read itself fails' {
+        Mock Get-ItemProperty { throw 'Requested registry access is not allowed.' }
+        New-Item -Path $script:FakeKey -Force | Out-Null
+        Get-FixedDriveWritePolicy -Path $script:FakeKey | Should -Be 'Unknown'
+    }
+
+    It 'answers Unknown when even the existence check fails, not "not set"' {
+        # A key that is there but unreadable must never be reported as one that is not there.
+        Mock Test-Path { throw 'Requested registry access is not allowed.' }
+        Get-FixedDriveWritePolicy -Path $script:FakeKey | Should -Be 'Unknown'
+    }
+}
+
+Describe 'Resolve-WriteAccessPolicyAdvice' {
+    It 'says nothing at all on a machine that allows the writes' {
+        @(Resolve-WriteAccessPolicyAdvice -Policy 'Allow' -PolicyPath 'HKLM:\X').Count | Should -Be 0
+        @(Resolve-WriteAccessPolicyAdvice -Policy 'Allow' -PolicyPath 'HKLM:\X' -Skipping).Count | Should -Be 0
+    }
+
+    It 'states the consequence as a fact once the answer to skip is known' {
+        $lines = (Resolve-WriteAccessPolicyAdvice -Policy 'Deny' -PolicyPath 'HKLM:\X' -Skipping) -join "`n"
+        $lines | Should -Match 'FDVDenyWriteAccess is 1'
+        $lines | Should -Match 'this Dev Drive will mount read-only'
+        $lines | Should -Match 'stop at the write check'
+    }
+
+    It 'states it as a condition while the answer is still open' {
+        # Printed before the menu, where nobody has decided to skip anything yet.
+        $lines = (Resolve-WriteAccessPolicyAdvice -Policy 'Deny' -PolicyPath 'HKLM:\X') -join "`n"
+        $lines | Should -Match 'would mount read-only'
+        $lines | Should -Not -Match 'stop at the write check'
+        $lines | Should -Not -Match 'will mount read-only'
+    }
+
+    It 'raises an unreadable setting either way, and says where to look' {
+        foreach ($lines in (Resolve-WriteAccessPolicyAdvice -Policy 'Unknown' -PolicyPath 'HKLM:\Somewhere') -join "`n",
+            (Resolve-WriteAccessPolicyAdvice -Policy 'Unknown' -PolicyPath 'HKLM:\Somewhere' -Skipping) -join "`n") {
+            $lines | Should -Match 'could not be read'
+            $lines | Should -Match "Get-ItemProperty 'HKLM:\\Somewhere' -Name FDVDenyWriteAccess"
+        }
+    }
+
+    It 'refuses a policy that is not one of the three' {
+        { Resolve-WriteAccessPolicyAdvice -Policy 'Maybe' -PolicyPath 'HKLM:\X' } | Should -Throw
+    }
+}
+
 Describe 'Resolve-BitLockerSetupPlan' {
     It 'asks for a password only in virtual hard disk mode' -TestCases @(
         @{ Vhdx = $true;  Expected = $true }
         @{ Vhdx = $false; Expected = $false }
     ) {
         (Resolve-BitLockerSetupPlan -VhdxMode:$Vhdx).UsePasswordProtector | Should -Be $Expected
+    }
+
+    It 'warns about the read-only spell and Windows'' own prompt where the setting is on' {
+        # The reporter answered that prompt, got "BitLocker encryption already enabled", and started over.
+        $notes = (Resolve-BitLockerSetupPlan -WritePolicy 'Deny').Notes -join "`n"
+        $notes | Should -Match 'read-only'
+        $notes | Should -Match 'Windows may put up its own prompt'
+        $notes | Should -Match 'Leave it alone'
+    }
+
+    It 'says neither where the setting is off' {
+        $notes = (Resolve-BitLockerSetupPlan).Notes -join "`n"
+        $notes | Should -Not -Match 'read-only'
+        $notes | Should -Not -Match 'own prompt'
+    }
+
+    It 'puts that warning first, before the protector notes' {
+        # It is about what happens during the run; the rest is about what the drive ends up with.
+        $notes = @((Resolve-BitLockerSetupPlan -WritePolicy 'Deny').Notes)
+        $notes[0] | Should -Match 'read-only'
     }
 
     It 'adds the domain account protector only on a domain-joined machine' -TestCases @(
@@ -2679,64 +2864,94 @@ Describe 'Request-DedupSchedule' {
 
 Describe 'Resolve-WriteProtectionAdvice' {
     It 'names the drive and says nothing can be written to it' {
-        (Resolve-WriteProtectionAdvice -MountPoint 'X:' -VolumeState 'Clear') -join "`n" |
+        (Resolve-WriteProtectionAdvice -MountPoint 'X:' -VolumeState 'Clear' -PolicyPath 'HKLM:\FVE') -join "`n" |
             Should -Match 'Drive X:.*nothing can be written'
     }
 
-    It 'blames the BitLocker write-access setting only when the drive is unencrypted' {
-        $lines = (Resolve-WriteProtectionAdvice -MountPoint 'X:' -VolumeState 'Clear') -join "`n"
-        $lines | Should -Match 'deny write access to fixed drives'
-        $lines | Should -Match 'PolicyManager'
-        $lines | Should -Match 'Microsoft.FVE'
+    It 'names the setting as the likely cause once the run has actually read it' {
+        # The run reads FDVDenyWriteAccess before the plan now, so this no longer lists suspects.
+        $lines = (Resolve-WriteProtectionAdvice -MountPoint 'X:' -VolumeState 'Clear' -WritePolicy 'Deny' -PolicyPath 'HKLM:\FVE') -join "`n"
+        $lines | Should -Match 'almost certainly the cause'
+        $lines | Should -Not -Match 'may be set to deny'
     }
 
-    It 'keeps that blame conditional, since the setting is never read' {
-        $lines = (Resolve-WriteProtectionAdvice -MountPoint 'X:' -VolumeState 'Clear') -join "`n"
+    It 'tells someone how to encrypt the volume that exists, not to create it again' {
+        # The Dev Drive is already there by this point, so a rerun would repeat the creation.
+        $lines = (Resolve-WriteProtectionAdvice -MountPoint 'X:' -VolumeState 'Clear' -WritePolicy 'Deny' -PolicyPath 'HKLM:\FVE') -join "`n"
+        $lines | Should -Match 'Enable-BitLocker -MountPoint X:'
+        $lines | Should -Not -Match 'Run the script again'
+    }
+
+    It 'rules the setting out no harder than it read it' {
+        # One key was read. That is enough to stop blaming the setting, not enough to acquit it.
+        $lines = (Resolve-WriteProtectionAdvice -MountPoint 'X:' -VolumeState 'Clear' -WritePolicy 'Allow' -PolicyPath 'HKLM:\FVE') -join "`n"
+        $lines | Should -Match 'does not report that setting as on'
+        $lines | Should -Match 'does not look like the cause'
+        $lines | Should -Not -Match 'almost certainly'
+    }
+
+    It 'keeps the blame conditional only where the setting could not be read' {
+        $lines = (Resolve-WriteProtectionAdvice -MountPoint 'X:' -VolumeState 'Clear' -WritePolicy 'Unknown' -PolicyPath 'HKLM:\FVE') -join "`n"
         $lines | Should -Match 'may be set to deny'
         $lines | Should -Match 'If that setting is on'
-        $lines | Should -Not -Match 'is what makes it writable'
+        $lines | Should -Not -Match 'almost certainly'
     }
 
-    It 'rules that setting out when the drive is encrypted' {
-        $lines = (Resolve-WriteProtectionAdvice -MountPoint 'X:' -VolumeState 'Encrypted') -join "`n"
-        $lines | Should -Match 'does not explain this'
+    It 'sends an unread setting to the path it was given, and never to PolicyManager' {
+        # PolicyManager was empty on the machine that reported this; the effective path had the value.
+        $lines = (Resolve-WriteProtectionAdvice -MountPoint 'X:' -VolumeState 'Clear' -WritePolicy 'Unknown' -PolicyPath 'HKLM:\Somewhere') -join "`n"
+        $lines | Should -Match "Get-ItemProperty 'HKLM:\\Somewhere' -Name FDVDenyWriteAccess"
         $lines | Should -Not -Match 'PolicyManager'
     }
 
+    It 'assumes the setting was not read when none is passed' {
+        (Resolve-WriteProtectionAdvice -MountPoint 'X:' -VolumeState 'Clear' -PolicyPath 'HKLM:\FVE') -join "`n" |
+            Should -Match 'may be set to deny'
+    }
+
+    It 'rules that setting out when the drive is encrypted, whatever the setting says' {
+        foreach ($policy in 'Deny', 'Allow', 'Unknown') {
+            $lines = (Resolve-WriteProtectionAdvice -MountPoint 'X:' -VolumeState 'Encrypted' -WritePolicy $policy -PolicyPath 'HKLM:\FVE') -join "`n"
+            $lines | Should -Match 'does not explain this'
+            $lines | Should -Not -Match 'That is the cause'
+        }
+    }
+
     It 'narrows nothing down when the encryption state could not be read' {
-        $lines = (Resolve-WriteProtectionAdvice -MountPoint 'X:' -VolumeState 'Unknown') -join "`n"
+        $lines = (Resolve-WriteProtectionAdvice -MountPoint 'X:' -VolumeState 'Unknown' -PolicyPath 'HKLM:\FVE') -join "`n"
         $lines | Should -Match 'could not be read'
         $lines | Should -Not -Match 'deny write access'
     }
 
     It 'assumes nothing when no state is passed' {
-        (Resolve-WriteProtectionAdvice -MountPoint 'X:') -join "`n" | Should -Match 'could not be read'
+        (Resolve-WriteProtectionAdvice -MountPoint 'X:' -PolicyPath 'HKLM:\FVE') -join "`n" | Should -Match 'could not be read'
     }
 
     It 'quotes what Windows said when there is a message, and stays silent when there is not' {
-        (Resolve-WriteProtectionAdvice -MountPoint 'X:' -VolumeState 'Clear' -Reason 'Media is write-protected') -join "`n" |
+        (Resolve-WriteProtectionAdvice -MountPoint 'X:' -VolumeState 'Clear' -Reason 'Media is write-protected' -PolicyPath 'HKLM:\FVE') -join "`n" |
             Should -Match 'Windows said: Media is write-protected'
-        (Resolve-WriteProtectionAdvice -MountPoint 'X:' -VolumeState 'Clear') -join "`n" |
+        (Resolve-WriteProtectionAdvice -MountPoint 'X:' -VolumeState 'Clear' -PolicyPath 'HKLM:\FVE') -join "`n" |
             Should -Not -Match 'Windows said'
     }
 
     It 'offers the partition read-only check whatever BitLocker is doing' {
         foreach ($state in @('Clear', 'Encrypted', 'Unknown')) {
-            (Resolve-WriteProtectionAdvice -MountPoint 'X:' -VolumeState $state) -join "`n" |
+            (Resolve-WriteProtectionAdvice -MountPoint 'X:' -VolumeState $state -PolicyPath 'HKLM:\FVE') -join "`n" |
                 Should -Match 'Get-Partition -DriveLetter X \|'
         }
     }
 
     It 'says the drive stays and nothing more can be set up, whatever the state' {
         foreach ($state in @('Clear', 'Encrypted', 'Unknown')) {
-            $lines = (Resolve-WriteProtectionAdvice -MountPoint 'X:' -VolumeState $state) -join "`n"
+            $lines = (Resolve-WriteProtectionAdvice -MountPoint 'X:' -VolumeState $state -PolicyPath 'HKLM:\FVE') -join "`n"
             $lines | Should -Match 'Drive X: stays as it is'
             $lines | Should -Match 'Nothing more can be set up'
         }
     }
 
     It 'returns plain lines rather than an object to unwrap' {
-        Resolve-WriteProtectionAdvice -MountPoint 'X:' -VolumeState 'Clear' | Should -BeOfType [string]
+        Resolve-WriteProtectionAdvice -MountPoint 'X:' -VolumeState 'Clear' -PolicyPath 'HKLM:\FVE' |
+            Should -BeOfType [string]
     }
 }
 

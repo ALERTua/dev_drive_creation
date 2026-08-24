@@ -246,6 +246,8 @@ E           Projects     ReFS           Fixed     Healthy      OK               
    - Automatic unlocking is set only when the operating system drive is BitLocker-protected
    - The volume is then asked whether automatic unlocking really is on, rather than the call being taken at its word
    - Where automatic unlocking cannot be set up, the encryption is finished all the same: the run gives the reason in the words Windows used, and says the drive will need unlocking by hand after every restart
+   - **On a machine that denies write access to unencrypted fixed drives, BitLocker is not optional**, and the run says so before the question rather than after the drive exists. The setting is `FDVDenyWriteAccess` under `HKLM\SYSTEM\CurrentControlSet\Policies\Microsoft\FVE` - the path where it takes effect, whatever policy channel delivered it. Skip BitLocker there and the plan says the drive will mount read-only and the run will stop at the write check
+   - On such a machine Windows may put up its own prompt to encrypt the new drive while the script is already encrypting it. The run warns to leave that prompt alone: answering it only produces "BitLocker encryption already enabled"
    - What the machine can actually do is checked before the plan is shown, and listed in it
    - A BitLocker failure offers a choice: retry, carry on without it, or stop - except a refusal by group policy, which is not offered a retry that would meet the same refusal
 
