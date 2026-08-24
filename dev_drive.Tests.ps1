@@ -198,11 +198,57 @@ Describe 'The script itself' {
             Should -BeNullOrEmpty
     }
 
-    It 'treats every mode but deduplication-only as compressing, in all three places' {
-        # Asking for the format, the schedule parameters and the initial job must agree, or the
-        # compress-only mode configures a format nobody was asked about.
-        ([regex]::Matches((Get-Content -Path $script:ScriptPath -Raw), "\`$DedupMode -ne 'Dedup'")).Count |
-            Should -Be 3
+    It 'never asks what a mode supports by comparing the run''s own mode to a name' {
+        # Separate re-derivations of "is this compressing" are how compress-only came to send the
+        # parameters Windows refuses; one of them drifts from the rest and nothing notices.
+        # Format-DedupModeChoice still names the three modes, which is wording rather than capability.
+        $content = Get-Content -Path $script:ScriptPath -Raw
+        ([regex]::Matches($content, "\`$DedupMode -\w+ '")).Count | Should -Be 0
+        ([regex]::Matches($content, "\`$ExpectedMode -\w+ '")).Count | Should -Be 0
+    }
+
+    It 'puts every block deduplication parameter inside the branch that allows it' {
+        # Measured on a live compression-only volume: CpuPercentage is refused outright, a scrub
+        # schedule is refused outright, and Duration is accepted and silently dropped. A test that
+        # only looked for a guard above each line would pass an inverted one, so this asks the
+        # syntax tree which branch body each line actually sits in.
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($script:ScriptPath, [ref]$null, [ref]$null)
+        $guards = @($ast.FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.IfStatementAst] -and
+                    $node.Clauses[0].Item1.Extent.Text -eq '$DedupCapability.UsesBlockDedup'
+                }, $true))
+        $guards.Count | Should -BeGreaterThan 0
+
+        $bodies = @($guards | ForEach-Object { $_.Clauses[0].Item2.Extent })
+        $content = Get-Content -Path $script:ScriptPath -Raw
+        $needles = @(
+            'CpuPercentage = $DedupDailyCpuPercent'
+            'CpuPercentage = 60'
+            'Set-ReFSDedupScrubSchedule -Volume'
+            'Duration = New-TimeSpan -Hours $DedupDailyDurationHours'
+            '(${DedupDailyDurationHours}h)'
+        )
+        foreach ($needle in $needles) {
+            $at = $content.IndexOf($needle)
+            $at | Should -BeGreaterThan 0
+            @($bodies | Where-Object { $at -gt $_.StartOffset -and $at -lt $_.EndOffset }).Count |
+                Should -BeGreaterThan 0
+        }
+    }
+
+    It 'says the weekly job is being skipped rather than passing over it in silence' {
+        # The guard that holds the scrub call must have an else, and the else must say something.
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($script:ScriptPath, [ref]$null, [ref]$null)
+        $scrubGuard = @($ast.FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.IfStatementAst] -and
+                    $node.Clauses[0].Item1.Extent.Text -eq '$DedupCapability.UsesBlockDedup' -and
+                    $node.Clauses[0].Item2.Extent.Text -match 'Set-ReFSDedupScrubSchedule'
+                }, $true))
+        $scrubGuard.Count | Should -Be 1
+        $scrubGuard[0].ElseClause | Should -Not -BeNullOrEmpty
+        $scrubGuard[0].ElseClause.Extent.Text | Should -Match 'No weekly scrub job'
     }
 
     It 'reaches the compression wording only through the mode helper' {
@@ -2138,10 +2184,50 @@ Describe 'Format-DedupTimeList' {
     }
 }
 
+Describe 'Resolve-DedupModeCapability' {
+    It 'says <Mode> compresses: <Compresses>, and deduplicates blocks: <Blocks>' -TestCases @(
+        @{ Mode = 'Dedup'; Compresses = $false; Blocks = $true }
+        @{ Mode = 'DedupAndCompress'; Compresses = $true; Blocks = $true }
+        @{ Mode = 'Compress'; Compresses = $true; Blocks = $false }
+    ) {
+        $capability = Resolve-DedupModeCapability -Mode $Mode
+        $capability.UsesCompression | Should -Be $Compresses
+        $capability.UsesBlockDedup | Should -Be $Blocks
+    }
+
+    It 'refuses a mode that is not one of the three' {
+        { Resolve-DedupModeCapability -Mode 'Everything' } | Should -Throw
+    }
+}
+
+Describe 'Format-DedupDailyJobNote' {
+    It 'names the duration and the CPU share where both apply' {
+        Format-DedupDailyJobNote -DurationHours 3 -CpuPercent 45 -BlockDedup |
+            Should -Be 'The daily job runs on mains power only, for up to 3 hours, using at most 45% of the CPU.'
+    }
+
+    It 'promises neither where Windows takes neither' {
+        # Measured on a compression-only volume: the CPU share is refused and the duration is
+        # accepted and dropped, so naming either of them would be a promise the run cannot keep.
+        $line = Format-DedupDailyJobNote -DurationHours 3 -CpuPercent 45
+        $line | Should -Match 'no time limit and no CPU share'
+        $line | Should -Not -Match '3 hours'
+        $line | Should -Not -Match '45'
+    }
+
+    It 'keeps the mains power condition either way' {
+        # That one is set through Task Scheduler afterwards, so it holds whatever the mode is.
+        foreach ($line in (Format-DedupDailyJobNote -DurationHours 2 -CpuPercent 60 -BlockDedup),
+            (Format-DedupDailyJobNote -DurationHours 2 -CpuPercent 60)) {
+            $line | Should -Match 'mains power only'
+        }
+    }
+}
+
 Describe 'Format-DedupScheduleSummary' {
     It 'names the days, the daily times, the weekly day and its start' {
         $lines = Format-DedupScheduleSummary -DailyTimes @('11:00', '17:00') -DailyDaysLabel 'Monday-Friday' `
-            -WeeklyDay 'Monday' -WeeklyStart '17:30' -WeeksInterval 1
+            -WeeklyDay 'Monday' -WeeklyStart '17:30' -WeeksInterval 1 -WeeklyJob
         $lines.Count | Should -Be 2
         $lines[0] | Should -Be '  Daily optimization : Monday-Friday at 11:00 and 17:00'
         $lines[1] | Should -Be '  Weekly maintenance : Monday at 17:30, every 1 week'
@@ -2149,15 +2235,28 @@ Describe 'Format-DedupScheduleSummary' {
 
     It 'shows the times the user chose rather than the defaults' {
         $lines = Format-DedupScheduleSummary -DailyTimes @('08:15', '13:00') -DailyDaysLabel 'Monday-Friday' `
-            -WeeklyDay 'Saturday' -WeeklyStart '09:00' -WeeksInterval 1
+            -WeeklyDay 'Saturday' -WeeklyStart '09:00' -WeeksInterval 1 -WeeklyJob
         $lines[0] | Should -Match '08:15 and 13:00'
         $lines[1] | Should -Match 'Saturday at 09:00'
     }
 
     It 'says weeks in the plural for an interval above one' {
         $lines = Format-DedupScheduleSummary -DailyTimes @('11:00') -DailyDaysLabel 'Monday-Friday' `
-            -WeeklyDay 'Monday' -WeeklyStart '17:30' -WeeksInterval 2
+            -WeeklyDay 'Monday' -WeeklyStart '17:30' -WeeksInterval 2 -WeeklyJob
         $lines[1] | Should -Match 'every 2 weeks'
+    }
+
+    It 'promises no weekly maintenance where Windows will schedule none' {
+        # @(): one line comes back as a bare string, and strict mode refuses .Count on one of those.
+        $lines = @(Format-DedupScheduleSummary -DailyTimes @('11:00', '17:00') -DailyDaysLabel 'Monday-Friday' `
+                -WeeklyDay 'Monday' -WeeklyStart '17:30' -WeeksInterval 1)
+        $lines.Count | Should -Be 1
+        $lines[0] | Should -Be '  Daily optimization : Monday-Friday at 11:00 and 17:00'
+    }
+
+    It 'needs no weekly day at all when there is no weekly job' {
+        { Format-DedupScheduleSummary -DailyTimes @('11:00') -DailyDaysLabel 'Monday-Friday' } |
+            Should -Not -Throw
     }
 }
 
@@ -2168,9 +2267,18 @@ Describe 'Resolve-DedupScheduleReminder' {
 
     It 'names the times just chosen so the right task can be found by its Triggers column' {
         $lines = (Resolve-DedupScheduleReminder -DailyTimes @('08:15', '13:00') -WeeklyDay 'Monday' `
-                -WeeklyStart '17:30' -TaskTreePath $script:TreePath) -join "`n"
+                -WeeklyStart '17:30' -TaskTreePath $script:TreePath -WeeklyJob) -join "`n"
         $lines | Should -Match '08:15 and 13:00 daily'
         $lines | Should -Match 'Monday at 17:30 weekly'
+    }
+
+    It 'names no weekly time where no weekly task was created' {
+        # Naming one sends the user hunting through Task Scheduler for a task that is not there.
+        $lines = (Resolve-DedupScheduleReminder -DailyTimes @('08:15', '13:00') -WeeklyDay 'Monday' `
+                -WeeklyStart '17:30' -TaskTreePath $script:TreePath) -join "`n"
+        $lines | Should -Match '08:15 and 13:00 daily\.'
+        $lines | Should -Not -Match 'weekly'
+        $lines | Should -Not -Match '17:30'
     }
 
     It 'gives the folder location, the admin steps and the Actions tab warning' {
@@ -2199,7 +2307,7 @@ Describe 'Request-DedupSchedule' {
     It 'keeps the offered times when the user takes them' {
         Mock Read-Host { '1' }
         $chosen = Request-DedupSchedule -DailyTimes @('11:00', '17:00') -DailyDaysLabel 'Monday-Friday' `
-            -WeeklyDay 'Monday' -WeeklyStart '17:30' -WeeksInterval 1 -DailyDurationHours 2 -DailyCpuPercent 60
+            -WeeklyDay 'Monday' -WeeklyStart '17:30' -WeeksInterval 1 -DailyDurationHours 2 -DailyCpuPercent 60 -BlockDedup
         $chosen.DailyTimes | Should -Be @('11:00', '17:00')
         $chosen.WeeklyDay | Should -Be 'Monday'
         $chosen.WeeklyStart | Should -Be '17:30'
@@ -2210,7 +2318,7 @@ Describe 'Request-DedupSchedule' {
         $script:index = 0
         Mock Read-Host { $script:answers[$script:index++] }
         $chosen = Request-DedupSchedule -DailyTimes @('11:00', '17:00') -DailyDaysLabel 'Monday-Friday' `
-            -WeeklyDay 'Monday' -WeeklyStart '17:30' -WeeksInterval 1 -DailyDurationHours 2 -DailyCpuPercent 60
+            -WeeklyDay 'Monday' -WeeklyStart '17:30' -WeeksInterval 1 -DailyDurationHours 2 -DailyCpuPercent 60 -BlockDedup
         $chosen.DailyTimes | Should -Be @('08:15', '13:00')
         $chosen.WeeklyDay | Should -Be 'Saturday'
         $chosen.WeeklyStart | Should -Be '09:00'
@@ -2221,7 +2329,7 @@ Describe 'Request-DedupSchedule' {
         $script:index = 0
         Mock Read-Host { $script:answers[$script:index++] }
         $chosen = Request-DedupSchedule -DailyTimes @('11:00', '17:00') -DailyDaysLabel 'Monday-Friday' `
-            -WeeklyDay 'Monday' -WeeklyStart '17:30' -WeeksInterval 1 -DailyDurationHours 2 -DailyCpuPercent 60
+            -WeeklyDay 'Monday' -WeeklyStart '17:30' -WeeksInterval 1 -DailyDurationHours 2 -DailyCpuPercent 60 -BlockDedup
         $chosen.DailyTimes | Should -Be @('11:00', '17:00')
         $chosen.WeeklyDay | Should -Be 'Monday'
         $chosen.WeeklyStart | Should -Be '17:30'
@@ -2232,7 +2340,7 @@ Describe 'Request-DedupSchedule' {
         $script:index = 0
         Mock Read-Host { $script:answers[$script:index++] }
         $chosen = Request-DedupSchedule -DailyTimes @('11:00', '17:00') -DailyDaysLabel 'Monday-Friday' `
-            -WeeklyDay 'Monday' -WeeklyStart '17:30' -WeeksInterval 1 -DailyDurationHours 2 -DailyCpuPercent 60
+            -WeeklyDay 'Monday' -WeeklyStart '17:30' -WeeksInterval 1 -DailyDurationHours 2 -DailyCpuPercent 60 -BlockDedup
         $chosen.DailyTimes | Should -Be @('08:15')
         $chosen.WeeklyDay | Should -Be 'Tuesday'
         $chosen.WeeklyStart | Should -Be '07:30'
@@ -2244,7 +2352,7 @@ Describe 'Request-DedupSchedule' {
         $script:index = 0
         Mock Read-Host { $script:answers[$script:index++] }
         $chosen = Request-DedupSchedule -DailyTimes @('11:00', '17:00') -DailyDaysLabel 'Monday-Friday' `
-            -WeeklyDay 'Monday' -WeeklyStart '17:30' -WeeksInterval 1 -DailyDurationHours 2 -DailyCpuPercent 60
+            -WeeklyDay 'Monday' -WeeklyStart '17:30' -WeeksInterval 1 -DailyDurationHours 2 -DailyCpuPercent 60 -BlockDedup
         $chosen.DailyTimes | Should -Be @('08:15')
     }
 
@@ -2253,7 +2361,7 @@ Describe 'Request-DedupSchedule' {
         $script:index = 0
         Mock Read-Host { $script:answers[$script:index++] }
         Request-DedupSchedule -DailyTimes @('11:00', '17:00') -DailyDaysLabel 'Monday-Friday' `
-            -WeeklyDay 'Monday' -WeeklyStart '17:30' -WeeksInterval 1 -DailyDurationHours 2 -DailyCpuPercent 60 |
+            -WeeklyDay 'Monday' -WeeklyStart '17:30' -WeeksInterval 1 -DailyDurationHours 2 -DailyCpuPercent 60 -BlockDedup |
             Out-Null
         Should -Invoke Write-Host -ParameterFilter {
             $Object -match 'own scheduled task' -and $Object -notmatch 'Overlap'
@@ -2263,11 +2371,40 @@ Describe 'Request-DedupSchedule' {
     It 'says the daily job, not both jobs, run on mains power for a duration and CPU cap it names' {
         Mock Read-Host { '1' }
         Request-DedupSchedule -DailyTimes @('11:00', '17:00') -DailyDaysLabel 'Monday-Friday' `
-            -WeeklyDay 'Monday' -WeeklyStart '17:30' -WeeksInterval 1 -DailyDurationHours 3 -DailyCpuPercent 45 |
-            Out-Null
+            -WeeklyDay 'Monday' -WeeklyStart '17:30' -WeeksInterval 1 -DailyDurationHours 3 -DailyCpuPercent 45 `
+            -BlockDedup | Out-Null
         Should -Invoke Write-Host -ParameterFilter {
             $Object -match 'The daily job runs on mains power only, for up to 3 hours, using at most 45% of the CPU\.'
         }
+    }
+
+    It 'asks nothing about a weekly job that cannot exist' {
+        # Compression only: the user picks the daily times and is never asked for a day or a time
+        # for maintenance Windows will refuse to schedule.
+        $script:answers = @('2', '08:15,13:00')
+        $script:index = 0
+        Mock Read-Host { $script:answers[$script:index++] }
+        $chosen = Request-DedupSchedule -DailyTimes @('11:00', '17:00') -DailyDaysLabel 'Monday-Friday' `
+            -WeeklyDay 'Monday' -WeeklyStart '17:30' -WeeksInterval 1 -DailyDurationHours 2 -DailyCpuPercent 60
+        $chosen.DailyTimes | Should -Be @('08:15', '13:00')
+        $script:index | Should -Be 2
+    }
+
+    It 'hands back the weekly values it was given when it asked about none' {
+        Mock Read-Host { '1' }
+        $chosen = Request-DedupSchedule -DailyTimes @('11:00') -DailyDaysLabel 'Monday-Friday' `
+            -WeeklyDay 'Monday' -WeeklyStart '17:30' -WeeksInterval 1 -DailyDurationHours 2 -DailyCpuPercent 60
+        $chosen.WeeklyDay | Should -Be 'Monday'
+        $chosen.WeeklyStart | Should -Be '17:30'
+    }
+
+    It 'promises no time limit and no CPU share where neither applies' {
+        Mock Read-Host { '1' }
+        Request-DedupSchedule -DailyTimes @('11:00') -DailyDaysLabel 'Monday-Friday' `
+            -WeeklyDay 'Monday' -WeeklyStart '17:30' -WeeksInterval 1 -DailyDurationHours 3 -DailyCpuPercent 45 |
+            Out-Null
+        Should -Invoke Write-Host -ParameterFilter { $Object -match 'no time limit and no CPU share' }
+        Should -Not -Invoke Write-Host -ParameterFilter { $Object -match 'using at most 45%' }
     }
 }
 
