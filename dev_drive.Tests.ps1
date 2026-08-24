@@ -1147,6 +1147,16 @@ Describe 'Resolve-VhdxMountAdvice' {
         $lines | Should -Match 'started as administrator'
     }
 
+    It 'warns that the trusted status stays behind, whatever happens with automatic mounting' -TestCases @(
+        @{ Requested = $true;  Granted = $true }
+        @{ Requested = $true;  Granted = $false }
+        @{ Requested = $false; Granted = $false }
+    ) {
+        $lines = (Resolve-VhdxMountAdvice -VhdxPath 'D:\dev.vhdx' -AutoAttachRequested:$Requested -AutoAttachGranted:$Granted) -join "`n"
+        $lines | Should -Match 'stored per machine and does not travel'
+        $lines | Should -Match 'fsutil devdrv trust /f'
+    }
+
     It 'returns plain lines rather than an object to unwrap' {
         Resolve-VhdxMountAdvice -VhdxPath 'D:\dev.vhdx' | Should -BeOfType [string]
     }

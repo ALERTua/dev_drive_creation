@@ -265,6 +265,18 @@ Mount-DiskImage -ImagePath 'D:\DevDrive.vhdx' -StorageType VHDX -Access ReadWrit
 
 Run it from a PowerShell started as administrator. Microsoft's [`Mount-DiskImage` reference](https://learn.microsoft.com/en-us/powershell/module/storage/mount-diskimage) states that mounting a virtual hard disk requires administrator privileges, unlike mounting an `.iso` file.
 
+### Carrying the file to another machine
+
+Portability is the reason to choose this mode, and it costs the trusted status. Microsoft's [Dev Drive documentation](https://learn.microsoft.com/en-us/windows/dev-drive/) states that the designation, trust status included, is stored per machine and does not travel with the file: a `.vhdx` mounted somewhere else comes up as an ordinary ReFS volume, every filter attaches, and Microsoft Defender scans it synchronously. Nothing announces this — the drive works, it is simply slower than the one you left behind.
+
+Mount it on the new machine, then mark it trusted again:
+
+```powershell
+fsutil devdrv trust /f D:
+```
+
+The `/f` matters more there than it does during creation: the volume you just mounted may already be in use, and without the flag the designation waits for the next mount.
+
 ### BitLocker inside a virtual hard disk
 
 Microsoft's documentation states that a `.vhdx` is already covered by BitLocker on the volume that hosts it, and that enabling BitLocker on the mounted virtual disk is unnecessary. The script says so before asking, but leaves the choice to you.

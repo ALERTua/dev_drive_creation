@@ -1329,22 +1329,28 @@ function Resolve-VhdxMountAdvice {
     )
 
     if ($AutoAttachGranted) {
-        return @("Windows will mount $VhdxPath automatically on every startup.")
-    }
-
-    $opening = if ($AutoAttachRequested) {
-        "Automatic mounting was NOT enabled, so this Dev Drive's mount point is gone after every restart."
+        $lines = @("Windows will mount $VhdxPath automatically on every startup.")
     } else {
-        "You chose to mount this Dev Drive yourself, so its mount point is gone after every restart."
+        $opening = if ($AutoAttachRequested) {
+            "Automatic mounting was NOT enabled, so this Dev Drive's mount point is gone after every restart."
+        } else {
+            "You chose to mount this Dev Drive yourself, so its mount point is gone after every restart."
+        }
+
+        $lines = @(
+            $opening
+            "Mount it again with:"
+            "  Mount-DiskImage -ImagePath '$VhdxPath' -StorageType VHDX -Access ReadWrite"
+            "Run that from a PowerShell started as administrator: mounting a virtual hard disk needs"
+            "administrator rights, unlike mounting a .iso file."
+        )
     }
 
-    return @(
-        $opening
-        "Mount it again with:"
-        "  Mount-DiskImage -ImagePath '$VhdxPath' -StorageType VHDX -Access ReadWrite"
-        "Run that from a PowerShell started as administrator: mounting a virtual hard disk needs"
-        "administrator rights, unlike mounting a .iso file."
-    )
+    # Trust is a per-machine registry flag, so a copy of this file is an ordinary volume elsewhere.
+    $lines += "Copied to another machine, this file mounts there as an ordinary volume: the trust that"
+    $lines += "gives it Defender performance mode is stored per machine and does not travel with the file."
+    $lines += "Restore it there, after mounting, with: fsutil devdrv trust /f <drive letter>:"
+    return $lines
 }
 
 function Request-AutoAttachChoice {
