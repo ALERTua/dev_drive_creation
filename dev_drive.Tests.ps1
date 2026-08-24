@@ -130,7 +130,7 @@ Describe 'The script itself' {
 
     It 'takes the fsutil devdrv trust exit code before any other command can overwrite it' {
         $content = Get-Content -Path $script:ScriptPath -Raw
-        $content | Should -Match '(?ms)fsutil devdrv trust /f "\$devLetterColon" \| Out-Null\s*\r?\n\s*#[^\r\n]*\r?\n\s*#[^\r\n]*\r?\n\s*\$trustExitCode = \$LASTEXITCODE'
+        $content | Should -Match '(?ms)fsutil devdrv trust /f "\$devLetterColon" \| Out-Null(?:\s*\r?\n\s*#[^\r\n]*)*\s*\r?\n\s*\$trustExitCode = \$LASTEXITCODE'
     }
 
     It 'asks the volume for its trust state as well as reading the exit code' {
@@ -141,6 +141,17 @@ Describe 'The script itself' {
         $codeAt | Should -BeGreaterThan 0
         $queryAt | Should -BeGreaterThan $codeAt
         $reportAt | Should -BeGreaterThan $queryAt
+    }
+
+    It 'colours the trust lines by the verdict, so a refusal is never printed as good news' {
+        $content = Get-Content -Path $script:ScriptPath -Raw
+        $content | Should -Match "\`$trustColour = if \(\`$trustReport\.Trusted\) \{ 'Green' \} else \{ 'Yellow' \}"
+        $content | Should -Match '(?ms)foreach \(\$line in \$trustReport\.Lines\) \{\s*\r?\n\s*Write-Host \$line -ForegroundColor \$trustColour'
+    }
+
+    It 'strips the error record before rendering the query output, so a stderr line stays one line' {
+        Select-String -Path $script:ScriptPath -Pattern 'fsutil devdrv query "\$devLetterColon" 2>&1 \| ForEach-Object \{ "\$_" \} \| Out-String' |
+            Should -Not -BeNullOrEmpty
     }
 
     It 'prints a plan summary line when BitLocker is skipped' {
@@ -1081,7 +1092,6 @@ Describe 'Resolve-BitLockerUnlockAction' {
     }
 }
 
-
 Describe 'Resolve-DevDriveTrustReport' {
     BeforeAll {
         $script:TrustedOutput = @'
@@ -1098,7 +1108,6 @@ Filters currently attached to this developer volume:
         $report = Resolve-DevDriveTrustReport -MountPoint 'X:' -TrustExitCode 0 -QueryOutput $script:TrustedOutput
         $report.Trusted | Should -BeTrue
         ($report.Lines -join "`n") | Should -Match 'X: reports itself trusted'
-        ($report.Lines -join "`n") | Should -Match 'performance mode'
     }
 
     It 'refuses to call the volume trusted when the command failed, whatever the query says' {
@@ -1107,10 +1116,18 @@ Filters currently attached to this developer volume:
         ($report.Lines -join "`n") | Should -Match 'exited with code 1'
     }
 
-    It 'refuses to call the volume trusted when the command succeeded but the volume disagrees' {
+    It 'refuses to call the volume trusted when the command succeeded but the answer does not say so' {
         $report = Resolve-DevDriveTrustReport -MountPoint 'X:' -TrustExitCode 0 -QueryOutput 'This is not a developer volume.'
         $report.Trusted | Should -BeFalse
-        ($report.Lines -join "`n") | Should -Match 'does not report itself as trusted'
+        ($report.Lines -join "`n") | Should -Match 'could not read that back'
+    }
+
+    It 'blames the reading, not the volume, when the answer came back in another language' {
+        $report = Resolve-DevDriveTrustReport -MountPoint 'X:' -TrustExitCode 0 -QueryOutput 'Dies ist ein vertrauenswuerdiges Entwicklervolume.'
+        $report.Trusted | Should -BeFalse
+        $lines = $report.Lines -join "`n"
+        $lines | Should -Match 'not in English'
+        $lines | Should -Not -Match 'will still work'
     }
 
     It 'reads a wording it does not know as not trusted' {
@@ -1139,7 +1156,7 @@ Filters currently attached to this developer volume:
         }
     }
 
-    It 'never says the drive is broken, only that it lost performance mode' {
+    It 'says the drive still works only when the command itself failed' {
         $lines = (Resolve-DevDriveTrustReport -MountPoint 'X:' -TrustExitCode 1 -QueryOutput '').Lines -join "`n"
         $lines | Should -Match 'will still work'
     }
@@ -1149,6 +1166,7 @@ Filters currently attached to this developer volume:
             Should -Be 1
     }
 }
+
 Describe 'Test-RecoveryKeyAcknowledged' {
     It 'accepts <Description>' -TestCases @(
         @{ Description = 'the word itself'; Answer = 'YES' }

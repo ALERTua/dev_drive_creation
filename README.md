@@ -162,7 +162,7 @@ Formatting the newly created partition drive E: to a Dev Drive
 
 Dev Drive created at E:
 Marking Dev Drive E: as trusted for Defender performance
-Dev Drive marked trusted.
+Dev Drive E: reports itself trusted, which is the signal for Microsoft Defender to run in performance mode.
 Skipping BitLocker encryption as requested.
 Enabling Deduplication mode DedupAndCompress for E:
 Enabled ReFS Dedup mode: DedupAndCompress
