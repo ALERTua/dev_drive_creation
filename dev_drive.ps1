@@ -736,31 +736,80 @@ function Request-CompressionFormat {
     }
 }
 
+function Get-CompressionLevelRange {
+    <# The levels each format takes, per the refsutil compression reference. LZ4 skips 2. #>
+    param([Parameter(Mandatory)][ValidateSet('LZ4', 'ZSTD')][string]$Format)
+
+    if ($Format -eq 'LZ4') {
+        return [PSCustomObject]@{ Allowed = @(1) + (3..12); Label = 'level 1, or 3 to 12' }
+    }
+    return [PSCustomObject]@{ Allowed = @(1..22); Label = 'levels 1 to 22' }
+}
+
+function Resolve-CompressionLevelInput {
+    <#
+        Decides what one typed compression level means. An empty answer is the documented way to
+        leave the level to Windows, and comes back as no level rather than as a number.
+    #>
+    param(
+        [Parameter(Mandatory)][ValidateSet('LZ4', 'ZSTD')][string]$Format,
+        [AllowNull()][AllowEmptyString()][string]$Answer
+    )
+
+    $result = [PSCustomObject]@{ Rejection = $null; Level = $null }
+
+    if ([string]::IsNullOrWhiteSpace($Answer)) {
+        return $result
+    }
+
+    $trimmed = $Answer.Trim()
+    if ($trimmed -notmatch '^\d+$') {
+        $result.Rejection = 'NotANumber'
+        return $result
+    }
+
+    $level = [int]$trimmed
+    if ((Get-CompressionLevelRange -Format $Format).Allowed -notcontains $level) {
+        $result.Rejection = 'OutOfRange'
+        return $result
+    }
+
+    $result.Level = $level
+    return $result
+}
+
 function Request-CompressionLevel {
-    Write-Host "`nChoose ZSTD compression level (1-9):" -ForegroundColor Cyan
-    Write-Host "Lower levels (1-3): Faster compression, less CPU usage" -ForegroundColor White
-    Write-Host "Medium levels (4-6): Balanced speed and compression" -ForegroundColor White
-    Write-Host "Higher levels (7-9): Better compression, more CPU usage" -ForegroundColor White
+    param([Parameter(Mandatory)][ValidateSet('LZ4', 'ZSTD')][string]$Format)
+
+    $range = Get-CompressionLevelRange -Format $Format
+    Write-Host "`nChoose the $Format compression level:" -ForegroundColor Cyan
+    Write-Host "$Format accepts $($range.Label)." -ForegroundColor White
+    if ($Format -eq 'LZ4') {
+        Write-Host "Levels 3 and above use the LZ4HC algorithm: smaller, and slower to compress." -ForegroundColor White
+    } else {
+        Write-Host "Higher levels compress smaller and slower, and levels 20 and above need noticeably more memory." -ForegroundColor White
+    }
+    Write-Host "Decompression is the same speed whichever level you pick." -ForegroundColor White
     Write-Host ""
 
     while ($true) {
-        $level = Read-Host "Enter compression level (1-9)"
-        if ($level -match '^[1-9]$') {
-            return [int]$level
-        } else {
-            Write-Host "Invalid level. Please enter a number between 1 and 9." -ForegroundColor Red
+        $answer = Read-Host "Enter a level, or press Enter for the level Windows picks"
+        $parsed = Resolve-CompressionLevelInput -Format $Format -Answer $answer
+        if (-not $parsed.Rejection) {
+            return $parsed.Level
         }
+        Write-Host "Invalid level. $Format accepts $($range.Label), or an empty answer to leave it to Windows." -ForegroundColor Red
     }
 }
 
 function Format-CompressionChoice {
-    <# Names the format, and a level only for a format that has one. #>
+    <# Names the format, and a level only when one was chosen; an unset level is Windows' own. #>
     param(
         [Parameter(Mandatory)][ValidateSet('LZ4', 'ZSTD')][string]$Format,
         [Nullable[int]]$Level
     )
 
-    if ($Format -eq 'ZSTD' -and $null -ne $Level) {
+    if ($null -ne $Level) {
         return "$Format compression, level $Level"
     }
     return "$Format compression"
@@ -1767,13 +1816,9 @@ if ($dedupChoice -eq "None") {
     # Ask for compression format
     $CompressionFormat = Request-CompressionFormat
 
-    # Ask for compression level if ZSTD is selected
-    if ($CompressionFormat -eq "ZSTD") {
-        $CompressionLevel = Request-CompressionLevel
-        Write-Host "Selected ZSTD compression with level $CompressionLevel" -ForegroundColor Green
-    } else {
-        Write-Host "Selected LZ4 compression" -ForegroundColor Green
-    }
+    # Both formats have levels, and both accept being left to Windows.
+    $CompressionLevel = Request-CompressionLevel -Format $CompressionFormat
+    Write-Host "Selected $(Format-CompressionChoice -Format $CompressionFormat -Level $CompressionLevel)" -ForegroundColor Green
 } else {
     $DedupMode = $dedupChoice
     Write-Host "Selected deduplication only (no compression)" -ForegroundColor Green
@@ -2175,10 +2220,11 @@ try {
             CpuPercentage     = $DedupDailyCpuPercent
         }
 
-        # Add compression parameters only if not Dedup-only mode
+        # Add compression parameters only if not Dedup-only mode. An unchosen level is left out
+        # entirely: that is how Windows is told to use its own, which it may change between builds.
         if ($DedupMode -ne 'Dedup') {
             $baseScheduleParams.CompressionFormat = $CompressionFormat
-            if ($CompressionFormat -eq 'ZSTD') {
+            if ($null -ne $CompressionLevel) {
                 $baseScheduleParams.CompressionLevel = [uint16]$CompressionLevel
             }
         }
@@ -2250,8 +2296,8 @@ try {
             # Add compression parameters only if not Dedup-only mode
             if ($DedupMode -ne 'Dedup') {
                 $jobParams.CompressionFormat = $CompressionFormat
-                if ($CompressionFormat -eq 'ZSTD') {
-                    $jobParams.CompressionLevel = $CompressionLevel
+                if ($null -ne $CompressionLevel) {
+                    $jobParams.CompressionLevel = [uint16]$CompressionLevel
                 }
             }
 
