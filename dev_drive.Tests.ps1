@@ -123,7 +123,7 @@ Describe 'The script itself' {
     It 'configures the mains-power condition only after the weekly maintenance job it must cover' {
         $content = Get-Content -Path $script:ScriptPath -Raw
         $weeklyAt = $content.IndexOf('Set-ReFSDedupScrubSchedule -Volume "$devLetterColon"')
-        $acPowerAt = $content.IndexOf('Configuring deduplication tasks to run only on AC power')
+        $acPowerAt = $content.IndexOf('Configuring the ReFS optimization tasks to run only on AC power')
         $weeklyAt | Should -BeGreaterThan 0
         $acPowerAt | Should -BeGreaterThan $weeklyAt
     }
@@ -167,6 +167,13 @@ Describe 'The script itself' {
             Should -Be 3
         Select-String -Path $script:ScriptPath -Pattern 'Write-Host "[^"]*(?<!-Level )\$CompressionLevel' |
             Should -BeNullOrEmpty
+    }
+
+    It 'treats every mode but deduplication-only as compressing, in all three places' {
+        # Asking for the format, the schedule parameters and the initial job must agree, or the
+        # compress-only mode configures a format nobody was asked about.
+        ([regex]::Matches((Get-Content -Path $script:ScriptPath -Raw), "\`$DedupMode -ne 'Dedup'")).Count |
+            Should -Be 3
     }
 
     It 'reaches the compression wording only through the mode helper' {

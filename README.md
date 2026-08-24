@@ -11,7 +11,7 @@ This script automates work you are expected to be able to do by hand: it assumes
 - **Virtual Hard Disk Mode**: Puts the Dev Drive in a `.vhdx` file that Windows can mount on every startup
 - **Smart Drive Selection**: Shows detailed drive information for informed choices
 - **Optional BitLocker**: Encryption that fits the machine, with the recovery key shown before the run goes on and a rejected password asked for again
-- **Advanced Deduplication**: Deduplicate, compress, or both - all three modes ReFS offers
+- **Advanced ReFS Optimization**: Deduplicate, compress, or both - all three modes ReFS offers
 - **Compression Options**: Choose LZ4 or ZSTD, each with the levels that format really has, or leave the level to Windows
 - **Real Size Limits**: Shows actual Windows shrinkable limits, not estimates
 - **Power-Aware Scheduling**: Deduplication jobs run only on AC power to preserve battery
@@ -41,7 +41,7 @@ This script runs in interactive mode and will guide you through the entire Dev D
 2. **Drive Selection**: Shows all physical drives with size and free space information
 3. **Size Configuration**: Enter Dev Drive size (minimum 50 GB; in free-space mode press Enter for the maximum)
 4. **BitLocker Setup**: Optional encryption, with the recovery key shown and acknowledged
-5. **Deduplication Options**: Deduplicate only, compress only, both, or neither
+5. **Deduplication Options**: Deduplicate only, deduplicate and compress, compress only, or neither
 6. **Compression Configuration**: Select format (LZ4/ZSTD) and level (LZ4: 1 or 3-12; ZSTD: 1-22; Enter leaves it to Windows)
 7. **Deduplication Schedule**: Keep the suggested times, or set them yourself
 
@@ -130,7 +130,7 @@ Higher levels compress smaller and slower, and levels 20 and above can need noti
 Decompression is the same speed whichever level you pick.
 
 Enter a level, or press Enter for the level Windows picks: 2
-Selected ZSTD compression, level 2
+Selected deduplication and ZSTD compression, level 2
 
 
 ===============================================================================
@@ -139,9 +139,10 @@ Selected ZSTD compression, level 2
 
 * Shrink Drive D (ALERT) by 199 GB to free up space
 * Create 199 GB Dev Drive on Disk 1 (CT4000P3PSSD8) using ReFS
+* Skip BitLocker encryption
 * Enable ReFS deduplication and ZSTD compression, level 2
-* Schedule daily optimization jobs at 11:00 and 17:00 (AC power only)
-* Schedule weekly maintenance job every Monday at 17:30
+* Daily optimization : Monday-Friday at 11:00 and 17:00
+* Weekly maintenance : Monday at 17:30, every 1 week
 * Mark Dev Drive as trusted for Windows Defender performance
 * Run initial optimization job to prepare the drive
 
@@ -166,14 +167,14 @@ Marking Dev Drive E: as trusted for Defender performance
 Dev Drive E: reports itself trusted, which is the signal for Microsoft Defender to run in performance mode.
 Skipping BitLocker encryption as requested.
 Enabling Deduplication mode DedupAndCompress for E:
-Enabled ReFS Dedup mode: DedupAndCompress
+Enabled ReFS mode: DedupAndCompress
 Scheduling the daily job at 11:00 (2h)
 Scheduling the daily job at 17:00 (2h)
 Scheduled the daily jobs
-Configuring deduplication tasks to run only on AC power...
-Successfully configured 1 deduplication task(s) to run only on AC power
+Configuring the ReFS optimization tasks to run only on AC power...
+Successfully configured 1 ReFS optimization task(s) to run only on AC power
 Scheduling deduplication scrub jobs
-Scheduled weekly scrub job on Monday at 12:00 (4h)
+Scheduled weekly scrub job on Monday at 17:30
 Running the initial ReFS job for E:
 Triggered the initial job: deduplication and ZSTD compression, level 2
 All done. Dev Drive E: ready.

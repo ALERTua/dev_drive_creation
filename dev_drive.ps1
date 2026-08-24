@@ -1003,7 +1003,7 @@ function Resolve-DedupScheduleReminder {
     )
 
     return @(
-        "Deduplication runs on a schedule kept in Task Scheduler, under:"
+        "The ReFS optimization runs on a schedule kept in Task Scheduler, under:"
         "  $TaskTreePath"
         ""
         "Times just chosen: $(Format-DedupTimeList -Times $DailyTimes) daily, $WeeklyDay at $WeeklyStart weekly."
@@ -1011,7 +1011,7 @@ function Resolve-DedupScheduleReminder {
         "To change the times later, press Win+R, type taskschd.msc and press Ctrl+Shift+Enter to open"
         "it as administrator, then open that folder and find the tasks whose Triggers column matches"
         "the times above. Edit them on the Triggers tab. Leave the Actions tab alone - that is what"
-        "actually runs the deduplication."
+        "actually runs the optimization."
         ""
         "Other tasks in that folder may belong to Windows or to earlier runs."
     )
@@ -1036,7 +1036,7 @@ function Request-DedupSchedule {
     $chosenDay = $WeeklyDay
     $chosenStart = $WeeklyStart
 
-    Write-Host "`n=== DEDUPLICATION SCHEDULE ===" -ForegroundColor Cyan
+    Write-Host "`n=== OPTIMIZATION SCHEDULE ===" -ForegroundColor Cyan
     Write-Host ""
     foreach ($line in (Format-DedupScheduleSummary -DailyTimes $chosenTimes -DailyDaysLabel $DailyDaysLabel `
                 -WeeklyDay $chosenDay -WeeklyStart $chosenStart -WeeksInterval $WeeksInterval)) {
@@ -2227,9 +2227,9 @@ try {
 
     # Enable Deduplication + Compression (conditional)
     if (-not $SkipDeduplication) {
-        Write-Host "Enabling Deduplication mode $DedupMode for $devLetterColon" -ForegroundColor Green
+        Write-Host "Enabling ReFS mode $DedupMode for $devLetterColon" -ForegroundColor Green
         Enable-ReFSDedup -Volume "$devLetterColon" -Type $DedupMode -ErrorAction Stop
-        Write-Host "Enabled ReFS Dedup mode: $DedupMode" -ForegroundColor Green
+        Write-Host "Enabled ReFS mode: $DedupMode" -ForegroundColor Green
 
         # Define common schedule parameters
         $baseScheduleParams = @{
@@ -2262,7 +2262,7 @@ try {
         Write-Host "Scheduled weekly scrub job on $ScrubDays at $ScrubStart" -ForegroundColor Green
 
         # Runs after every job this pass schedules, so the weekly task exists when this walks the folder.
-        Write-Host "Configuring deduplication tasks to run only on AC power..." -ForegroundColor Green
+        Write-Host "Configuring the ReFS optimization tasks to run only on AC power..." -ForegroundColor Green
         try {
             # Find all ReFS deduplication tasks
             $dedupTasks = Get-ScheduledTask | Where-Object {$_.TaskPath -Like $DedupTaskPath -And $_.TaskName -ne "Initialization" -And $_.State -ne "Disabled"}
@@ -2283,17 +2283,17 @@ try {
             }
 
             if ($configuredTasks -gt 0) {
-                Write-Host "Successfully configured $configuredTasks deduplication task(s) to run only on AC power" -ForegroundColor Green
+                Write-Host "Successfully configured $configuredTasks ReFS optimization task(s) to run only on AC power" -ForegroundColor Green
             }
             foreach ($failure in $taskFailures) {
                 Write-Host $failure -ForegroundColor Yellow
             }
             if (-not $dedupTasks) {
-                Write-Host "No deduplication tasks were found to configure. Tasks will run on any power source." -ForegroundColor Yellow
+                Write-Host "No ReFS optimization tasks were found to configure. Tasks will run on any power source." -ForegroundColor Yellow
             }
         }
         catch {
-            Write-Host "Could not configure AC power condition for deduplication tasks: $($_.Exception.Message)" -ForegroundColor Yellow
+            Write-Host "Could not configure AC power condition for the ReFS optimization tasks: $($_.Exception.Message)" -ForegroundColor Yellow
             Write-Host "Tasks will run on any power source." -ForegroundColor Yellow
         }
 
@@ -2321,13 +2321,14 @@ try {
 
             Write-Host "Running the initial ReFS job for $devLetterColon" -ForegroundColor Green
 
+            # -FullRun only where it has always been passed; the cmdlet has one parameter set, so it
+            # is not excluded by the compression parameters, and this split is older than the repository.
             if ($DedupMode -eq 'Dedup') {
-                Start-ReFSDedupJob @jobParams -FullRun -ErrorAction Stop | Out-Null
-            } else {
-                Start-ReFSDedupJob @jobParams -ErrorAction Stop | Out-Null
+                $jobParams.FullRun = $true
             }
+            Start-ReFSDedupJob @jobParams -ErrorAction Stop | Out-Null
             Write-Host "Triggered the initial job: $(Format-DedupModeChoice -Mode $DedupMode -Format $CompressionFormat -Level $CompressionLevel)" -ForegroundColor Green
-            Write-Host "You should wait for it to complete for the deduplication to properly work" -ForegroundColor Yellow
+            Write-Host "You should wait for it to complete for the optimization to properly work" -ForegroundColor Yellow
         }
     } else {
         Write-Host "Skipping deduplication as requested." -ForegroundColor Yellow
