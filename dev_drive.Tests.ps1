@@ -9,6 +9,10 @@
 #Requires -Modules @{ ModuleName = 'Pester'; ModuleVersion = '5.0.0' }
 
 BeforeAll {
+    # The script itself runs under strict mode, and some of it behaves differently without it:
+    # indexing past the end of an array is silent here and an exception there.
+    Set-StrictMode -Version Latest
+
     $script:ScriptPath = Join-Path $PSScriptRoot 'dev_drive.ps1'
 
     # dev_drive.ps1 is a linear script that starts asking questions when it runs, so its functions
@@ -34,6 +38,14 @@ BeforeAll {
         }
     }
 
+    # Same for the ReFS deduplication module, which is not present on every Windows.
+    if (-not (Get-Command Get-ReFSDedupSchedule -ErrorAction SilentlyContinue)) {
+        function Get-ReFSDedupSchedule {
+            param([string]$Volume)
+            throw "ReFS deduplication is not available on this machine, so $Volume cannot be read."
+        }
+    }
+
     # Stands in for one entry of a BitLocker volume's KeyProtector list.
     function New-Protector {
         param([string]$Type, [string]$Id)
@@ -56,7 +68,7 @@ Describe 'The script itself' {
     }
 
     It 'declares the Dev Drive minimum exactly once' {
-        (Select-String -Path $script:ScriptPath -Pattern '^\$DevDriveMinSizeGB\s*=' ).Count | Should -Be 1
+        @(Select-String -Path $script:ScriptPath -Pattern '^\$DevDriveMinSizeGB\s*=').Count | Should -Be 1
     }
 
     It 'sets the minimum to Microsoft''s documented 50 GB' {
@@ -65,7 +77,7 @@ Describe 'The script itself' {
     }
 
     It 'declares the shrink head-room exactly once' {
-        (Select-String -Path $script:ScriptPath -Pattern '^\$ShrinkSpareBytes\s*=' ).Count | Should -Be 1
+        @(Select-String -Path $script:ScriptPath -Pattern '^\$ShrinkSpareBytes\s*=').Count | Should -Be 1
     }
 
     It 'never lets an untyped 0 choose the overload of a Math comparison' {
@@ -141,6 +153,23 @@ Describe 'The script itself' {
         $codeAt | Should -BeGreaterThan 0
         $queryAt | Should -BeGreaterThan $codeAt
         $reportAt | Should -BeGreaterThan $queryAt
+    }
+
+    It 'asks the volume what it stored after the daily schedules and before the weekly one' {
+        # Reading before the scrub schedule is written is what lets the first entry answer for the
+        # daily jobs; after it, a scrub entry could answer instead.
+        $content = Get-Content -Path $script:ScriptPath -Raw
+        $dailyAt = $content.IndexOf('Write-Host "Scheduled the daily jobs"')
+        $readBackAt = $content.IndexOf('$dedupVerdict = Resolve-DedupReadBackVerdict')
+        $scrubAt = $content.IndexOf('Set-ReFSDedupScrubSchedule -Volume "$devLetterColon"')
+        $dailyAt | Should -BeGreaterThan 0
+        $readBackAt | Should -BeGreaterThan $dailyAt
+        $scrubAt | Should -BeGreaterThan $readBackAt
+    }
+
+    It 'compares the read-back against what the run asked for, not against literals' {
+        $content = Get-Content -Path $script:ScriptPath -Raw
+        $content | Should -Match '(?ms)Resolve-DedupReadBackVerdict -MountPoint \$devLetterColon -ExpectedMode \$DedupMode `\s*\r?\n\s*-ExpectedFormat \$CompressionFormat -ExpectedLevel \$CompressionLevel'
     }
 
     It 'colours the trust lines by the outcome, so only a real failure is printed as one' {
@@ -1633,6 +1662,130 @@ Describe 'Request-Compression' {
         $chosen = Request-Compression
         $chosen.PSObject.Properties.Name | Should -Contain 'Format'
         $chosen.PSObject.Properties.Name | Should -Contain 'Level'
+    }
+}
+
+Describe 'Get-DedupVolumeReport' {
+    It 'reports what the volume answered, still typed rather than rendered' {
+        Mock Get-ReFSDedupSchedule {
+            [PSCustomObject]@{ Type = 'DedupAndCompress'; CompressionFormat = 'ZSTD'; CompressionLevel = [uint16]7 }
+        }
+        $report = Get-DedupVolumeReport -MountPoint 'X:'
+        $report.Known | Should -BeTrue
+        $report.Mode | Should -Be 'DedupAndCompress'
+        $report.Format | Should -Be 'ZSTD'
+        $report.Level | Should -Be 7
+    }
+
+    It 'takes the first schedule when the volume has several, since they share these settings' {
+        Mock Get-ReFSDedupSchedule {
+            @(
+                [PSCustomObject]@{ Type = 'Compress'; CompressionFormat = 'LZ4'; CompressionLevel = [uint16]12 }
+                [PSCustomObject]@{ Type = 'Dedup'; CompressionFormat = 'ZSTD'; CompressionLevel = [uint16]7 }
+            )
+        }
+        $report = Get-DedupVolumeReport -MountPoint 'X:'
+        $report.Level | Should -Be 12
+        $report.Mode | Should -Be 'Compress'
+    }
+
+    It 'says it could not be asked rather than inventing an answer, and why' {
+        Mock Get-ReFSDedupSchedule { throw 'Access is denied.' }
+        $report = Get-DedupVolumeReport -MountPoint 'X:'
+        $report.Known | Should -BeFalse
+        $report.Reason | Should -Match 'Windows said: Access is denied\.'
+    }
+
+    It 'calls an empty answer no schedule, not a volume that would not answer' {
+        Mock Get-ReFSDedupSchedule { @() }
+        $report = Get-DedupVolumeReport -MountPoint 'X:'
+        $report.Known | Should -BeFalse
+        $report.Reason | Should -Match 'reports no schedule at all'
+        $report.Reason | Should -Not -Match 'Windows said'
+    }
+}
+
+Describe 'Resolve-DedupReadBackVerdict' {
+    BeforeAll {
+        function New-Report {
+            param([string]$Mode, [string]$Format, [int]$Level, [bool]$Known = $true, [string]$Reason = '')
+            return [PSCustomObject]@{ Known = $Known; Reason = $Reason; Mode = $Mode; Format = $Format; Level = $Level }
+        }
+    }
+
+    It 'agrees when the volume reports what was asked for' {
+        $verdict = Resolve-DedupReadBackVerdict -MountPoint 'X:' -ExpectedMode 'DedupAndCompress' `
+            -ExpectedFormat 'ZSTD' -ExpectedLevel 7 -Actual (New-Report -Mode 'DedupAndCompress' -Format 'ZSTD' -Level 7)
+        $verdict.Agrees | Should -BeTrue
+        $verdict.Lines -join "`n" | Should -Match 'X: confirms it: deduplication and ZSTD compression, level 7\.'
+    }
+
+    It 'treats a reported level of 0 as the default, which is what asking for no level means' {
+        $verdict = Resolve-DedupReadBackVerdict -MountPoint 'X:' -ExpectedMode 'Compress' `
+            -ExpectedFormat 'LZ4' -ExpectedLevel $null -Actual (New-Report -Mode 'Compress' -Format 'LZ4' -Level 0)
+        $verdict.Agrees | Should -BeTrue
+        $lines = $verdict.Lines -join "`n"
+        $lines | Should -Match 'The compression level is the one Windows picks\.'
+        $lines | Should -Not -Match 'level 0'
+    }
+
+    It 'accepts any level when none was asked for' {
+        $verdict = Resolve-DedupReadBackVerdict -MountPoint 'X:' -ExpectedMode 'DedupAndCompress' `
+            -ExpectedFormat 'ZSTD' -ExpectedLevel $null -Actual (New-Report -Mode 'DedupAndCompress' -Format 'ZSTD' -Level 3)
+        $verdict.Agrees | Should -BeTrue
+        $verdict.Lines -join "`n" | Should -Match 'level 3'
+    }
+
+    It 'names every setting that came back different' -TestCases @(
+        @{ Mode = 'Compress'; Format = 'ZSTD'; Level = 7; Expect = 'mode: asked for DedupAndCompress, the volume reports Compress' }
+        @{ Mode = 'DedupAndCompress'; Format = 'LZ4'; Level = 7; Expect = 'compression format: asked for ZSTD, the volume reports LZ4' }
+        @{ Mode = 'DedupAndCompress'; Format = 'ZSTD'; Level = 3; Expect = 'compression level: asked for level 7, the volume reports level 3' }
+    ) {
+        $verdict = Resolve-DedupReadBackVerdict -MountPoint 'X:' -ExpectedMode 'DedupAndCompress' `
+            -ExpectedFormat 'ZSTD' -ExpectedLevel 7 -Actual (New-Report -Mode $Mode -Format $Format -Level $Level)
+        $verdict.Agrees | Should -BeFalse
+        $verdict.Lines -join "`n" | Should -Match ([regex]::Escape($Expect))
+    }
+
+    It 'calls a level asked for and answered with the default a difference, and names it as the default' {
+        $verdict = Resolve-DedupReadBackVerdict -MountPoint 'X:' -ExpectedMode 'DedupAndCompress' `
+            -ExpectedFormat 'ZSTD' -ExpectedLevel 7 -Actual (New-Report -Mode 'DedupAndCompress' -Format 'ZSTD' -Level 0)
+        $verdict.Agrees | Should -BeFalse
+        $verdict.Lines -join "`n" | Should -Match 'the volume reports the default'
+    }
+
+    It 'ignores the compression settings for the mode that does not compress' {
+        $verdict = Resolve-DedupReadBackVerdict -MountPoint 'X:' -ExpectedMode 'Dedup' `
+            -ExpectedFormat 'ZSTD' -ExpectedLevel 9 -Actual (New-Report -Mode 'Dedup' -Format 'LZ4' -Level 0)
+        $verdict.Agrees | Should -BeTrue
+        $verdict.Lines -join "`n" | Should -Be 'X: confirms it: deduplication only, without compression.'
+    }
+
+    It 'says the drive still works when the settings disagree' {
+        $verdict = Resolve-DedupReadBackVerdict -MountPoint 'X:' -ExpectedMode 'Dedup' `
+            -ExpectedFormat '' -ExpectedLevel $null -Actual (New-Report -Mode 'Disabled' -Format 'LZ4' -Level 0)
+        $verdict.Agrees | Should -BeFalse
+        $verdict.Lines -join "`n" | Should -Match 'created and usable'
+    }
+
+    It 'asks the user to look for themselves when the volume could not be read' {
+        $verdict = Resolve-DedupReadBackVerdict -MountPoint 'X:' -ExpectedMode 'Dedup' `
+            -ExpectedFormat '' -ExpectedLevel $null -Actual (New-Report -Known $false -Mode '' -Format '' -Level 0)
+        $verdict.Agrees | Should -BeFalse
+        $lines = $verdict.Lines -join "`n"
+        $lines | Should -Match 'Could not confirm the deduplication settings on X:'
+        $lines | Should -Match 'Get-ReFSDedupSchedule -Volume X:'
+    }
+
+    It 'passes on the reason the volume gave, when there is one' {
+        $verdict = Resolve-DedupReadBackVerdict -MountPoint 'X:' -ExpectedMode 'Dedup' -ExpectedFormat '' `
+            -ExpectedLevel $null -Actual (New-Report -Known $false -Mode '' -Format '' -Level 0 -Reason 'Windows said: Access is denied.')
+        $verdict.Lines -join "`n" | Should -Match 'Windows said: Access is denied\.'
+    }
+
+    It 'refuses a mode it does not know' {
+        { Resolve-DedupReadBackVerdict -MountPoint 'X:' -ExpectedMode 'Disabled' -ExpectedFormat '' `
+                -ExpectedLevel $null -Actual (New-Report -Mode 'Disabled' -Format '' -Level 0) } | Should -Throw
     }
 }
 

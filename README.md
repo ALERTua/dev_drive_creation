@@ -173,15 +173,29 @@ Dev Drive created at E:
 Marking Dev Drive E: as trusted for Defender performance
 Dev Drive E: reports itself trusted, which is the signal for Microsoft Defender to run in performance mode.
 Skipping BitLocker encryption as requested.
-Enabling Deduplication mode DedupAndCompress for E:
+Enabling ReFS mode DedupAndCompress for E:
 Enabled ReFS mode: DedupAndCompress
 Scheduling the daily job at 11:00 (2h)
 Scheduling the daily job at 17:00 (2h)
 Scheduled the daily jobs
-Configuring the ReFS optimization tasks to run only on AC power...
-Successfully configured 1 ReFS optimization task(s) to run only on AC power
+E: confirms it: deduplication and ZSTD compression, level 2.
 Scheduling deduplication scrub jobs
 Scheduled weekly scrub job on Monday at 17:30
+Configuring the ReFS optimization tasks to run only on AC power...
+Successfully configured 1 ReFS optimization task(s) to run only on AC power
+
+The ReFS optimization runs on a schedule kept in Task Scheduler, under:
+  Task Scheduler Library > Microsoft > Windows > ReFsDedupSvc
+
+Times just chosen: 11:00 and 17:00 daily, Monday at 17:30 weekly.
+
+To change the times later, press Win+R, type taskschd.msc and press Ctrl+Shift+Enter to open
+it as administrator, then open that folder and find the tasks whose Triggers column matches
+the times above. Edit them on the Triggers tab. Leave the Actions tab alone - that is what
+actually runs the optimization.
+
+Other tasks in that folder may belong to Windows or to earlier runs.
+
 Running the initial ReFS job for E:
 Triggered the initial job: deduplication and ZSTD compression, level 2
 All done. Dev Drive E: ready.
@@ -228,6 +242,7 @@ E           DevDrive     ReFS           Fixed     Healthy      OK               
    - Keep the suggested schedule, or set three fields yourself: the daily start times (comma separated, 24-hour HH:MM, up to four), the weekly maintenance day, and its start time
    - Each of the three takes Enter to keep the value shown; choosing your own times gets the result repeated back, taking the defaults does not
    - The daily job's days, its two-hour limit, its 60% CPU share and its AC-power condition are fixed and are not asked about
+   - After the jobs are created the script asks the volume what it actually stored and prints that, rather than reporting success because no command failed. A setting that came back different is named, and the run carries on: the Dev Drive exists and works either way
    - After the jobs are created the script says where to change the times later, in Task Scheduler under Microsoft > Windows > ReFsDedupSvc
    - The daily jobs are automatically scheduled to run only on AC power
 

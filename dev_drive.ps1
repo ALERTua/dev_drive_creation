@@ -448,7 +448,9 @@ function Resolve-BitLockerRecoveryProtector {
         [Parameter(Mandatory)][string]$MountPoint
     )
 
-    $recovery = @($KeyProtector | Where-Object { $_.KeyProtectorType -eq 'RecoveryPassword' })
+    # @() first: a $null argument reaches the filter as one $null item, and strict mode refuses to
+    # read a property off it.
+    $recovery = @(@($KeyProtector) | Where-Object { $null -ne $_ -and $_.KeyProtectorType -eq 'RecoveryPassword' })
     $ids = @($recovery | ForEach-Object { $_.KeyProtectorId })
     $result = [PSCustomObject]@{ Rejection = $null; ProtectorId = $null; ProtectorIds = $ids; Message = $null }
 
@@ -862,6 +864,94 @@ function Format-CompressionChoice {
         return "$Format compression, level $Level"
     }
     return "$Format compression"
+}
+
+function Get-DedupVolumeReport {
+    <#
+        What the volume says about its own deduplication settings, or why it could not say. Only the
+        settings every daily schedule shares are read, so the first schedule answers for all of them.
+    #>
+    param([Parameter(Mandatory)][string]$MountPoint)
+
+    try {
+        $schedules = @(Get-ReFSDedupSchedule -Volume $MountPoint -ErrorAction Stop)
+    }
+    catch {
+        return [PSCustomObject]@{
+            Known  = $false
+            Reason = "Windows said: $($_.Exception.GetBaseException().Message)"
+            Mode = ''; Format = ''; Level = 0
+        }
+    }
+
+    # An empty answer is the volume saying there is no schedule, not the volume failing to answer.
+    if ($schedules.Count -eq 0) {
+        return [PSCustomObject]@{
+            Known  = $false
+            Reason = "The volume reports no schedule at all, although one was just written to it."
+            Mode = ''; Format = ''; Level = 0
+        }
+    }
+
+    return [PSCustomObject]@{
+        Known  = $true
+        Reason = ''
+        Mode   = [string]$schedules[0].Type
+        Format = [string]$schedules[0].CompressionFormat
+        Level  = [int]$schedules[0].CompressionLevel
+    }
+}
+
+function Resolve-DedupReadBackVerdict {
+    <#
+        Compares what was asked for against what the volume reports. A reported level of 0 is how it
+        says "the default", which is what asking for no level means.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$MountPoint,
+        [Parameter(Mandatory)][ValidateSet('Dedup', 'DedupAndCompress', 'Compress')][string]$ExpectedMode,
+        [AllowNull()][AllowEmptyString()][string]$ExpectedFormat,
+        [Nullable[int]]$ExpectedLevel,
+        [Parameter(Mandatory)]$Actual
+    )
+
+    if (-not $Actual.Known) {
+        $lines = @("Could not confirm the deduplication settings on $MountPoint.")
+        if (-not [string]::IsNullOrWhiteSpace($Actual.Reason)) {
+            $lines += $Actual.Reason
+        }
+        $lines += "Check them by hand with: Get-ReFSDedupSchedule -Volume $MountPoint"
+        return [PSCustomObject]@{ Agrees = $false; Lines = $lines }
+    }
+
+    $reportedLevel = if ($Actual.Level -eq 0) { $null } else { $Actual.Level }
+    $compresses = $ExpectedMode -ne 'Dedup'
+
+    $differences = @()
+    if ($Actual.Mode -ne $ExpectedMode) {
+        $differences += "mode: asked for $ExpectedMode, the volume reports $($Actual.Mode)"
+    }
+    if ($compresses -and $Actual.Format -ne $ExpectedFormat) {
+        $differences += "compression format: asked for $ExpectedFormat, the volume reports $($Actual.Format)"
+    }
+    # No level asked for means any level is right, because Windows chose it.
+    if ($compresses -and $null -ne $ExpectedLevel -and $Actual.Level -ne $ExpectedLevel) {
+        $reported = if ($null -eq $reportedLevel) { 'the default' } else { "level $reportedLevel" }
+        $differences += "compression level: asked for level $ExpectedLevel, the volume reports $reported"
+    }
+
+    if ($differences.Count -gt 0) {
+        $lines = @("$MountPoint was set up, but does not report back what was asked for:")
+        $lines += $differences | ForEach-Object { "  $_" }
+        $lines += "The Dev Drive is created and usable. Check them by hand with: Get-ReFSDedupSchedule -Volume $MountPoint"
+        return [PSCustomObject]@{ Agrees = $false; Lines = $lines }
+    }
+
+    $lines = @("$MountPoint confirms it: $(Format-DedupModeChoice -Mode $Actual.Mode -Format $Actual.Format -Level $reportedLevel).")
+    if ($compresses -and $null -eq $reportedLevel) {
+        $lines += "The compression level is the one Windows picks."
+    }
+    return [PSCustomObject]@{ Agrees = $true; Lines = $lines }
 }
 
 function Resolve-DedupTimeInput {
@@ -2278,6 +2368,15 @@ try {
         }
 
         Write-Host "Scheduled the daily jobs" -ForegroundColor Green
+
+        # The settings are asked of the volume rather than assumed from the calls that just returned.
+        $dedupVerdict = Resolve-DedupReadBackVerdict -MountPoint $devLetterColon -ExpectedMode $DedupMode `
+            -ExpectedFormat $CompressionFormat -ExpectedLevel $CompressionLevel `
+            -Actual (Get-DedupVolumeReport -MountPoint $devLetterColon)
+        $verdictColour = if ($dedupVerdict.Agrees) { 'Green' } else { 'Yellow' }
+        foreach ($line in $dedupVerdict.Lines) {
+            Write-Host $line -ForegroundColor $verdictColour
+        }
 
         Write-Host "Scheduling deduplication scrub jobs" -ForegroundColor Green
         Set-ReFSDedupScrubSchedule -Volume "$devLetterColon" -Days $ScrubDays -Start $ScrubStart -WeeksInterval $ScrubWeeksInterval -ErrorAction Stop
