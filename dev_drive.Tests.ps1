@@ -303,6 +303,42 @@ Describe 'The script itself' {
         $backupAt | Should -BeGreaterThan $bannerAt
     }
 
+    It 'formats the volume with the name that was asked for, never a hard-coded one' {
+        $content = Get-Content -Path $script:ScriptPath -Raw
+        $content | Should -Match 'Format-Volume[^\r\n]*-NewFileSystemLabel \$DevDriveLabel'
+        # Either quote style would be a literal, and so would a bare word.
+        $content | Should -Not -Match 'Format-Volume[^\r\n]*-NewFileSystemLabel [^$\r\n]'
+    }
+
+    It 'asks for the name before it prints the plan for confirmation' {
+        # Nothing may be created before the plan is agreed, so the name has to be settled with the rest.
+        $content = Get-Content -Path $script:ScriptPath -Raw
+        $askedAt = $content.IndexOf('$DevDriveLabel = Request-DevDriveLabel')
+        $planAt = $content.IndexOf('* Name the Dev Drive $DevDriveLabel')
+        $formatAt = $content.IndexOf('Format-Volume -DriveLetter $devLetter')
+        $askedAt | Should -BeGreaterThan 0
+        $planAt | Should -BeGreaterThan $askedAt
+        $formatAt | Should -BeGreaterThan $planAt
+    }
+
+    It 'reads the name back off the volume instead of reporting the one it sent' {
+        $content = Get-Content -Path $script:ScriptPath -Raw
+        $formatAt = $content.IndexOf('Format-Volume -DriveLetter $devLetter')
+        $readAt = $content.IndexOf('$actualLabel = Get-VolumeLabel -DriveLetter $devLetter')
+        $reportAt = $content.IndexOf('Resolve-DevDriveLabelReport -DriveLetter $devLetter')
+        $readAt | Should -BeGreaterThan $formatAt
+        $reportAt | Should -BeGreaterThan $readAt
+    }
+
+    It 'keeps the name length cap in one place rather than beside every use of it' {
+        # A default written out as a literal drifts from the constant without anything noticing.
+        $content = Get-Content -Path $script:ScriptPath -Raw
+        ([regex]::Matches($content, '(?m)^\$DevDriveLabelMaxLength\s*=')).Count | Should -Be 1
+        ([regex]::Matches($content, '(?m)^\$DevDriveDefaultLabel\s*=')).Count | Should -Be 1
+        ([regex]::Matches($content, '\$MaxLength = \$script:DevDriveLabelMaxLength')).Count | Should -Be 2
+        ([regex]::Matches($content, '\$MaxLength = \d')).Count | Should -Be 0
+    }
+
     It 'never tells the user to just try again' {
         Select-String -Path $script:ScriptPath -Pattern 'try again' | Should -BeNullOrEmpty
     }
@@ -647,6 +683,239 @@ Describe 'Resolve-DevDriveSizeInput' {
             (Resolve-DevDriveSizeInput -Answer '10' -MinGB 50 -MaxGB 200 -MaxIsAdvisory).Rejection |
                 Should -Be 'BelowMinimum'
         }
+    }
+}
+
+Describe 'Resolve-DevDriveLabelInput' {
+    It 'keeps the offered name when the answer is <Description>' -TestCases @(
+        @{ Description = 'empty'; Answer = '' }
+        @{ Description = 'spaces'; Answer = '   ' }
+        @{ Description = 'a tab'; Answer = "`t" }
+    ) {
+        $verdict = Resolve-DevDriveLabelInput -Answer $Answer -Default 'DevDrive' -MaxLength 32
+        $verdict.Rejection | Should -BeNullOrEmpty
+        $verdict.Label | Should -Be 'DevDrive'
+    }
+
+    It 'takes a name the user typed' {
+        $verdict = Resolve-DevDriveLabelInput -Answer 'Projects' -Default 'DevDrive' -MaxLength 32
+        $verdict.Rejection | Should -BeNullOrEmpty
+        $verdict.Label | Should -Be 'Projects'
+    }
+
+    It 'trims the answer rather than storing the spaces around it' {
+        (Resolve-DevDriveLabelInput -Answer '  Work Drive  ' -Default 'DevDrive' -MaxLength 32).Label | Should -Be 'Work Drive'
+    }
+
+    It 'keeps the case the user typed' {
+        (Resolve-DevDriveLabelInput -Answer 'devDRIVE' -Default 'DevDrive' -MaxLength 32).Label | Should -Be 'devDRIVE'
+    }
+
+    It 'takes a name of exactly the maximum length' {
+        $name = 'a' * 32
+        $verdict = Resolve-DevDriveLabelInput -Answer $name -Default 'DevDrive' -MaxLength 32
+        $verdict.Rejection | Should -BeNullOrEmpty
+        $verdict.Label | Should -Be $name
+    }
+
+    It 'refuses one character past the maximum' {
+        # Caught here rather than by Format-Volume, which only runs once the partition exists.
+        $verdict = Resolve-DevDriveLabelInput -Answer ('a' * 33) -Default 'DevDrive' -MaxLength 32
+        $verdict.Rejection | Should -Be 'TooLong'
+        $verdict.Label | Should -BeNullOrEmpty
+    }
+
+    It 'measures the length after trimming, not before' {
+        $verdict = Resolve-DevDriveLabelInput -Answer ('  ' + ('a' * 32) + '  ') -Default 'DevDrive' -MaxLength 32
+        $verdict.Rejection | Should -BeNullOrEmpty
+    }
+
+    It 'refuses <Character>, which Windows does not allow in a name' -TestCases @(
+        @{ Character = '\' }
+        @{ Character = '/' }
+        @{ Character = ':' }
+        @{ Character = '*' }
+        @{ Character = '?' }
+        @{ Character = '"' }
+        @{ Character = '<' }
+        @{ Character = '>' }
+        @{ Character = '|' }
+    ) {
+        $verdict = Resolve-DevDriveLabelInput -Answer "Dev$($Character)Drive" -Default 'DevDrive' -MaxLength 32
+        $verdict.Rejection | Should -Be 'BadCharacter'
+        $verdict.RejectedCharacters | Should -Be $Character
+    }
+
+    It 'takes the forbidden list from Windows rather than from a list written here' {
+        # Every character the platform rejects in a file name is rejected here, including any that
+        # a hand-written list would have missed.
+        foreach ($character in [System.IO.Path]::GetInvalidFileNameChars()) {
+            (Resolve-DevDriveLabelInput -Answer "Dev$($character)Drive" -Default 'DevDrive' -MaxLength 32).Rejection |
+                Should -Be 'BadCharacter'
+        }
+    }
+
+    It 'names the characters it refused, once each' {
+        $verdict = Resolve-DevDriveLabelInput -Answer 'a<b>c<d' -Default 'DevDrive' -MaxLength 32
+        $verdict.RejectedCharacters | Should -Be '< >'
+        $verdict.ControlCharacter | Should -BeFalse
+    }
+
+    It 'leaves a control character for the prompt to name rather than printing it' {
+        # There is nothing to show on screen for one, and echoing it garbles the line.
+        $verdict = Resolve-DevDriveLabelInput -Answer "Dev`0Drive" -Default 'DevDrive' -MaxLength 32
+        $verdict.Rejection | Should -Be 'BadCharacter'
+        $verdict.RejectedCharacters | Should -BeNullOrEmpty
+        $verdict.ControlCharacter | Should -BeTrue
+    }
+
+    It 'reports both kinds at once when a name carries both' {
+        # Otherwise removing the visible ones earns a second refusal naming something new.
+        $verdict = Resolve-DevDriveLabelInput -Answer "Dev|`0Drive" -Default 'DevDrive' -MaxLength 32
+        $verdict.RejectedCharacters | Should -Be '|'
+        $verdict.ControlCharacter | Should -BeTrue
+    }
+
+    It 'allows the punctuation Windows does allow' {
+        foreach ($name in 'Dev Drive', 'Dev-Drive', 'Dev_Drive', 'Dev.Drive', 'Dev(1)', "Dev's Drive") {
+            (Resolve-DevDriveLabelInput -Answer $name -Default 'DevDrive' -MaxLength 32).Label | Should -Be $name
+        }
+    }
+}
+
+Describe 'Request-DevDriveLabel' {
+    BeforeAll {
+        Mock Write-Host { }
+    }
+
+    It 'takes the offered name on Enter' {
+        Mock Read-Host { '' }
+        Request-DevDriveLabel -Default 'DevDrive' -MaxLength 32 | Should -Be 'DevDrive'
+    }
+
+    It 'keeps asking until the answer is one the file system can take' {
+        $script:answers = @('Dev:Drive', ('a' * 40), "bad`0name", 'Projects')
+        $script:index = 0
+        Mock Read-Host { $script:answers[$script:index++] }
+        Request-DevDriveLabel -Default 'DevDrive' -MaxLength 32 | Should -Be 'Projects'
+        $script:index | Should -Be 4
+    }
+
+    It 'says which character it refused' {
+        $script:answers = @('Dev|Drive', 'Projects')
+        $script:index = 0
+        Mock Read-Host { $script:answers[$script:index++] }
+        Request-DevDriveLabel -Default 'DevDrive' -MaxLength 32 | Out-Null
+        Should -Invoke Write-Host -ParameterFilter { $Object -match 'these characters: \|' }
+    }
+
+    It 'names a control character instead of echoing it' {
+        $script:answers = @("Dev`0Drive", 'Projects')
+        $script:index = 0
+        Mock Read-Host { $script:answers[$script:index++] }
+        Request-DevDriveLabel -Default 'DevDrive' -MaxLength 32 | Out-Null
+        Should -Invoke Write-Host -ParameterFilter { $Object -match 'contains a control character' }
+    }
+
+    It 'names both kinds in one message when a name carries both' {
+        $script:answers = @("Dev|`0Drive", 'Projects')
+        $script:index = 0
+        Mock Read-Host { $script:answers[$script:index++] }
+        Request-DevDriveLabel -Default 'DevDrive' -MaxLength 32 | Out-Null
+        Should -Invoke Write-Host -ParameterFilter {
+            $Object -match 'these characters: \|, and a control character'
+        }
+    }
+
+    It 'says what the name is for before it asks for one' {
+        Mock Read-Host { '' }
+        Request-DevDriveLabel -Default 'DevDrive' -MaxLength 32 | Out-Null
+        Should -Invoke Write-Host -ParameterFilter { $Object -match 'what File Explorer shows beside its letter' }
+    }
+
+    It 'gives the real limit when the name is too long' {
+        $script:answers = @(('a' * 40), 'Projects')
+        $script:index = 0
+        Mock Read-Host { $script:answers[$script:index++] }
+        Request-DevDriveLabel -Default 'DevDrive' -MaxLength 32 | Out-Null
+        Should -Invoke Write-Host -ParameterFilter { $Object -match 'at most 32 characters' }
+    }
+
+    It 'offers the name on the Enter key in the prompt itself' {
+        Mock Read-Host { param($Prompt) $script:asked = $Prompt; return '' }
+        Request-DevDriveLabel -Default 'MyDrive' -MaxLength 32 | Out-Null
+        $script:asked | Should -Match 'press Enter for MyDrive'
+    }
+}
+
+Describe 'Get-VolumeLabel' {
+    It 'reports the name the volume answers with' {
+        Mock Get-Volume { [PSCustomObject]@{ FileSystemLabel = 'Projects' } }
+        Get-VolumeLabel -DriveLetter 'X' | Should -Be 'Projects'
+    }
+
+    It 'answers nothing rather than throwing when the volume cannot be found' {
+        # Reading a property off an empty result throws under strict mode, which would abort the run
+        # right after the drive was created - over a name.
+        Mock Get-Volume { }
+        { Get-VolumeLabel -DriveLetter 'X' } | Should -Not -Throw
+        Get-VolumeLabel -DriveLetter 'X' | Should -BeNullOrEmpty
+    }
+
+    It 'answers nothing when the query itself fails' {
+        Mock Get-Volume { throw 'The volume could not be read.' }
+        Get-VolumeLabel -DriveLetter 'X' | Should -BeNullOrEmpty
+    }
+
+    It 'answers nothing when more than one volume comes back' {
+        Mock Get-Volume { @([PSCustomObject]@{ FileSystemLabel = 'A' }, [PSCustomObject]@{ FileSystemLabel = 'B' }) }
+        Get-VolumeLabel -DriveLetter 'X' | Should -BeNullOrEmpty
+    }
+
+    It 'passes an empty name through as empty rather than as no answer' {
+        Mock Get-Volume { [PSCustomObject]@{ FileSystemLabel = '' } }
+        Get-VolumeLabel -DriveLetter 'X' | Should -Be ''
+    }
+}
+
+Describe 'Resolve-DevDriveLabelReport' {
+    It 'confirms the name from the volume, not from the call that set it' {
+        $report = Resolve-DevDriveLabelReport -DriveLetter 'X' -Requested 'Projects' -Actual 'Projects'
+        $report.Matches | Should -BeTrue
+        @($report.Lines).Count | Should -Be 1
+        $report.Lines[0] | Should -Be 'Dev Drive created at X:, named Projects.'
+    }
+
+    It 'names what the volume said when it is not what was asked for' {
+        $report = Resolve-DevDriveLabelReport -DriveLetter 'X' -Requested 'Projects' -Actual 'PROJECTS'
+        $report.Matches | Should -BeFalse
+        ($report.Lines -join "`n") | Should -Match 'reports itself as PROJECTS rather than Projects'
+        ($report.Lines -join "`n") | Should -Match "Set-Volume -DriveLetter X -NewFileSystemLabel 'Projects'"
+    }
+
+    It 'says a volume with no name has none rather than inventing one' {
+        $report = Resolve-DevDriveLabelReport -DriveLetter 'X' -Requested 'Projects' -Actual ''
+        $report.Matches | Should -BeFalse
+        ($report.Lines -join "`n") | Should -Match 'reports no name at all'
+    }
+
+    It 'says a volume that could not be read was not read, rather than that it has no name' {
+        # Two different facts. Claiming the second is asserting a reading that never happened.
+        $report = Resolve-DevDriveLabelReport -DriveLetter 'X' -Requested 'Projects' -Actual $null
+        $report.Matches | Should -BeFalse
+        ($report.Lines -join "`n") | Should -Match 'could not be read back'
+        ($report.Lines -join "`n") | Should -Not -Match 'no name at all'
+    }
+
+    It 'offers the rename command only where there is a name to correct' {
+        # Nothing is known to be wrong on a volume that did not answer, so nothing is prescribed.
+        ((Resolve-DevDriveLabelReport -DriveLetter 'X' -Requested 'Projects' -Actual $null).Lines -join "`n") |
+            Should -Not -Match 'Set-Volume'
+    }
+
+    It 'does not confuse two names that differ only in case' {
+        (Resolve-DevDriveLabelReport -DriveLetter 'X' -Requested 'devdrive' -Actual 'DevDrive').Matches |
+            Should -BeFalse
     }
 }
 

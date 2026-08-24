@@ -40,10 +40,11 @@ This script runs in interactive mode and will guide you through the entire Dev D
 1. **Creation Method**: Free space on a disk, shrinking an existing drive, or a `.vhdx` file
 2. **Drive Selection**: Shows all physical drives with size and free space information
 3. **Size Configuration**: Enter Dev Drive size (minimum 50 GB; in free-space mode press Enter for the maximum)
-4. **BitLocker Setup**: Optional encryption, with the recovery key shown and acknowledged
-5. **Deduplication Options**: Deduplicate only, deduplicate and compress, compress only, or neither
-6. **Compression Configuration**: Take LZ4 or ZSTD at the level Windows picks, or set the format and level yourself
-7. **Deduplication Schedule**: Keep the suggested times, or set them yourself
+4. **Name**: The name the volume carries, or Enter for `DevDrive`
+5. **BitLocker Setup**: Optional encryption, with the recovery key shown and acknowledged
+6. **Deduplication Options**: Deduplicate only, deduplicate and compress, compress only, or neither
+7. **Compression Configuration**: Take LZ4 or ZSTD at the level Windows picks, or set the format and level yourself
+8. **Deduplication Schedule**: Keep the suggested times, or set them yourself
 
 In virtual hard disk mode, step 2 is skipped; instead you are asked for the file path, the disk type, the size and whether to mount the file automatically on startup. There is no press-Enter-for-maximum there, and the size has a 50 GB floor. See [Virtual hard disk mode](#virtual-hard-disk-mode).
 
@@ -101,7 +102,10 @@ Shrinkable size information:
 Note: Windows allows shrinking by the size of starting from the end of the drive disk space to the nearest written file block. Disk Fragmentation can affect this. If Windows does not allow for a drive to be shrunk, please use third-party tools (e.g. AOMEI).                                                                      
                                                                                                              
 Enter Shrink amount in GB (min: 50, max: 816.36): 199                                                
-                                                                                                             
+
+The Dev Drive carries a name, which is what File Explorer shows beside its letter.
+Enter a name for the Dev Drive, or press Enter for DevDrive: Projects
+
 Do you want to enable BitLocker encryption for the Dev Drive?                                                
 BitLocker provides security but may impact performance.
 1. Yes, enable BitLocker encryption
@@ -146,6 +150,7 @@ Selected deduplication and ZSTD compression, level 2
 
 * Shrink Drive D (ALERT) by 199 GB to free up space
 * Create 199 GB Dev Drive on Disk 1 (CT4000P3PSSD8) using ReFS
+* Name the Dev Drive Projects
 * Skip BitLocker encryption
 * Enable ReFS deduplication and ZSTD compression, level 2
 * Daily optimization : Monday-Friday at 11:00 and 17:00
@@ -169,7 +174,7 @@ Shrunk drive D by 199 GB
 Creating a new partition from the freed space on disk 1
 Formatting the newly created partition drive E: to a Dev Drive
 
-Dev Drive created at E:
+Dev Drive created at E:, named Projects.
 Marking Dev Drive E: as trusted for Defender performance
 Dev Drive E: reports itself trusted, which is the signal for Microsoft Defender to run in performance mode.
 Skipping BitLocker encryption as requested.
@@ -201,7 +206,7 @@ Triggered the initial job: deduplication and ZSTD compression, level 2
 All done. Dev Drive E: ready.
 DriveLetter FriendlyName FileSystemType DriveType HealthStatus OperationalStatus SizeRemaining   Size
 ----------- ------------ -------------- --------- ------------ ----------------- -------------   ----
-E           DevDrive     ReFS           Fixed     Healthy      OK                    196.25 GB 199 GB
+E           Projects     ReFS           Fixed     Healthy      OK                    196.25 GB 199 GB
 
 ```
 
@@ -225,7 +230,14 @@ E           DevDrive     ReFS           Fixed     Healthy      OK               
    - Press Enter to use the maximum, in free-space mode only
    - Validates input against actual Windows constraints, including the 50 GB Dev Drive minimum
 
-4. **Security Configuration**
+4. **Name**
+   - Asks what the volume should be called, with `DevDrive` on the Enter key, so two Dev Drives need not share a name
+   - Asked before anything is created, and repeated in the plan, so the name is confirmed with everything else
+   - Refuses a name longer than 32 characters, and one carrying a character Windows rejects in a file name. Both are caught at the prompt, not by `Format-Volume` once the partition exists
+   - Neither rule is quoted from Microsoft, because neither is documented: `Format-Volume -NewFileSystemLabel` states no length, and no character list for a volume label could be found. The 32 is this script's own cap at the long-standing NTFS label length, and the character list stands in for one it cannot get
+   - So the name is read back off the volume after formatting and reported. A volume that came out named something else is named, with the command to rename it; one that could not be read is said to be unconfirmed rather than reported as having no name
+
+5. **Security Configuration**
    - Optional BitLocker encryption, enabled together with its recovery key in one step
    - The recovery key is printed and has to be acknowledged before the run continues
    - A password is asked for in virtual hard disk mode only, and asked for again if BitLocker rejects it
@@ -237,7 +249,7 @@ E           DevDrive     ReFS           Fixed     Healthy      OK               
    - What the machine can actually do is checked before the plan is shown, and listed in it
    - A BitLocker failure offers a choice: retry, carry on without it, or stop - except a refusal by group policy, which is not offered a retry that would meet the same refusal
 
-5. **Storage Optimization Setup**
+6. **Storage Optimization Setup**
    - Choose what happens to the data: deduplicate only, deduplicate and compress, compress only, or neither
    - Choose compression in one answer: LZ4 at Windows' own level, ZSTD at Windows' own level, or set both yourself
    - Setting them yourself asks for the format (LZ4 for speed, ZSTD for a better ratio) and then the level, where Enter still leaves it to Windows: LZ4 takes 1, or 3 to 12 where 3 and above use LZ4HC; ZSTD takes 1 to 22. The defaults are Microsoft's own and documented as subject to change, so an empty answer passes no level at all
@@ -249,7 +261,7 @@ E           DevDrive     ReFS           Fixed     Healthy      OK               
    - After the jobs are created the script says where to change the times later, in Task Scheduler under Microsoft > Windows > ReFsDedupSvc
    - The daily jobs are automatically scheduled to run only on AC power
 
-6. **Dev Drive Creation & Setup**
+7. **Dev Drive Creation & Setup**
    - Creates ReFS-formatted Dev Drive with selected size
    - Applies all chosen security and optimization settings
    - Marks drive as trusted for Windows Defender performance
