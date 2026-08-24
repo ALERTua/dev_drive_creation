@@ -1000,7 +1000,7 @@ function Resolve-DedupReadBackVerdict {
     }
 
     $reportedLevel = if ($Actual.Level -eq 0) { $null } else { $Actual.Level }
-    $compresses = $ExpectedMode -ne 'Dedup'
+    $compresses = (Resolve-DedupModeCapability -Mode $ExpectedMode).UsesCompression
 
     $differences = @()
     if ($Actual.Mode -ne $ExpectedMode) {
@@ -1159,22 +1159,50 @@ function Format-DedupTimeList {
     return (($Times[0..($Times.Count - 2)] -join ', ') + ' and ' + $Times[-1])
 }
 
+function Resolve-DedupModeCapability {
+    <# What a mode's jobs take: a compression-only volume refuses the block deduplication
+       parameters, and has no scrub schedule at all. #>
+    param([Parameter(Mandatory)][ValidateSet('Dedup', 'DedupAndCompress', 'Compress')][string]$Mode)
+
+    return [PSCustomObject]@{
+        UsesCompression = $Mode -ne 'Dedup'
+        UsesBlockDedup  = $Mode -ne 'Compress'
+    }
+}
+
+function Format-DedupDailyJobNote {
+    <# What holds the daily job back. Compression alone takes neither: the CPU share is refused,
+       the duration accepted and dropped. #>
+    param(
+        [Parameter(Mandatory)][int]$DurationHours,
+        [Parameter(Mandatory)][int]$CpuPercent,
+        [switch]$BlockDedup
+    )
+
+    if ($BlockDedup) {
+        return "The daily job runs on mains power only, for up to $DurationHours hours, using at most $CpuPercent% of the CPU."
+    }
+    return "The daily job runs on mains power only. Windows takes no time limit and no CPU share for compression."
+}
+
 function Format-DedupScheduleSummary {
-    <# The two lines saying when the deduplication jobs run, shown while choosing and in the plan. #>
+    <# The lines saying when the jobs run, shown while choosing and in the plan; a volume that only
+       compresses gets no weekly line. #>
     param(
         [Parameter(Mandatory)][string[]]$DailyTimes,
         [Parameter(Mandatory)][string]$DailyDaysLabel,
-        [Parameter(Mandatory)][string]$WeeklyDay,
-        [Parameter(Mandatory)][string]$WeeklyStart,
-        [Parameter(Mandatory)][int]$WeeksInterval
+        [string]$WeeklyDay,
+        [string]$WeeklyStart,
+        [int]$WeeksInterval = 1,
+        [switch]$WeeklyJob
     )
 
-    $weeks = if ($WeeksInterval -eq 1) { "every 1 week" } else { "every $WeeksInterval weeks" }
-
-    return @(
-        "  Daily optimization : $DailyDaysLabel at $(Format-DedupTimeList -Times $DailyTimes)"
-        "  Weekly maintenance : $WeeklyDay at $WeeklyStart, $weeks"
-    )
+    $lines = @("  Daily optimization : $DailyDaysLabel at $(Format-DedupTimeList -Times $DailyTimes)")
+    if ($WeeklyJob) {
+        $weeks = if ($WeeksInterval -eq 1) { "every 1 week" } else { "every $WeeksInterval weeks" }
+        $lines += "  Weekly maintenance : $WeeklyDay at $WeeklyStart, $weeks"
+    }
+    return $lines
 }
 
 function Resolve-DedupScheduleReminder {
@@ -1184,16 +1212,20 @@ function Resolve-DedupScheduleReminder {
     #>
     param(
         [Parameter(Mandatory)][string[]]$DailyTimes,
-        [Parameter(Mandatory)][string]$WeeklyDay,
-        [Parameter(Mandatory)][string]$WeeklyStart,
-        [Parameter(Mandatory)][string]$TaskTreePath
+        [string]$WeeklyDay,
+        [string]$WeeklyStart,
+        [Parameter(Mandatory)][string]$TaskTreePath,
+        [switch]$WeeklyJob
     )
+
+    $chosen = "Times just chosen: $(Format-DedupTimeList -Times $DailyTimes) daily"
+    $chosen += if ($WeeklyJob) { ", $WeeklyDay at $WeeklyStart weekly." } else { "." }
 
     return @(
         "The ReFS optimization runs on a schedule kept in Task Scheduler, under:"
         "  $TaskTreePath"
         ""
-        "Times just chosen: $(Format-DedupTimeList -Times $DailyTimes) daily, $WeeklyDay at $WeeklyStart weekly."
+        $chosen
         ""
         "To change the times later, press Win+R, type taskschd.msc and press Ctrl+Shift+Enter to open"
         "it as administrator, then open that folder and find the tasks whose Triggers column matches"
@@ -1206,17 +1238,18 @@ function Resolve-DedupScheduleReminder {
 
 function Request-DedupSchedule {
     <#
-        The one question about when the deduplication jobs run, with three follow-ups for a user who
-        wants to pick the times. Returns the daily start times, the weekly day and its start time.
+        The one question about when the jobs run, with follow-ups for a user who wants to pick the
+        times. The weekly ones are asked only where a weekly job exists to run at them.
     #>
     param(
         [Parameter(Mandatory)][string[]]$DailyTimes,
         [Parameter(Mandatory)][string]$DailyDaysLabel,
-        [Parameter(Mandatory)][string]$WeeklyDay,
-        [Parameter(Mandatory)][string]$WeeklyStart,
-        [Parameter(Mandatory)][int]$WeeksInterval,
+        [string]$WeeklyDay,
+        [string]$WeeklyStart,
+        [int]$WeeksInterval = 1,
         [Parameter(Mandatory)][int]$DailyDurationHours,
-        [Parameter(Mandatory)][int]$DailyCpuPercent
+        [Parameter(Mandatory)][int]$DailyCpuPercent,
+        [switch]$BlockDedup
     )
 
     $chosenTimes = $DailyTimes
@@ -1226,11 +1259,11 @@ function Request-DedupSchedule {
     Write-Host "`n=== OPTIMIZATION SCHEDULE ===" -ForegroundColor Cyan
     Write-Host ""
     foreach ($line in (Format-DedupScheduleSummary -DailyTimes $chosenTimes -DailyDaysLabel $DailyDaysLabel `
-                -WeeklyDay $chosenDay -WeeklyStart $chosenStart -WeeksInterval $WeeksInterval)) {
+                -WeeklyDay $chosenDay -WeeklyStart $chosenStart -WeeksInterval $WeeksInterval -WeeklyJob:$BlockDedup)) {
         Write-Host $line -ForegroundColor White
     }
     Write-Host ""
-    Write-Host "The daily job runs on mains power only, for up to $DailyDurationHours hours, using at most $DailyCpuPercent% of the CPU." -ForegroundColor White
+    Write-Host (Format-DedupDailyJobNote -DurationHours $DailyDurationHours -CpuPercent $DailyCpuPercent -BlockDedup:$BlockDedup) -ForegroundColor White
     Write-Host "1. Use these times (recommended)" -ForegroundColor White
     Write-Host "2. Choose the times myself" -ForegroundColor White
     Write-Host ""
@@ -1271,37 +1304,39 @@ function Request-DedupSchedule {
             break
         }
 
-        while ($true) {
-            Write-Host "`nDay for the weekly maintenance." -ForegroundColor Cyan
-            $answer = Read-Host "Press Enter to keep $chosenDay"
-            $verdict = Resolve-DedupDayInput -Answer $answer -CurrentDay $chosenDay -AllowEmpty
+        if ($BlockDedup) {
+            while ($true) {
+                Write-Host "`nDay for the weekly maintenance." -ForegroundColor Cyan
+                $answer = Read-Host "Press Enter to keep $chosenDay"
+                $verdict = Resolve-DedupDayInput -Answer $answer -CurrentDay $chosenDay -AllowEmpty
 
-            if ($verdict.Rejection) {
-                Write-Host "Invalid day. Enter one day name, for example Monday." -ForegroundColor Red
-                continue
+                if ($verdict.Rejection) {
+                    Write-Host "Invalid day. Enter one day name, for example Monday." -ForegroundColor Red
+                    continue
+                }
+
+                $chosenDay = $verdict.Day
+                break
             }
 
-            $chosenDay = $verdict.Day
-            break
-        }
+            while ($true) {
+                Write-Host "`nStart time for the weekly maintenance, 24-hour HH:MM." -ForegroundColor Cyan
+                $answer = Read-Host "Press Enter to keep $chosenStart"
+                $verdict = Resolve-DedupTimeInput -Answer $answer -CurrentTime $chosenStart -AllowEmpty
 
-        while ($true) {
-            Write-Host "`nStart time for the weekly maintenance, 24-hour HH:MM." -ForegroundColor Cyan
-            $answer = Read-Host "Press Enter to keep $chosenStart"
-            $verdict = Resolve-DedupTimeInput -Answer $answer -CurrentTime $chosenStart -AllowEmpty
+                if ($verdict.Rejection) {
+                    Write-Host "Invalid time. Enter it as HH:MM on a 24-hour clock, for example 08:15." -ForegroundColor Red
+                    continue
+                }
 
-            if ($verdict.Rejection) {
-                Write-Host "Invalid time. Enter it as HH:MM on a 24-hour clock, for example 08:15." -ForegroundColor Red
-                continue
+                $chosenStart = $verdict.Time
+                break
             }
-
-            $chosenStart = $verdict.Time
-            break
         }
 
         Write-Host ""
         foreach ($line in (Format-DedupScheduleSummary -DailyTimes $chosenTimes -DailyDaysLabel $DailyDaysLabel `
-                    -WeeklyDay $chosenDay -WeeklyStart $chosenStart -WeeksInterval $WeeksInterval)) {
+                    -WeeklyDay $chosenDay -WeeklyStart $chosenStart -WeeksInterval $WeeksInterval -WeeklyJob:$BlockDedup)) {
             Write-Host $line -ForegroundColor Green
         }
     }
@@ -2026,7 +2061,9 @@ if ($dedupChoice -eq "None") {
     $SkipDeduplication = $true
 } else {
     $DedupMode = $dedupChoice
-    if ($DedupMode -ne 'Dedup') {
+    # Set from the answer, never from the default above it: a mode nobody chose describes nothing.
+    $DedupCapability = Resolve-DedupModeCapability -Mode $DedupMode
+    if ($DedupCapability.UsesCompression) {
         $compression = Request-Compression
         $CompressionFormat = $compression.Format
         $CompressionLevel = $compression.Level
@@ -2038,7 +2075,8 @@ if ($dedupChoice -eq "None") {
 if (-not $SkipDeduplication) {
     $dedupSchedule = Request-DedupSchedule -DailyTimes $DedupStartTimes -DailyDaysLabel $DedupDailyDaysLabel `
         -WeeklyDay $ScrubDays -WeeklyStart $ScrubStart -WeeksInterval $ScrubWeeksInterval `
-        -DailyDurationHours $DedupDailyDurationHours -DailyCpuPercent $DedupDailyCpuPercent
+        -DailyDurationHours $DedupDailyDurationHours -DailyCpuPercent $DedupDailyCpuPercent `
+        -BlockDedup:$DedupCapability.UsesBlockDedup
     $DedupStartTimes = $dedupSchedule.DailyTimes
     $ScrubDays = $dedupSchedule.WeeklyDay
     $ScrubStart = $dedupSchedule.WeeklyStart
@@ -2082,7 +2120,8 @@ if (-not $SkipBitLocker) {
 if (-not $SkipDeduplication) {
     Write-Host "* Enable ReFS $(Format-DedupModeChoice -Mode $DedupMode -Format $CompressionFormat -Level $CompressionLevel)" -ForegroundColor White
     foreach ($line in (Format-DedupScheduleSummary -DailyTimes $DedupStartTimes -DailyDaysLabel $DedupDailyDaysLabel `
-                -WeeklyDay $ScrubDays -WeeklyStart $ScrubStart -WeeksInterval $ScrubWeeksInterval)) {
+                -WeeklyDay $ScrubDays -WeeklyStart $ScrubStart -WeeksInterval $ScrubWeeksInterval `
+                -WeeklyJob:$DedupCapability.UsesBlockDedup)) {
         Write-Host "* $($line.Trim())" -ForegroundColor White
     }
 } else {
@@ -2440,23 +2479,28 @@ try {
         $baseScheduleParams = @{
             Volume            = "$devLetterColon"
             Days              = $DedupDailyDays
-            Duration          = New-TimeSpan -Hours $DedupDailyDurationHours
-            CpuPercentage     = $DedupDailyCpuPercent
+        }
+
+        # A compression-only volume refuses the CPU share, and takes the duration only to drop it.
+        if ($DedupCapability.UsesBlockDedup) {
+            $baseScheduleParams.Duration = New-TimeSpan -Hours $DedupDailyDurationHours
+            $baseScheduleParams.CpuPercentage = $DedupDailyCpuPercent
         }
 
         # Compression parameters only outside Dedup-only mode; an unchosen level is left out so Windows uses its own.
-        if ($DedupMode -ne 'Dedup') {
+        if ($DedupCapability.UsesCompression) {
             $baseScheduleParams.CompressionFormat = $CompressionFormat
             if ($null -ne $CompressionLevel) {
                 $baseScheduleParams.CompressionLevel = [uint16]$CompressionLevel
             }
         }
 
+        $dailyLimit = if ($DedupCapability.UsesBlockDedup) { " (${DedupDailyDurationHours}h)" } else { "" }
         foreach ($time in $DedupStartTimes) {
             $scheduleParams = $baseScheduleParams.Clone()
             $scheduleParams.Start = $time
 
-            Write-Host "Scheduling the daily job at $time (${DedupDailyDurationHours}h)" -ForegroundColor Green
+            Write-Host "Scheduling the daily job at $time$dailyLimit" -ForegroundColor Green
             Set-ReFSDedupSchedule @scheduleParams -ErrorAction Stop
         }
 
@@ -2471,11 +2515,16 @@ try {
             Write-Host $line -ForegroundColor $verdictColour
         }
 
-        Write-Host "Scheduling deduplication scrub jobs" -ForegroundColor Green
-        Set-ReFSDedupScrubSchedule -Volume "$devLetterColon" -Days $ScrubDays -Start $ScrubStart -WeeksInterval $ScrubWeeksInterval -ErrorAction Stop
-        Write-Host "Scheduled weekly scrub job on $ScrubDays at $ScrubStart" -ForegroundColor Green
+        # Windows refuses a scrub schedule outright where nothing is deduplicated to be scrubbed.
+        if ($DedupCapability.UsesBlockDedup) {
+            Write-Host "Scheduling deduplication scrub jobs" -ForegroundColor Green
+            Set-ReFSDedupScrubSchedule -Volume "$devLetterColon" -Days $ScrubDays -Start $ScrubStart -WeeksInterval $ScrubWeeksInterval -ErrorAction Stop
+            Write-Host "Scheduled weekly scrub job on $ScrubDays at $ScrubStart" -ForegroundColor Green
+        } else {
+            Write-Host "No weekly scrub job: Windows has none for a volume that only compresses." -ForegroundColor Yellow
+        }
 
-        # Runs after every job this pass schedules, so the weekly task exists when this walks the folder.
+        # Runs after every job this pass scheduled, whichever of them there were, so it sees them all.
         Write-Host "Configuring the ReFS optimization tasks to run only on AC power..." -ForegroundColor Green
         try {
             # Find all ReFS deduplication tasks
@@ -2513,7 +2562,8 @@ try {
 
         Write-Host ""
         foreach ($line in (Resolve-DedupScheduleReminder -DailyTimes $DedupStartTimes `
-                    -WeeklyDay $ScrubDays -WeeklyStart $ScrubStart -TaskTreePath $DedupTaskTreePath)) {
+                    -WeeklyDay $ScrubDays -WeeklyStart $ScrubStart -TaskTreePath $DedupTaskTreePath `
+                    -WeeklyJob:$DedupCapability.UsesBlockDedup)) {
             Write-Host $line -ForegroundColor Cyan
         }
         Write-Host ""
@@ -2522,11 +2572,15 @@ try {
             $jobParams = @{
                 Volume            = "$devLetterColon"
                 Duration          = (New-TimeSpan -Hours 5)
-                CpuPercentage     = 60
+            }
+
+            # The same refusal as the schedule. Duration stays: this call takes it, the schedule drops it.
+            if ($DedupCapability.UsesBlockDedup) {
+                $jobParams.CpuPercentage = 60
             }
 
             # Add compression parameters only if not Dedup-only mode
-            if ($DedupMode -ne 'Dedup') {
+            if ($DedupCapability.UsesCompression) {
                 $jobParams.CompressionFormat = $CompressionFormat
                 if ($null -ne $CompressionLevel) {
                     $jobParams.CompressionLevel = [uint16]$CompressionLevel
@@ -2537,7 +2591,7 @@ try {
 
             # -FullRun only where it has always been passed; the cmdlet has one parameter set, so it
             # is not excluded by the compression parameters, and this split is older than the repository.
-            if ($DedupMode -eq 'Dedup') {
+            if (-not $DedupCapability.UsesCompression) {
                 $jobParams.FullRun = $true
             }
             Start-ReFSDedupJob @jobParams -ErrorAction Stop | Out-Null

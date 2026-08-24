@@ -241,9 +241,10 @@ E           DevDrive     ReFS           Fixed     Healthy      OK               
    - Choose what happens to the data: deduplicate only, deduplicate and compress, compress only, or neither
    - Choose compression in one answer: LZ4 at Windows' own level, ZSTD at Windows' own level, or set both yourself
    - Setting them yourself asks for the format (LZ4 for speed, ZSTD for a better ratio) and then the level, where Enter still leaves it to Windows: LZ4 takes 1, or 3 to 12 where 3 and above use LZ4HC; ZSTD takes 1 to 22. The defaults are Microsoft's own and documented as subject to change, so an empty answer passes no level at all
-   - Keep the suggested schedule, or set three fields yourself: the daily start times (comma separated, 24-hour HH:MM, up to four), the weekly maintenance day, and its start time
-   - Each of the three takes Enter to keep the value shown; choosing your own times gets the result repeated back, taking the defaults does not
-   - The daily job's days, its two-hour limit, its 60% CPU share and its AC-power condition are fixed and are not asked about
+   - Keep the suggested schedule, or set the fields yourself: the daily start times (comma separated, 24-hour HH:MM, up to four), and - where there is a weekly job - the weekly maintenance day and its start time
+   - Each field takes Enter to keep the value shown; choosing your own times gets the result repeated back, taking the defaults does not
+   - The daily job's days, its AC-power condition and, where they apply, its two-hour limit and 60% CPU share are fixed and are not asked about
+   - **Compress only takes none of that**: Windows creates no weekly maintenance job for such a volume, refuses a CPU share for its daily job, and accepts a duration only to drop it. So the run asks for the daily times alone, promises neither limit, and says during creation that no weekly job is being made. The AC-power condition still applies
    - After the jobs are created the script asks the volume what it actually stored and prints that, rather than reporting success because no command failed. A setting that came back different is named, and the run carries on: the Dev Drive exists and works either way
    - After the jobs are created the script says where to change the times later, in Task Scheduler under Microsoft > Windows > ReFsDedupSvc
    - The daily jobs are automatically scheduled to run only on AC power
@@ -331,6 +332,8 @@ By default the script creates two daily deduplication jobs and one weekly mainte
 - Monday at 5:30 PM weekly (maintenance pass, every week)
 
 The daily start times, the weekly maintenance day and its start time are asked for during the run, so there is no need to edit the script to move them. Everything else about the jobs is fixed.
+
+In compress-only mode there is no weekly maintenance job and no duration or CPU limit on the daily one: Windows refuses those settings on a volume that only compresses, and accepts a duration only to drop it. The run creates the daily jobs on AC power and says the weekly one is being skipped.
 
 ## Development
 
