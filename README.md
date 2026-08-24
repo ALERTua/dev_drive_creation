@@ -42,7 +42,7 @@ This script runs in interactive mode and will guide you through the entire Dev D
 3. **Size Configuration**: Enter Dev Drive size (minimum 50 GB; in free-space mode press Enter for the maximum)
 4. **BitLocker Setup**: Optional encryption, with the recovery key shown and acknowledged
 5. **Deduplication Options**: Deduplicate only, deduplicate and compress, compress only, or neither
-6. **Compression Configuration**: Select format (LZ4/ZSTD) and level (LZ4: 1 or 3-12; ZSTD: 1-22; Enter leaves it to Windows)
+6. **Compression Configuration**: Take LZ4 or ZSTD at the level Windows picks, or set the format and level yourself
 7. **Deduplication Schedule**: Keep the suggested times, or set them yourself
 
 In virtual hard disk mode, step 2 is skipped; instead you are asked for the file path, the disk type, the size and whether to mount the file automatically on startup. There is no press-Enter-for-maximum there, and the size has a 50 GB floor. See [Virtual hard disk mode](#virtual-hard-disk-mode).
@@ -117,6 +117,13 @@ Deduplication finds and removes duplicate data. Compression makes what is left s
 4. Neither (maximum performance, less space saved)
 
 Enter your choice (1, 2, 3 or 4): 2
+
+Choose compression:                                                                                          
+1. Fast - LZ4, at the level Windows picks
+2. Balanced - ZSTD, at the level Windows picks
+3. Pick the format and level yourself
+
+Enter your choice (1, 2 or 3): 3
 
 Choose compression format:                                                                                   
 1. LZ4: Fast compression with good balance of speed and compression ratio
@@ -216,8 +223,8 @@ E           DevDrive     ReFS           Fixed     Healthy      OK               
 
 5. **Storage Optimization Setup**
    - Choose what happens to the data: deduplicate only, deduplicate and compress, compress only, or neither
-   - Select compression format (LZ4 for speed, ZSTD for better compression)
-   - Configure the compression level, or press Enter to leave it to Windows: LZ4 takes 1, or 3 to 12 where 3 and above use LZ4HC; ZSTD takes 1 to 22. The defaults are Microsoft's own and documented as subject to change, so an empty answer passes no level at all
+   - Choose compression in one answer: LZ4 at Windows' own level, ZSTD at Windows' own level, or set both yourself
+   - Setting them yourself asks for the format (LZ4 for speed, ZSTD for a better ratio) and then the level, where Enter still leaves it to Windows: LZ4 takes 1, or 3 to 12 where 3 and above use LZ4HC; ZSTD takes 1 to 22. The defaults are Microsoft's own and documented as subject to change, so an empty answer passes no level at all
    - Keep the suggested schedule, or set three fields yourself: the daily start times (comma separated, 24-hour HH:MM, up to four), the weekly maintenance day, and its start time
    - Each of the three takes Enter to keep the value shown; choosing your own times gets the result repeated back, taking the defaults does not
    - The daily job's days, its two-hour limit, its 60% CPU share and its AC-power condition are fixed and are not asked about

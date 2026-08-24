@@ -752,6 +752,28 @@ function Request-CompressionFormat {
     }
 }
 
+function Request-Compression {
+    <# The format and the level together, so a chosen format is never left waiting for a level. #>
+    Write-Host "`nChoose compression:" -ForegroundColor Cyan
+    Write-Host "1. Fast - LZ4, at the level Windows picks" -ForegroundColor White
+    Write-Host "2. Balanced - ZSTD, at the level Windows picks" -ForegroundColor White
+    Write-Host "3. Pick the format and level yourself" -ForegroundColor White
+    Write-Host ""
+
+    $shortcuts = @{ '1' = 'LZ4'; '2' = 'ZSTD' }
+    while ($true) {
+        $choice = Read-Host "Enter your choice (1, 2 or 3)"
+        if ($shortcuts.ContainsKey([string]$choice)) {
+            return [PSCustomObject]@{ Format = $shortcuts[[string]$choice]; Level = $null }
+        }
+        if ([string]$choice -eq '3') {
+            $format = Request-CompressionFormat
+            return [PSCustomObject]@{ Format = $format; Level = Request-CompressionLevel -Format $format }
+        }
+        Write-Host "Invalid choice. Please enter 1, 2 or 3." -ForegroundColor Red
+    }
+}
+
 function Get-CompressionLevelRange {
     <# The levels each format takes, per the refsutil compression reference. LZ4 skips 2. #>
     param([Parameter(Mandatory)][ValidateSet('LZ4', 'ZSTD')][string]$Format)
@@ -1840,9 +1862,9 @@ if ($dedupChoice -eq "None") {
 } else {
     $DedupMode = $dedupChoice
     if ($DedupMode -ne 'Dedup') {
-        $CompressionFormat = Request-CompressionFormat
-        # Both formats have levels, and both accept being left to Windows.
-        $CompressionLevel = Request-CompressionLevel -Format $CompressionFormat
+        $compression = Request-Compression
+        $CompressionFormat = $compression.Format
+        $CompressionLevel = $compression.Level
     }
     Write-Host "Selected $(Format-DedupModeChoice -Mode $DedupMode -Format $CompressionFormat -Level $CompressionLevel)" -ForegroundColor Green
 }

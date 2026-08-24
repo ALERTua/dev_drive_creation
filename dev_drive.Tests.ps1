@@ -182,10 +182,10 @@ Describe 'The script itself' {
             Should -Be 1
     }
 
-    It 'asks for the level whatever the format, not only for ZSTD' {
+    It 'takes the format and the level from one answer, so neither is set without the other' {
         $content = Get-Content -Path $script:ScriptPath -Raw
-        ([regex]::Matches($content, '\$CompressionLevel = Request-CompressionLevel -Format \$CompressionFormat')).Count |
-            Should -Be 1
+        $content | Should -Match '(?ms)\$compression = Request-Compression\s*\r?\n\s*\$CompressionFormat = \$compression\.Format\s*\r?\n\s*\$CompressionLevel = \$compression\.Level'
+        $content | Should -Not -Match '\$CompressionFormat = Request-CompressionFormat'
         $content | Should -Not -Match "if \(\`$CompressionFormat -eq 'ZSTD'\) \{\s*\r?\n\s*\`$CompressionLevel = Request"
     }
 
@@ -1570,6 +1570,69 @@ Describe 'Format-DedupModeChoice' {
 
     It 'refuses a mode it does not know' {
         { Format-DedupModeChoice -Mode 'Disabled' -Format 'LZ4' -Level 1 } | Should -Throw
+    }
+}
+
+Describe 'Request-Compression' {
+    BeforeEach {
+        Mock Write-Host {}
+    }
+
+    It 'takes <Expected> with no level for answer <Answer>' -TestCases @(
+        @{ Answer = '1'; Expected = 'LZ4' }
+        @{ Answer = '2'; Expected = 'ZSTD' }
+    ) {
+        Mock Read-Host { $Answer }
+        $chosen = Request-Compression
+        $chosen.Format | Should -Be $Expected
+        $chosen.Level | Should -BeNullOrEmpty
+    }
+
+    It 'asks nothing further for the two shortcut answers' {
+        Mock Read-Host { '1' }
+        Request-Compression | Out-Null
+        Should -Invoke Read-Host -Times 1 -Exactly
+    }
+
+    It 'asks for the format and then the level when the user picks them' {
+        $script:answers = @('3', '2', '15')
+        $script:index = 0
+        Mock Read-Host { $script:answers[$script:index++] }
+        $chosen = Request-Compression
+        $chosen.Format | Should -Be 'ZSTD'
+        $chosen.Level | Should -Be 15
+    }
+
+    It 'lets the level be left to Windows even on the path that offers to set it' {
+        $script:answers = @('3', '1', '')
+        $script:index = 0
+        Mock Read-Host { $script:answers[$script:index++] }
+        $chosen = Request-Compression
+        $chosen.Format | Should -Be 'LZ4'
+        $chosen.Level | Should -BeNullOrEmpty
+    }
+
+    It 'keeps asking until the answer is one of the three' {
+        $script:answers = @('0', '4', 'fast', '2')
+        $script:index = 0
+        Mock Read-Host { $script:answers[$script:index++] }
+        (Request-Compression).Format | Should -Be 'ZSTD'
+        $script:index | Should -Be 4
+    }
+
+    It 'names what each shortcut does, and that Windows picks the level' {
+        Mock Read-Host { '1' }
+        Request-Compression | Out-Null
+        Should -Invoke Write-Host -ParameterFilter { $Object -match 'Fast - LZ4, at the level Windows picks' }
+        Should -Invoke Write-Host -ParameterFilter { $Object -match 'Balanced - ZSTD, at the level Windows picks' }
+        Should -Invoke Write-Host -ParameterFilter { $Object -match 'Pick the format and level yourself' }
+    }
+
+    It 'returns one object rather than leaving a format without its level' {
+        Mock Read-Host { '2' }
+        $chosen = Request-Compression
+        $chosen.PSObject.Properties.Name | Should -Contain 'Format'
+        $chosen.PSObject.Properties.Name | Should -Contain 'Level'
     }
 }
 
