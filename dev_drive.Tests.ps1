@@ -1126,8 +1126,15 @@ Filters currently attached to this developer volume:
         $report = Resolve-DevDriveTrustReport -MountPoint 'X:' -TrustExitCode 0 -QueryOutput 'Dies ist ein vertrauenswuerdiges Entwicklervolume.'
         $report.Trusted | Should -BeFalse
         $lines = $report.Lines -join "`n"
-        $lines | Should -Match 'not in English'
+        $lines | Should -Match 'in whatever language'
         $lines | Should -Not -Match 'will still work'
+    }
+
+    It 'never calls an English answer that denies trust benign' {
+        $lines = (Resolve-DevDriveTrustReport -MountPoint 'X:' -TrustExitCode 0 -QueryOutput 'This is not a developer volume.').Lines -join "`n"
+        $lines | Should -Not -Match 'nothing is wrong\.$'
+        $lines | Should -Match 'If that answer says the volume is trusted, in whatever language, nothing is wrong\.'
+        $lines | Should -Match 'If it does not, retry by hand'
     }
 
     It 'reads a wording it does not know as not trusted' {

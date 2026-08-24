@@ -621,12 +621,12 @@ function Resolve-DevDriveTrustReport {
     }
 
     if ($TrustExitCode -eq 0) {
-        $lines += "On a Windows that is not in English that answer is simply in another language, and nothing is wrong."
+        $lines += "If that answer says the volume is trusted, in whatever language, nothing is wrong."
     } else {
         $lines += "The Dev Drive will still work, but without the Defender performance mode trust enables."
     }
 
-    $lines += "If it does not say the volume is trusted, retry by hand with: fsutil devdrv trust /f $MountPoint"
+    $lines += "If it does not, retry by hand with: fsutil devdrv trust /f $MountPoint"
     return [PSCustomObject]@{ Trusted = $false; Lines = $lines }
 }
 
