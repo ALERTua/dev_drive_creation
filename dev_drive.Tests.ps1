@@ -1507,6 +1507,7 @@ Describe 'Format-CompressionChoice' {
 
     It 'invents no level for ZSTD when none was chosen' {
         Format-CompressionChoice -Format 'ZSTD' -Level $null | Should -Be 'ZSTD compression'
+        Format-CompressionChoice -Format 'ZSTD' | Should -Be 'ZSTD compression'
     }
 
     It 'refuses a format it does not know' {

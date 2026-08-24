@@ -757,7 +757,7 @@ function Format-CompressionChoice {
     <# Names the format, and a level only for a format that has one. #>
     param(
         [Parameter(Mandatory)][ValidateSet('LZ4', 'ZSTD')][string]$Format,
-        [AllowNull()][Nullable[int]]$Level
+        [Nullable[int]]$Level
     )
 
     if ($Format -eq 'ZSTD' -and $null -ne $Level) {
