@@ -1502,11 +1502,14 @@ function Resolve-DevDriveLabelReport {
     }
 
     $said = if ([string]::IsNullOrWhiteSpace($Actual)) { "reports no name at all" } else { "reports itself as $Actual" }
+    # Doubled, as PowerShell requires: a name may legally carry an apostrophe, and this line is
+    # printed to be copied and run.
+    $quoted = $Requested.Replace("'", "''")
     return [PSCustomObject]@{
         Matches = $false
         Lines   = @(
             "Dev Drive created at $mountPoint, but it $said rather than $Requested."
-            "Set the name with: Set-Volume -DriveLetter $DriveLetter -NewFileSystemLabel '$Requested'"
+            "Set the name with: Set-Volume -DriveLetter $DriveLetter -NewFileSystemLabel '$quoted'"
         )
     }
 }
