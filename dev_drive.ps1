@@ -1904,7 +1904,8 @@ try {
     Write-Host "Dev Drive created at $devLetterColon" -ForegroundColor Green
 
     Write-Host "Marking Dev Drive $devLetterColon as trusted for Defender performance" -ForegroundColor Green
-    fsutil devdrv trust "$devLetterColon" | Out-Null
+    # /f: the designation lands through a dismount, which fsutil skips on a volume in use.
+    fsutil devdrv trust /f "$devLetterColon" | Out-Null
     if ($LASTEXITCODE -eq 0) {
         Write-Host "Dev Drive marked trusted." -ForegroundColor Green
     } else {
@@ -1914,7 +1915,7 @@ try {
         Write-Host "Could not mark $devLetterColon as trusted (fsutil exited with code $LASTEXITCODE)." -ForegroundColor Yellow
         Write-Host "The Dev Drive will still work, but without the Defender performance mode trust enables." -ForegroundColor Yellow
         Write-Host "Check the current state with: fsutil devdrv query $devLetterColon" -ForegroundColor Yellow
-        Write-Host "Retry by hand with: fsutil devdrv trust $devLetterColon" -ForegroundColor Yellow
+        Write-Host "Retry by hand with: fsutil devdrv trust /f $devLetterColon" -ForegroundColor Yellow
     }
 
 
