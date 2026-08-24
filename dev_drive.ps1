@@ -1329,28 +1329,34 @@ function Resolve-VhdxMountAdvice {
     )
 
     if ($AutoAttachGranted) {
-        $lines = @("Windows will mount $VhdxPath automatically on every startup.")
-    } else {
-        $opening = if ($AutoAttachRequested) {
-            "Automatic mounting was NOT enabled, so this Dev Drive's mount point is gone after every restart."
-        } else {
-            "You chose to mount this Dev Drive yourself, so its mount point is gone after every restart."
-        }
-
-        $lines = @(
-            $opening
-            "Mount it again with:"
-            "  Mount-DiskImage -ImagePath '$VhdxPath' -StorageType VHDX -Access ReadWrite"
-            "Run that from a PowerShell started as administrator: mounting a virtual hard disk needs"
-            "administrator rights, unlike mounting a .iso file."
-        )
+        return @("Windows will mount $VhdxPath automatically on every startup.")
     }
 
-    # Trust is a per-machine registry flag, so a copy of this file is an ordinary volume elsewhere.
-    $lines += "Copied to another machine, this file mounts there as an ordinary volume: the trust that"
-    $lines += "gives it Defender performance mode is stored per machine and does not travel with the file."
-    $lines += "Restore it there, after mounting, with: fsutil devdrv trust /f <drive letter>:"
-    return $lines
+    $opening = if ($AutoAttachRequested) {
+        "Automatic mounting was NOT enabled, so this Dev Drive's mount point is gone after every restart."
+    } else {
+        "You chose to mount this Dev Drive yourself, so its mount point is gone after every restart."
+    }
+
+    return @(
+        $opening
+        "Mount it again with:"
+        "  Mount-DiskImage -ImagePath '$VhdxPath' -StorageType VHDX -Access ReadWrite"
+        "Run that from a PowerShell started as administrator: mounting a virtual hard disk needs"
+        "administrator rights, unlike mounting a .iso file."
+    )
+}
+
+function Resolve-VhdxPortabilityAdvice {
+    <# What carrying the file to another machine costs: the trusted status is per machine. #>
+    param([Parameter(Mandatory)][string]$VhdxPath)
+
+    return @(
+        "Microsoft does not recommend copying $VhdxPath to another machine and carrying on using it as a Dev Drive."
+        "The trusted status is stored on the machine that formatted the volume and does not travel with the file:"
+        "copied elsewhere it mounts as an ordinary volume, every filter attaches, and Defender scans it synchronously."
+        "If you do it anyway, mark it trusted there after mounting it: fsutil devdrv trust /f <drive letter>:"
+    )
 }
 
 function Request-AutoAttachChoice {
@@ -2213,6 +2219,15 @@ try {
     if (-not $VhdxAtBootGranted -and $VhdxMountAdvice) {
         Write-Host ""
         foreach ($line in $VhdxMountAdvice) {
+            Write-Host $line -ForegroundColor Yellow
+        }
+    }
+
+    # Printed at the end only, and whatever automatic mounting did: it is about the file's future,
+    # not about this run, and by here the volume really is a Dev Drive.
+    if ($mode -eq "Vhdx") {
+        Write-Host ""
+        foreach ($line in (Resolve-VhdxPortabilityAdvice -VhdxPath $VhdxPath)) {
             Write-Host $line -ForegroundColor Yellow
         }
     }

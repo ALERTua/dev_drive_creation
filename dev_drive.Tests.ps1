@@ -225,6 +225,15 @@ Describe 'The script itself' {
             Should -Not -BeNullOrEmpty
     }
 
+    It 'gives the portability advice at the end of the run, whatever automatic mounting did' {
+        $content = Get-Content -Path $script:ScriptPath -Raw
+        $allDoneAt = $content.IndexOf('Write-Host "All done. Dev Drive')
+        $adviceAt = $content.IndexOf('Resolve-VhdxPortabilityAdvice -VhdxPath $VhdxPath')
+        $adviceAt | Should -BeGreaterThan $allDoneAt
+        # The mount advice is skipped when Windows mounts the file itself; this one never is.
+        $content.Substring($allDoneAt, $adviceAt - $allDoneAt) | Should -Match 'if \(\$mode -eq "Vhdx"\)'
+    }
+
     It 'checks that the drive accepts writes after BitLocker and before deduplication' {
         $content = Get-Content -Path $script:ScriptPath -Raw
         $bitLockerAt = $content.IndexOf('Skipping BitLocker encryption as requested')
@@ -1147,18 +1156,34 @@ Describe 'Resolve-VhdxMountAdvice' {
         $lines | Should -Match 'started as administrator'
     }
 
-    It 'warns that the trusted status stays behind, whatever happens with automatic mounting' -TestCases @(
-        @{ Requested = $true;  Granted = $true }
-        @{ Requested = $true;  Granted = $false }
-        @{ Requested = $false; Granted = $false }
-    ) {
-        $lines = (Resolve-VhdxMountAdvice -VhdxPath 'D:\dev.vhdx' -AutoAttachRequested:$Requested -AutoAttachGranted:$Granted) -join "`n"
-        $lines | Should -Match 'stored per machine and does not travel'
-        $lines | Should -Match 'fsutil devdrv trust /f'
+    It 'returns plain lines rather than an object to unwrap' {
+        Resolve-VhdxMountAdvice -VhdxPath 'D:\dev.vhdx' | Should -BeOfType [string]
+    }
+}
+
+Describe 'Resolve-VhdxPortabilityAdvice' {
+    It 'names the file and says the trusted status does not travel with it' {
+        $lines = (Resolve-VhdxPortabilityAdvice -VhdxPath 'D:\dev.vhdx') -join "`n"
+        $lines | Should -Match ([regex]::Escape('D:\dev.vhdx'))
+        $lines | Should -Match 'does not travel with the file'
+    }
+
+    It 'says Microsoft advises against the move before saying how to survive it' {
+        $lines = Resolve-VhdxPortabilityAdvice -VhdxPath 'D:\dev.vhdx'
+        $adviceAt = ($lines | Select-String -Pattern 'does not recommend').LineNumber
+        $commandAt = ($lines | Select-String -Pattern 'fsutil devdrv trust /f').LineNumber
+        $adviceAt | Should -Not -BeNullOrEmpty
+        $commandAt | Should -BeGreaterThan $adviceAt
+    }
+
+    It 'says nothing about this run, only about the file elsewhere' {
+        $lines = (Resolve-VhdxPortabilityAdvice -VhdxPath 'D:\dev.vhdx') -join "`n"
+        $lines | Should -Not -Match 'Mount-DiskImage'
+        $lines | Should -Not -Match 'startup'
     }
 
     It 'returns plain lines rather than an object to unwrap' {
-        Resolve-VhdxMountAdvice -VhdxPath 'D:\dev.vhdx' | Should -BeOfType [string]
+        Resolve-VhdxPortabilityAdvice -VhdxPath 'D:\dev.vhdx' | Should -BeOfType [string]
     }
 }
 

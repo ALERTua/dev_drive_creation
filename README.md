@@ -267,15 +267,17 @@ Run it from a PowerShell started as administrator. Microsoft's [`Mount-DiskImage
 
 ### Carrying the file to another machine
 
-Portability is the reason to choose this mode, and it costs the trusted status. Microsoft's [Dev Drive documentation](https://learn.microsoft.com/en-us/windows/dev-drive/) states that the designation, trust status included, is stored per machine and does not travel with the file: a `.vhdx` mounted somewhere else comes up as an ordinary ReFS volume, every filter attaches, and Microsoft Defender scans it synchronously. Nothing announces this — the drive works, it is simply slower than the one you left behind.
+Microsoft's [Dev Drive documentation](https://learn.microsoft.com/en-us/windows/dev-drive/) advises against it: when a virtual hard disk is hosted on a fixed disk — which this mode requires — it is not recommended to copy it, move it to a different machine and carry on using it as a Dev Drive.
 
-Mount it on the new machine, then mark it trusted again:
+The reason is that the designation, trust status included, is stored per machine and does not travel with the file. Mounted somewhere else, the `.vhdx` comes up as an ordinary ReFS volume: every filter attaches and Microsoft Defender scans it synchronously. Nothing announces this — the drive works, it is simply slower than the one you left behind.
+
+If you move it anyway, mount it on the new machine and mark it trusted there:
 
 ```powershell
 fsutil devdrv trust /f D:
 ```
 
-The `/f` matters more there than it does during creation: the volume you just mounted may already be in use, and without the flag the designation waits for the next mount.
+The script prints the same advice at the end of every run that creates a `.vhdx`.
 
 ### BitLocker inside a virtual hard disk
 
