@@ -183,6 +183,19 @@ Scheduling deduplication scrub jobs
 Scheduled weekly scrub job on Monday at 17:30
 Configuring the ReFS optimization tasks to run only on AC power...
 Successfully configured 1 ReFS optimization task(s) to run only on AC power
+
+The ReFS optimization runs on a schedule kept in Task Scheduler, under:
+  Task Scheduler Library > Microsoft > Windows > ReFsDedupSvc
+
+Times just chosen: 11:00 and 17:00 daily, Monday at 17:30 weekly.
+
+To change the times later, press Win+R, type taskschd.msc and press Ctrl+Shift+Enter to open
+it as administrator, then open that folder and find the tasks whose Triggers column matches
+the times above. Edit them on the Triggers tab. Leave the Actions tab alone - that is what
+actually runs the optimization.
+
+Other tasks in that folder may belong to Windows or to earlier runs.
+
 Running the initial ReFS job for E:
 Triggered the initial job: deduplication and ZSTD compression, level 2
 All done. Dev Drive E: ready.
