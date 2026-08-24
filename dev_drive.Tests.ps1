@@ -154,6 +154,21 @@ Describe 'The script itself' {
             Should -Not -BeNullOrEmpty
     }
 
+    It 'starts the compression level unset, so no message can print one nobody chose' {
+        Select-String -Path $script:ScriptPath -Pattern '^\$CompressionLevel = \$null' |
+            Should -Not -BeNullOrEmpty
+        Select-String -Path $script:ScriptPath -Pattern '^\$CompressionLevel = \d' |
+            Should -BeNullOrEmpty
+    }
+
+    It 'builds every compression message through the one helper that knows about levels' {
+        $content = Get-Content -Path $script:ScriptPath -Raw
+        ([regex]::Matches($content, 'Format-CompressionChoice -Format \$CompressionFormat -Level \$CompressionLevel')).Count |
+            Should -Be 2
+        $content | Should -Not -Match 'compression \(level \$CompressionLevel\)'
+        $content | Should -Not -Match 'Level=\$CompressionLevel'
+    }
+
     It 'prints a plan summary line when BitLocker is skipped' {
         Select-String -Path $script:ScriptPath -Pattern '\* Skip BitLocker encryption' |
             Should -Not -BeNullOrEmpty
@@ -1472,6 +1487,30 @@ Describe 'Resolve-DedupDayInput' {
             (Resolve-DedupDayInput -Answer 'someday' -CurrentDay 'Monday' -AllowEmpty).Rejection |
                 Should -Be 'InvalidDay'
         }
+    }
+}
+
+Describe 'Format-CompressionChoice' {
+    It 'never names a level for LZ4, which has none' -TestCases @(
+        @{ Level = $null }
+        @{ Level = 5 }
+        @{ Level = 9 }
+    ) {
+        $text = Format-CompressionChoice -Format 'LZ4' -Level $Level
+        $text | Should -Be 'LZ4 compression'
+        $text | Should -Not -Match 'level'
+    }
+
+    It 'names the level for ZSTD, which has one' {
+        Format-CompressionChoice -Format 'ZSTD' -Level 7 | Should -Be 'ZSTD compression, level 7'
+    }
+
+    It 'invents no level for ZSTD when none was chosen' {
+        Format-CompressionChoice -Format 'ZSTD' -Level $null | Should -Be 'ZSTD compression'
+    }
+
+    It 'refuses a format it does not know' {
+        { Format-CompressionChoice -Format 'GZIP' -Level 1 } | Should -Throw
     }
 }
 

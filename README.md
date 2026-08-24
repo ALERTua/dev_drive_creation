@@ -138,7 +138,7 @@ Selected ZSTD compression with level 2
 
 * Shrink Drive D (ALERT) by 199 GB to free up space
 * Create 199 GB Dev Drive on Disk 1 (CT4000P3PSSD8) using ReFS
-* Enable ReFS deduplication with ZSTD compression (level 2)
+* Enable ReFS deduplication with ZSTD compression, level 2
 * Schedule daily optimization jobs at 11:00 and 17:00 (AC power only)
 * Schedule weekly maintenance job every Monday at 17:30
 * Mark Dev Drive as trusted for Windows Defender performance
@@ -174,7 +174,7 @@ Successfully configured 1 deduplication task(s) to run only on AC power
 Scheduling deduplication scrub jobs
 Scheduled weekly scrub job on Monday at 12:00 (4h)
 Running initial Deduplication Job for E:
-Triggered initial dedup job: Format=ZSTD, Level=2
+Triggered initial dedup job with ZSTD compression, level 2
 All done. Dev Drive E: ready.
 DriveLetter FriendlyName FileSystemType DriveType HealthStatus OperationalStatus SizeRemaining   Size
 ----------- ------------ -------------- --------- ------------ ----------------- -------------   ----
