@@ -753,6 +753,19 @@ function Request-CompressionLevel {
     }
 }
 
+function Format-CompressionChoice {
+    <# Names the format, and a level only for a format that has one. #>
+    param(
+        [Parameter(Mandatory)][ValidateSet('LZ4', 'ZSTD')][string]$Format,
+        [Nullable[int]]$Level
+    )
+
+    if ($Format -eq 'ZSTD' -and $null -ne $Level) {
+        return "$Format compression, level $Level"
+    }
+    return "$Format compression"
+}
+
 function Resolve-DedupTimeInput {
     <#
         Decides what one typed start time means. Takes HH:MM or H:MM on a 24-hour clock and
@@ -1525,7 +1538,8 @@ $ShrinkSpareBytes = 5GB
 # Set default values for deduplication and compression settings
 $DedupMode = 'Dedup'
 $CompressionFormat = 'LZ4'
-$CompressionLevel = 5
+# Unset until a format that has levels is chosen: a number here would be printed as a setting nobody made.
+$CompressionLevel = $null
 $RunInitialJob = $true
 $SkipBitLocker = $false
 $SkipDeduplication = $false
@@ -1812,7 +1826,7 @@ if (-not $SkipBitLocker) {
 
 if (-not $SkipDeduplication) {
     if ($DedupMode -eq "DedupAndCompress") {
-        Write-Host "* Enable ReFS deduplication with $CompressionFormat compression (level $CompressionLevel)" -ForegroundColor White
+        Write-Host "* Enable ReFS deduplication with $(Format-CompressionChoice -Format $CompressionFormat -Level $CompressionLevel)" -ForegroundColor White
     } else {
         Write-Host "* Enable ReFS deduplication only (no compression)" -ForegroundColor White
     }
@@ -2248,7 +2262,7 @@ try {
                 Write-Host "Triggered initial dedup job (deduplication only)" -ForegroundColor Green
             } else {
                 Start-ReFSDedupJob @jobParams -ErrorAction Stop | Out-Null
-                Write-Host "Triggered initial dedup job: Format=$CompressionFormat, Level=$CompressionLevel" -ForegroundColor Green
+                Write-Host "Triggered initial dedup job with $(Format-CompressionChoice -Format $CompressionFormat -Level $CompressionLevel)" -ForegroundColor Green
             }
             Write-Host "You should wait for it to complete for the deduplication to properly work" -ForegroundColor Yellow
         }
