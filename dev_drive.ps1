@@ -774,6 +774,80 @@ function Request-Compression {
     }
 }
 
+function Get-DedupVolumeReport {
+    <#
+        What the volume says about its own deduplication settings, or that it could not be asked.
+        Only the settings shared by every daily schedule are taken, so the first one answers for all.
+    #>
+    param([Parameter(Mandatory)][string]$MountPoint)
+
+    try {
+        $schedule = @(Get-ReFSDedupSchedule -Volume $MountPoint -ErrorAction Stop)[0]
+        return [PSCustomObject]@{
+            Known  = $true
+            Mode   = [string]$schedule.Type
+            Format = [string]$schedule.CompressionFormat
+            Level  = [int]$schedule.CompressionLevel
+        }
+    }
+    catch {
+        return [PSCustomObject]@{ Known = $false; Mode = ''; Format = ''; Level = 0 }
+    }
+}
+
+function Resolve-DedupReadBackVerdict {
+    <#
+        Compares what was asked for against what the volume reports. A reported level of 0 is how it
+        says "the default", which is what asking for no level means.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$MountPoint,
+        [Parameter(Mandatory)][ValidateSet('Dedup', 'DedupAndCompress', 'Compress')][string]$ExpectedMode,
+        [AllowNull()][AllowEmptyString()][string]$ExpectedFormat,
+        [Nullable[int]]$ExpectedLevel,
+        [Parameter(Mandatory)]$Actual
+    )
+
+    if (-not $Actual.Known) {
+        return [PSCustomObject]@{
+            Agrees = $false
+            Lines  = @(
+                "Could not read the deduplication settings back from $MountPoint."
+                "Check them by hand with: Get-ReFSDedupSchedule -Volume $MountPoint"
+            )
+        }
+    }
+
+    $reportedLevel = if ($Actual.Level -eq 0) { $null } else { $Actual.Level }
+    $compresses = $ExpectedMode -ne 'Dedup'
+
+    $differences = @()
+    if ($Actual.Mode -ne $ExpectedMode) {
+        $differences += "mode: asked for $ExpectedMode, the volume reports $($Actual.Mode)"
+    }
+    if ($compresses -and $Actual.Format -ne $ExpectedFormat) {
+        $differences += "compression format: asked for $ExpectedFormat, the volume reports $($Actual.Format)"
+    }
+    # No level asked for means any level is right, because Windows chose it.
+    if ($compresses -and $null -ne $ExpectedLevel -and $Actual.Level -ne $ExpectedLevel) {
+        $reported = if ($null -eq $reportedLevel) { 'the default' } else { "level $reportedLevel" }
+        $differences += "compression level: asked for level $ExpectedLevel, the volume reports $reported"
+    }
+
+    if ($differences.Count -gt 0) {
+        $lines = @("$MountPoint was set up, but does not report back what was asked for:")
+        $lines += $differences | ForEach-Object { "  $_" }
+        $lines += "The Dev Drive is created and usable. Read the settings with: Get-ReFSDedupSchedule -Volume $MountPoint"
+        return [PSCustomObject]@{ Agrees = $false; Lines = $lines }
+    }
+
+    $lines = @("$MountPoint confirms it: $(Format-DedupModeChoice -Mode $Actual.Mode -Format $Actual.Format -Level $reportedLevel).")
+    if ($compresses -and $null -eq $reportedLevel) {
+        $lines += "The compression level is the one Windows picks."
+    }
+    return [PSCustomObject]@{ Agrees = $true; Lines = $lines }
+}
+
 function Get-CompressionLevelRange {
     <# The levels each format takes, per the refsutil compression reference. LZ4 skips 2. #>
     param([Parameter(Mandatory)][ValidateSet('LZ4', 'ZSTD')][string]$Format)
@@ -2278,6 +2352,15 @@ try {
         }
 
         Write-Host "Scheduled the daily jobs" -ForegroundColor Green
+
+        # The settings are asked of the volume rather than assumed from the calls that just returned.
+        $dedupVerdict = Resolve-DedupReadBackVerdict -MountPoint $devLetterColon -ExpectedMode $DedupMode `
+            -ExpectedFormat $CompressionFormat -ExpectedLevel $CompressionLevel `
+            -Actual (Get-DedupVolumeReport -MountPoint $devLetterColon)
+        $verdictColour = if ($dedupVerdict.Agrees) { 'Green' } else { 'Yellow' }
+        foreach ($line in $dedupVerdict.Lines) {
+            Write-Host $line -ForegroundColor $verdictColour
+        }
 
         Write-Host "Scheduling deduplication scrub jobs" -ForegroundColor Green
         Set-ReFSDedupScrubSchedule -Volume "$devLetterColon" -Days $ScrubDays -Start $ScrubStart -WeeksInterval $ScrubWeeksInterval -ErrorAction Stop
