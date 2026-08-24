@@ -130,7 +130,7 @@ Describe 'The script itself' {
 
     It 'checks the fsutil devdrv trust exit code before declaring the drive trusted' {
         $content = Get-Content -Path $script:ScriptPath -Raw
-        $content | Should -Match '(?ms)fsutil devdrv trust "\$devLetterColon" \| Out-Null\s*\r?\n\s*if \(\$LASTEXITCODE'
+        $content | Should -Match '(?ms)fsutil devdrv trust /f "\$devLetterColon" \| Out-Null\s*\r?\n\s*if \(\$LASTEXITCODE'
     }
 
     It 'prints a plan summary line when BitLocker is skipped' {
@@ -222,6 +222,17 @@ Describe 'The script itself' {
 
     It 'sets the shrunk-drive variable to a known value before the try block that might throw first' {
         Select-String -Path $script:ScriptPath -Pattern '^\$ShrunkDriveLetter = \$null' |
+            Should -Not -BeNullOrEmpty
+    }
+
+    It 'forces the dismount when marking the drive trusted, so the designation lands during the run' {
+        $content = Get-Content -Path $script:ScriptPath -Raw
+        $content | Should -Match 'fsutil devdrv trust /f "\$devLetterColon"'
+        $content | Should -Not -Match 'fsutil devdrv trust "\$devLetterColon"'
+    }
+
+    It 'offers the same force flag in the retry it prints when marking trust fails' {
+        Select-String -Path $script:ScriptPath -Pattern 'Retry by hand with: fsutil devdrv trust /f' |
             Should -Not -BeNullOrEmpty
     }
 
