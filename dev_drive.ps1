@@ -721,7 +721,7 @@ function Request-DeduplicationChoice {
 function Request-CompressionFormat {
     Write-Host "`nChoose compression format:" -ForegroundColor Cyan
     Write-Host "1. LZ4: Fast compression with good balance of speed and compression ratio" -ForegroundColor White
-    Write-Host "2. ZSTD: Better compression ratio but uses more CPU (allows custom compression level)" -ForegroundColor White
+    Write-Host "2. ZSTD: Better compression ratio but uses more CPU" -ForegroundColor White
     Write-Host ""
 
     while ($true) {
@@ -743,7 +743,7 @@ function Get-CompressionLevelRange {
     if ($Format -eq 'LZ4') {
         return [PSCustomObject]@{ Allowed = @(1) + (3..12); Label = 'level 1, or 3 to 12' }
     }
-    return [PSCustomObject]@{ Allowed = @(1..22); Label = 'levels 1 to 22' }
+    return [PSCustomObject]@{ Allowed = 1..22; Label = 'levels 1 to 22' }
 }
 
 function Resolve-CompressionLevelInput {
@@ -762,13 +762,20 @@ function Resolve-CompressionLevelInput {
         return $result
     }
 
+    # [0-9] not \d, which also matches other alphabets' digits; the length cap keeps a long run of
+    # digits from overflowing the cast below.
     $trimmed = $Answer.Trim()
-    if ($trimmed -notmatch '^\d+$') {
+    if ($trimmed -notmatch '^[0-9]+$' -or $trimmed.Length -gt 2) {
         $result.Rejection = 'NotANumber'
         return $result
     }
 
+    # Zero is what the documentation calls "use the default", which here is said by answering nothing.
     $level = [int]$trimmed
+    if ($level -eq 0) {
+        return $result
+    }
+
     if ((Get-CompressionLevelRange -Format $Format).Allowed -notcontains $level) {
         $result.Rejection = 'OutOfRange'
         return $result
@@ -787,7 +794,7 @@ function Request-CompressionLevel {
     if ($Format -eq 'LZ4') {
         Write-Host "Levels 3 and above use the LZ4HC algorithm: smaller, and slower to compress." -ForegroundColor White
     } else {
-        Write-Host "Higher levels compress smaller and slower, and levels 20 and above need noticeably more memory." -ForegroundColor White
+        Write-Host "Higher levels compress smaller and slower, and levels 20 and above can need noticeably more memory." -ForegroundColor White
     }
     Write-Host "Decompression is the same speed whichever level you pick." -ForegroundColor White
     Write-Host ""
@@ -798,7 +805,11 @@ function Request-CompressionLevel {
         if (-not $parsed.Rejection) {
             return $parsed.Level
         }
-        Write-Host "Invalid level. $Format accepts $($range.Label), or an empty answer to leave it to Windows." -ForegroundColor Red
+        if ($parsed.Rejection -eq 'NotANumber') {
+            Write-Host "That is not a level. Enter a plain number, or nothing at all to leave it to Windows." -ForegroundColor Red
+        } else {
+            Write-Host "$Format accepts $($range.Label). Enter one of those, or nothing at all to leave it to Windows." -ForegroundColor Red
+        }
     }
 }
 
@@ -2220,8 +2231,7 @@ try {
             CpuPercentage     = $DedupDailyCpuPercent
         }
 
-        # Add compression parameters only if not Dedup-only mode. An unchosen level is left out
-        # entirely: that is how Windows is told to use its own, which it may change between builds.
+        # Compression parameters only outside Dedup-only mode; an unchosen level is left out so Windows uses its own.
         if ($DedupMode -ne 'Dedup') {
             $baseScheduleParams.CompressionFormat = $CompressionFormat
             if ($null -ne $CompressionLevel) {

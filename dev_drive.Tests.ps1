@@ -162,12 +162,18 @@ Describe 'The script itself' {
     }
 
     It 'builds every compression message through the one helper that knows about levels' {
-        # The count is not fixed - messages come and go - but no message may reach for the level itself.
         $content = Get-Content -Path $script:ScriptPath -Raw
         ([regex]::Matches($content, 'Format-CompressionChoice -Format \$CompressionFormat -Level \$CompressionLevel')).Count |
-            Should -BeGreaterThan 1
+            Should -Be 3
         Select-String -Path $script:ScriptPath -Pattern 'Write-Host "[^"]*(?<!-Level )\$CompressionLevel' |
             Should -BeNullOrEmpty
+    }
+
+    It 'asks for the level whatever the format, not only for ZSTD' {
+        $content = Get-Content -Path $script:ScriptPath -Raw
+        ([regex]::Matches($content, '\$CompressionLevel = Request-CompressionLevel -Format \$CompressionFormat')).Count |
+            Should -Be 1
+        $content | Should -Not -Match "if \(\`$CompressionFormat -eq 'ZSTD'\) \{\s*\r?\n\s*\`$CompressionLevel = Request"
     }
 
     It 'leaves the level out of the calls to Windows when nobody chose one' {
@@ -1520,6 +1526,10 @@ Describe 'Get-CompressionLevelRange' {
         (Get-CompressionLevelRange -Format 'LZ4').Label | Should -Be 'level 1, or 3 to 12'
         (Get-CompressionLevelRange -Format 'ZSTD').Label | Should -Be 'levels 1 to 22'
     }
+
+    It 'refuses a format it does not know' {
+        { Get-CompressionLevelRange -Format 'GZIP' } | Should -Throw
+    }
 }
 
 Describe 'Resolve-CompressionLevelInput' {
@@ -1527,6 +1537,7 @@ Describe 'Resolve-CompressionLevelInput' {
         @{ Answer = '' }
         @{ Answer = '   ' }
         @{ Answer = $null }
+        @{ Answer = '0' }
     ) {
         $parsed = Resolve-CompressionLevelInput -Format 'ZSTD' -Answer $Answer
         $parsed.Rejection | Should -BeNullOrEmpty
@@ -1549,7 +1560,6 @@ Describe 'Resolve-CompressionLevelInput' {
         @{ Format = 'LZ4';  Answer = '13'; Why = 'LZ4 stops at 12' }
         @{ Format = 'LZ4';  Answer = '22'; Why = 'that is a ZSTD level' }
         @{ Format = 'ZSTD'; Answer = '23'; Why = 'ZSTD stops at 22' }
-        @{ Format = 'ZSTD'; Answer = '0';  Why = 'zero is the empty answer, not a level' }
     ) {
         (Resolve-CompressionLevelInput -Format $Format -Answer $Answer).Rejection | Should -Be 'OutOfRange'
     }
@@ -1559,6 +1569,14 @@ Describe 'Resolve-CompressionLevelInput' {
         @{ Answer = '3.5' }
         @{ Answer = '-3' }
         @{ Answer = '1 2' }
+    ) {
+        (Resolve-CompressionLevelInput -Format 'ZSTD' -Answer $Answer).Rejection | Should -Be 'NotANumber'
+    }
+
+    It 'refuses an answer that would throw on the way to a number' -TestCases @(
+        @{ Answer = '99999999999999999999'; Why = 'twenty digits overflow the cast' }
+        @{ Answer = '000'; Why = 'longer than any level, so the cap catches it before the cast' }
+        @{ Answer = "$([char]0xFF13)"; Why = 'a fullwidth digit matches \d but does not parse' }
     ) {
         (Resolve-CompressionLevelInput -Format 'ZSTD' -Answer $Answer).Rejection | Should -Be 'NotANumber'
     }
@@ -1584,11 +1602,24 @@ Describe 'Request-CompressionLevel' {
     }
 
     It 'keeps asking until the answer is one the format accepts' {
-        $script:answers = @('2', '99', '9')
+        $script:answers = @('2', '99999999999999999999', 'nine', '9')
         $script:index = 0
         Mock Read-Host { $script:answers[$script:index++] }
         Request-CompressionLevel -Format 'LZ4' | Should -Be 9
-        $script:index | Should -Be 3
+        $script:index | Should -Be 4
+    }
+
+    It 'says which kind of answer was wrong, rather than one message for both' {
+        $script:answers = @('nine', '')
+        $script:index = 0
+        Mock Read-Host { $script:answers[$script:index++] }
+        Request-CompressionLevel -Format 'ZSTD' | Out-Null
+        Should -Invoke Write-Host -ParameterFilter { $Object -match 'That is not a level' }
+
+        $script:answers = @('99', '')
+        $script:index = 0
+        Request-CompressionLevel -Format 'ZSTD' | Out-Null
+        Should -Invoke Write-Host -ParameterFilter { $Object -match 'ZSTD accepts levels 1 to 22\. Enter one of those' }
     }
 
     It 'names the range of the format it is asking about, and offers the empty answer' -TestCases @(

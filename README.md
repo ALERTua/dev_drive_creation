@@ -119,13 +119,13 @@ Enter your choice (1, 2 or 3): 2
 
 Choose compression format:                                                                                   
 1. LZ4: Fast compression with good balance of speed and compression ratio
-2. ZSTD: Better compression ratio but uses more CPU (allows custom compression level)
+2. ZSTD: Better compression ratio but uses more CPU
 
 Enter your choice (1 or 2): 2
 
 Choose the ZSTD compression level:                                                                           
 ZSTD accepts levels 1 to 22.
-Higher levels compress smaller and slower, and levels 20 and above need noticeably more memory.
+Higher levels compress smaller and slower, and levels 20 and above can need noticeably more memory.
 Decompression is the same speed whichever level you pick.
 
 Enter a level, or press Enter for the level Windows picks: 2
@@ -215,7 +215,7 @@ E           DevDrive     ReFS           Fixed     Healthy      OK               
 5. **Storage Optimization Setup**
    - Choose deduplication level (none, deduplication-only, or with compression)
    - Select compression format (LZ4 for speed, ZSTD for better compression)
-   - Configure the compression level, or press Enter to leave it to Windows. LZ4 takes level 1 or 3 to 12, where 3 and above use LZ4HC; ZSTD takes 1 to 22. Both defaults are Microsoft's own and are documented as subject to change, so an empty answer passes no level rather than a number of ours
+   - Configure the compression level, or press Enter to leave it to Windows: LZ4 takes 1, or 3 to 12 where 3 and above use LZ4HC; ZSTD takes 1 to 22. The defaults are Microsoft's own and documented as subject to change, so an empty answer passes no level at all
    - Keep the suggested schedule, or set three fields yourself: the daily start times (comma separated, 24-hour HH:MM, up to four), the weekly maintenance day, and its start time
    - Each of the three takes Enter to keep the value shown; choosing your own times gets the result repeated back, taking the defaults does not
    - The daily job's days, its two-hour limit, its 60% CPU share and its AC-power condition are fixed and are not asked about
