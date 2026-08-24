@@ -1391,6 +1391,126 @@ function Resolve-DevDriveSizeInput {
     return $result
 }
 
+function Resolve-DevDriveLabelInput {
+    <# Decides what one typed answer to the name question means. Rejection is $null when the answer
+       is good, and an empty answer keeps the offered name. #>
+    param(
+        [AllowEmptyString()][string]$Answer,
+        [Parameter(Mandatory)][string]$Default,
+        [int]$MaxLength = $script:DevDriveLabelMaxLength
+    )
+
+    $result = [PSCustomObject]@{ Rejection = $null; Label = $null; RejectedCharacters = ''; ControlCharacter = $false }
+
+    if ([string]::IsNullOrWhiteSpace($Answer)) {
+        $result.Label = $Default
+        return $result
+    }
+
+    $label = $Answer.Trim()
+    if ($label.Length -gt $MaxLength) {
+        $result.Rejection = 'TooLong'
+        return $result
+    }
+
+    # A proxy: Windows documents no character list for a volume label, so the file name list stands
+    # in for one. It can be too permissive, which the read-back after formatting is there to catch.
+    $bad = @($label.ToCharArray() | Where-Object { [System.IO.Path]::GetInvalidFileNameChars() -contains $_ })
+    if ($bad.Count -gt 0) {
+        $result.Rejection = 'BadCharacter'
+        # Control characters are counted rather than shown: there is nothing to print for one.
+        $result.RejectedCharacters = (@($bad | Where-Object { [int]$_ -ge 32 } | Select-Object -Unique) -join ' ')
+        $result.ControlCharacter = [bool]@($bad | Where-Object { [int]$_ -lt 32 }).Count
+        return $result
+    }
+
+    $result.Label = $label
+    return $result
+}
+
+function Request-DevDriveLabel {
+    <# The name the volume will carry. Enter keeps the one offered, as every other prompt here does. #>
+    param(
+        [Parameter(Mandatory)][string]$Default,
+        [int]$MaxLength = $script:DevDriveLabelMaxLength
+    )
+
+    Write-Host "`nThe Dev Drive carries a name, which is what File Explorer shows beside its letter." -ForegroundColor Cyan
+
+    while ($true) {
+        $answer = Read-Host "Enter a name for the Dev Drive, or press Enter for $Default"
+        $verdict = Resolve-DevDriveLabelInput -Answer $answer -Default $Default -MaxLength $MaxLength
+
+        if ($verdict.Rejection -eq 'TooLong') {
+            Write-Host "That name is too long. Enter at most $MaxLength characters." -ForegroundColor Red
+            continue
+        }
+        if ($verdict.Rejection -eq 'BadCharacter') {
+            # Both halves are named at once, or removing the visible ones only earns a second refusal.
+            $parts = @()
+            if ($verdict.RejectedCharacters) { $parts += "these characters: $($verdict.RejectedCharacters)" }
+            if ($verdict.ControlCharacter) { $parts += "a control character" }
+            Write-Host "That name cannot be used, because it contains $($parts -join ', and ')." -ForegroundColor Red
+            continue
+        }
+
+        return $verdict.Label
+    }
+}
+
+function Get-VolumeLabel {
+    <# The name a volume answers with; one that cannot be read answers $null, not an empty name. #>
+    param([Parameter(Mandatory)][string]$DriveLetter)
+
+    try {
+        # @() and the count check together: reading a property off nothing throws under strict mode.
+        $volume = @(Get-Volume -DriveLetter $DriveLetter -ErrorAction Stop)
+        if ($volume.Count -ne 1) { return $null }
+        return $volume[0].FileSystemLabel
+    }
+    catch {
+        return $null
+    }
+}
+
+function Resolve-DevDriveLabelReport {
+    <# What to say about the name the volume came back with, read off it rather than assumed. A
+       volume that could not be read is reported as unread, never as one with no name. #>
+    param(
+        [Parameter(Mandatory)][string]$DriveLetter,
+        [Parameter(Mandatory)][string]$Requested,
+        [object]$Actual
+    )
+
+    $mountPoint = "$DriveLetter`:"
+
+    if ($Actual -is [string] -and $Actual -ceq $Requested) {
+        return [PSCustomObject]@{
+            Matches = $true
+            Lines   = @("Dev Drive created at $mountPoint, named $Requested.")
+        }
+    }
+
+    if ($null -eq $Actual) {
+        return [PSCustomObject]@{
+            Matches = $false
+            Lines   = @(
+                "Dev Drive created at $mountPoint, but its name could not be read back, so it is not confirmed as $Requested."
+                "Check it with: Get-Volume -DriveLetter $DriveLetter"
+            )
+        }
+    }
+
+    $said = if ([string]::IsNullOrWhiteSpace($Actual)) { "reports no name at all" } else { "reports itself as $Actual" }
+    return [PSCustomObject]@{
+        Matches = $false
+        Lines   = @(
+            "Dev Drive created at $mountPoint, but it $said rather than $Requested."
+            "Set the name with: Set-Volume -DriveLetter $DriveLetter -NewFileSystemLabel '$Requested'"
+        )
+    }
+}
+
 function Request-DevDriveSizeGB {
     <#
         The one size question for all three creation modes. -MaxIsAdvisory warns instead of
@@ -1827,6 +1947,13 @@ if ($windows_build -ge $windows_build_min) {
 # Microsoft's documented minimum size for a Dev Drive volume (https://learn.microsoft.com/en-us/windows/dev-drive/)
 $DevDriveMinSizeGB = 50
 
+# The name offered on the Enter key.
+$DevDriveDefaultLabel = "DevDrive"
+
+# This script's own cap, at the long-standing NTFS label length: Microsoft documents none for
+# Format-Volume -NewFileSystemLabel, so there is nothing to cite and nothing to read off a volume.
+$DevDriveLabelMaxLength = 32
+
 # Head-room kept on the volume hosting a fixed size .vhdx, so it is never filled to the last byte.
 $VhdxHostSpareBytes = 1GB
 
@@ -2017,6 +2144,9 @@ if ($mode -eq "FreeSpace") {
     $VhdxAutoAttach = Request-AutoAttachChoice
 }
 
+# Asked here rather than in each mode: the name is the same question whatever created the volume.
+$DevDriveLabel = Request-DevDriveLabel -Default $DevDriveDefaultLabel -MaxLength $DevDriveLabelMaxLength
+
 # Ask about BitLocker encryption
 $enableBitLocker = Request-BitLockerChoice -VhdxMode:($mode -eq "Vhdx")
 $SkipBitLocker = -not $enableBitLocker
@@ -2107,6 +2237,8 @@ if ($mode -eq "Vhdx") {
 } else {
     Write-Host "* Create $SizeGB GB Dev Drive on Disk $DiskNumber ($selectedDiskName) using ReFS" -ForegroundColor White
 }
+
+Write-Host "* Name the Dev Drive $DevDriveLabel" -ForegroundColor White
 
 if (-not $SkipBitLocker) {
     Write-Host "* Enable BitLocker encryption for the Dev Drive" -ForegroundColor White
@@ -2256,8 +2388,14 @@ try {
     $devLetter = $newPart.DriveLetter
     $devLetterColon = "$devLetter`:"
     Write-Host "Formatting the newly created partition drive $devLetterColon to a Dev Drive" -ForegroundColor Green
-    Format-Volume -DriveLetter $devLetter -FileSystem ReFS -DevDrive -NewFileSystemLabel "DevDrive" -Confirm:$false -Force -ErrorAction Stop
-    Write-Host "Dev Drive created at $devLetterColon" -ForegroundColor Green
+    Format-Volume -DriveLetter $devLetter -FileSystem ReFS -DevDrive -NewFileSystemLabel $DevDriveLabel -Confirm:$false -Force -ErrorAction Stop
+    # The name is asked of the volume: a label the file system altered would otherwise go unseen.
+    $actualLabel = Get-VolumeLabel -DriveLetter $devLetter
+    $labelReport = Resolve-DevDriveLabelReport -DriveLetter $devLetter -Requested $DevDriveLabel -Actual $actualLabel
+    $labelColour = if ($labelReport.Matches) { 'Green' } else { 'Yellow' }
+    foreach ($line in $labelReport.Lines) {
+        Write-Host $line -ForegroundColor $labelColour
+    }
 
     Write-Host "Marking Dev Drive $devLetterColon as trusted for Defender performance" -ForegroundColor Green
     # /f: the designation lands through a dismount, which fsutil skips on a volume in use.
