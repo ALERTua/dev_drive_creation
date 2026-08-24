@@ -950,6 +950,36 @@ Describe 'Resolve-DevDriveLabelReport' {
         (Resolve-DevDriveLabelReport -DriveLetter 'X' -Requested 'devdrive' -Actual 'DevDrive').Matches |
             Should -BeFalse
     }
+
+    It 'hands back a rename command that parses, for <Description>' -TestCases @(
+        @{ Description = 'an ordinary name'; Name = 'Projects' }
+        @{ Description = 'a name with an apostrophe'; Name = "Bob's Drive" }
+        @{ Description = 'a name that is nothing but apostrophes'; Name = "'''" }
+        @{ Description = 'a name with spaces and brackets'; Name = 'Dev Drive (2)' }
+    ) {
+        # The line is printed to be copied and run, so it has to be valid PowerShell. A name may
+        # legally carry an apostrophe, which ends the quoted string it is embedded in.
+        $lines = (Resolve-DevDriveLabelReport -DriveLetter 'X' -Requested $Name -Actual 'Something else').Lines
+        $command = ($lines | Where-Object { $_ -match '^Set the name with: ' }) -replace '^Set the name with: ', ''
+        $errors = $null
+        [System.Management.Automation.Language.Parser]::ParseInput($command, [ref]$null, [ref]$errors) | Out-Null
+        $errors | Should -BeNullOrEmpty
+    }
+
+    It 'passes the name itself to Set-Volume, not the doubling that quoted it' {
+        # Doubled apostrophes are the escape, so PowerShell hands the cmdlet the original name back.
+        $lines = (Resolve-DevDriveLabelReport -DriveLetter 'X' -Requested "Bob's Drive" -Actual 'DevDrive').Lines
+        $command = ($lines | Where-Object { $_ -match '^Set the name with: ' }) -replace '^Set the name with: ', ''
+        $ast = [System.Management.Automation.Language.Parser]::ParseInput($command, [ref]$null, [ref]$null)
+        $literal = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.StringConstantExpressionAst] }, $true) |
+            Where-Object { $_.StringConstantType -eq 'SingleQuoted' }
+        $literal.Value | Should -Be "Bob's Drive"
+    }
+
+    It 'still says the name the user asked for in plain words, undoubled' {
+        ((Resolve-DevDriveLabelReport -DriveLetter 'X' -Requested "Bob's Drive" -Actual 'DevDrive').Lines[0]) |
+            Should -Match "rather than Bob's Drive\."
+    }
 }
 
 Describe 'Get-VhdxAlignedSize' {
