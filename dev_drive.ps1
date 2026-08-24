@@ -587,6 +587,46 @@ function Resolve-BitLockerUnlockAction {
     }
 }
 
+function Resolve-DevDriveTrustReport {
+    <#
+        What to say after marking a volume trusted. The exit code answers whether the command ran;
+        only the volume's own answer says whether it ended up trusted. fsutil answers in the
+        machine's language, so an answer this script cannot read is shown, not judged.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$MountPoint,
+        [Parameter(Mandatory)][int]$TrustExitCode,
+        [AllowNull()][AllowEmptyString()][string]$QueryOutput
+    )
+
+    if ($TrustExitCode -eq 0 -and $QueryOutput -match '(?im)^\s*This is a trusted developer volume') {
+        return [PSCustomObject]@{
+            Outcome = 'Trusted'
+            Lines   = @("Dev Drive $MountPoint reports itself trusted, which is the signal for Microsoft Defender to run in performance mode.")
+        }
+    }
+
+    $said = @($QueryOutput -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+
+    if ($TrustExitCode -eq 0) {
+        $lines = @("Marked $MountPoint as trusted. fsutil devdrv query $MountPoint answers in this machine's language:")
+        $lines += if ($said.Count -gt 0) { $said | ForEach-Object { "  $($_.Trim())" } } else { "  (nothing)" }
+        $lines += "It should say the volume is trusted."
+        return [PSCustomObject]@{ Outcome = 'Unconfirmed'; Lines = $lines }
+    }
+
+    $lines = @("Could not mark $MountPoint as trusted (fsutil exited with code $TrustExitCode).")
+    if ($said.Count -gt 0) {
+        $lines += "fsutil devdrv query $MountPoint said:"
+        $lines += $said | ForEach-Object { "  $($_.Trim())" }
+    } else {
+        $lines += "fsutil devdrv query $MountPoint said nothing."
+    }
+    $lines += "The Dev Drive will still work, but without the Defender performance mode trust enables."
+    $lines += "Retry by hand with: fsutil devdrv trust /f $MountPoint"
+    return [PSCustomObject]@{ Outcome = 'Failed'; Lines = $lines }
+}
+
 function Test-RecoveryKeyAcknowledged {
     <# Only the acknowledgement word, in any case and with spaces trimmed, lets the run go on. #>
     param(
@@ -1906,16 +1946,16 @@ try {
     Write-Host "Marking Dev Drive $devLetterColon as trusted for Defender performance" -ForegroundColor Green
     # /f: the designation lands through a dismount, which fsutil skips on a volume in use.
     fsutil devdrv trust /f "$devLetterColon" | Out-Null
-    if ($LASTEXITCODE -eq 0) {
-        Write-Host "Dev Drive marked trusted." -ForegroundColor Green
-    } else {
-        # fsutil is a native tool: a failure here does not throw, so it must be read from
-        # $LASTEXITCODE instead of the surrounding try/catch. The drive is still a fully
-        # working Dev Drive; it only loses the Defender performance mode that trust grants.
-        Write-Host "Could not mark $devLetterColon as trusted (fsutil exited with code $LASTEXITCODE)." -ForegroundColor Yellow
-        Write-Host "The Dev Drive will still work, but without the Defender performance mode trust enables." -ForegroundColor Yellow
-        Write-Host "Check the current state with: fsutil devdrv query $devLetterColon" -ForegroundColor Yellow
-        Write-Host "Retry by hand with: fsutil devdrv trust /f $devLetterColon" -ForegroundColor Yellow
+    # fsutil does not throw, so take its exit code before the query overwrites $LASTEXITCODE.
+    $trustExitCode = $LASTEXITCODE
+    # Cast each record to a string first: on Windows PowerShell a redirected stderr line is an
+    # ErrorRecord, and Out-String would render it as a whole error display instead of its text.
+    $trustQuery = (fsutil devdrv query "$devLetterColon" 2>&1 | ForEach-Object { "$_" } | Out-String)
+    $trustReport = Resolve-DevDriveTrustReport -MountPoint $devLetterColon -TrustExitCode $trustExitCode -QueryOutput $trustQuery
+    # Grey, not yellow, for an answer that could not be read: on a localized Windows that is every run.
+    $trustColour = switch ($trustReport.Outcome) { 'Trusted' { 'Green' } 'Unconfirmed' { 'Gray' } default { 'Yellow' } }
+    foreach ($line in $trustReport.Lines) {
+        Write-Host $line -ForegroundColor $trustColour
     }
 
 
