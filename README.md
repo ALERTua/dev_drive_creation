@@ -12,7 +12,7 @@ This script automates work you are expected to be able to do by hand: it assumes
 - **Smart Drive Selection**: Shows detailed drive information for informed choices
 - **Optional BitLocker**: Encryption that fits the machine, with the recovery key shown before the run goes on and a rejected password asked for again
 - **Advanced Deduplication**: Configure deduplication with optional compression
-- **Compression Options**: Choose LZ4 or ZSTD with customizable compression levels
+- **Compression Options**: Choose LZ4 or ZSTD, each with the levels that format really has, or leave the level to Windows
 - **Real Size Limits**: Shows actual Windows shrinkable limits, not estimates
 - **Power-Aware Scheduling**: Deduplication jobs run only on AC power to preserve battery
 - **Smart Defaults**: Press Enter for maximum partition sizes, sensible defaults throughout
@@ -42,7 +42,7 @@ This script runs in interactive mode and will guide you through the entire Dev D
 3. **Size Configuration**: Enter Dev Drive size (minimum 50 GB; in free-space mode press Enter for the maximum)
 4. **BitLocker Setup**: Optional encryption, with the recovery key shown and acknowledged
 5. **Deduplication Options**: Choose deduplication level and compression settings
-6. **Compression Configuration**: Select format (LZ4/ZSTD) and level (1-9 for ZSTD)
+6. **Compression Configuration**: Select format (LZ4/ZSTD) and level (LZ4: 1 or 3-12; ZSTD: 1-22; Enter leaves it to Windows)
 7. **Deduplication Schedule**: Keep the suggested times, or set them yourself
 
 In virtual hard disk mode, step 2 is skipped; instead you are asked for the file path, the disk type, the size and whether to mount the file automatically on startup. There is no press-Enter-for-maximum there, and the size has a 50 GB floor. See [Virtual hard disk mode](#virtual-hard-disk-mode).
@@ -119,17 +119,17 @@ Enter your choice (1, 2 or 3): 2
 
 Choose compression format:                                                                                   
 1. LZ4: Fast compression with good balance of speed and compression ratio
-2. ZSTD: Better compression ratio but uses more CPU (allows custom compression level)
+2. ZSTD: Better compression ratio but uses more CPU
 
 Enter your choice (1 or 2): 2
 
-Choose ZSTD compression level (1-9):                                                                         
-Lower levels (1-3): Faster compression, less CPU usage
-Medium levels (4-6): Balanced speed and compression
-Higher levels (7-9): Better compression, more CPU usage
+Choose the ZSTD compression level:                                                                           
+ZSTD accepts levels 1 to 22.
+Higher levels compress smaller and slower, and levels 20 and above can need noticeably more memory.
+Decompression is the same speed whichever level you pick.
 
-Enter compression level (1-9): 2
-Selected ZSTD compression with level 2
+Enter a level, or press Enter for the level Windows picks: 2
+Selected ZSTD compression, level 2
 
 
 ===============================================================================
@@ -215,7 +215,7 @@ E           DevDrive     ReFS           Fixed     Healthy      OK               
 5. **Storage Optimization Setup**
    - Choose deduplication level (none, deduplication-only, or with compression)
    - Select compression format (LZ4 for speed, ZSTD for better compression)
-   - Configure compression level (1-9 for ZSTD, affects CPU usage)
+   - Configure the compression level, or press Enter to leave it to Windows: LZ4 takes 1, or 3 to 12 where 3 and above use LZ4HC; ZSTD takes 1 to 22. The defaults are Microsoft's own and documented as subject to change, so an empty answer passes no level at all
    - Keep the suggested schedule, or set three fields yourself: the daily start times (comma separated, 24-hour HH:MM, up to four), the weekly maintenance day, and its start time
    - Each of the three takes Enter to keep the value shown; choosing your own times gets the result repeated back, taking the defaults does not
    - The daily job's days, its two-hour limit, its 60% CPU share and its AC-power condition are fixed and are not asked about
