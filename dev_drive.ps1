@@ -697,25 +697,41 @@ function Request-BitLockerFailureChoice {
 }
 
 function Request-DeduplicationChoice {
-    Write-Host "`nDo you want to enable ReFS deduplication for the Dev Drive?" -ForegroundColor Cyan
-    Write-Host "Deduplication saves disk space by eliminating duplicate data." -ForegroundColor White
-    Write-Host "1. Yes, enable deduplication only (recommended for most users)" -ForegroundColor White
-    Write-Host "2. Yes, enable deduplication + compression (configure compression settings)" -ForegroundColor White
-    Write-Host "3. No, skip deduplication (maximum performance, less space savings)" -ForegroundColor White
+    Write-Host "`nWhat should Windows do with the data on the Dev Drive?" -ForegroundColor Cyan
+    Write-Host "Deduplication finds and removes duplicate data. Compression makes what is left smaller." -ForegroundColor White
+    Write-Host "1. Deduplicate only (recommended for most users)" -ForegroundColor White
+    Write-Host "2. Deduplicate and compress (saves the most space)" -ForegroundColor White
+    Write-Host "3. Compress only, without looking for duplicates" -ForegroundColor White
+    Write-Host "4. Neither (maximum performance, less space saved)" -ForegroundColor White
     Write-Host ""
 
+    $answers = @{ '1' = 'Dedup'; '2' = 'DedupAndCompress'; '3' = 'Compress'; '4' = 'None' }
     while ($true) {
-        $choice = Read-Host "Enter your choice (1, 2 or 3)"
-        if ($choice -eq "1") {
-            return "Dedup"
-        } elseif ($choice -eq "2") {
-            return "DedupAndCompress"
-        } elseif ($choice -eq "3") {
-            return "None"
-        } else {
-            Write-Host "Invalid choice. Please enter 1, 2 or 3." -ForegroundColor Red
+        $choice = Read-Host "Enter your choice (1, 2, 3 or 4)"
+        if ($answers.ContainsKey([string]$choice)) {
+            return $answers[[string]$choice]
         }
+        Write-Host "Invalid choice. Please enter 1, 2, 3 or 4." -ForegroundColor Red
     }
+}
+
+function Format-DedupModeChoice {
+    <# Names what a mode does, and the compression only where there is any. #>
+    param(
+        [Parameter(Mandatory)][ValidateSet('Dedup', 'DedupAndCompress', 'Compress')][string]$Mode,
+        [AllowNull()][AllowEmptyString()][string]$Format,
+        [Nullable[int]]$Level
+    )
+
+    if ($Mode -eq 'Dedup') {
+        return "deduplication only, without compression"
+    }
+
+    $compression = Format-CompressionChoice -Format $Format -Level $Level
+    if ($Mode -eq 'Compress') {
+        return "$compression, without deduplication"
+    }
+    return "deduplication and $compression"
 }
 
 function Request-CompressionFormat {
@@ -1821,18 +1837,14 @@ if ($enableBitLocker) {
 $dedupChoice = Request-DeduplicationChoice
 if ($dedupChoice -eq "None") {
     $SkipDeduplication = $true
-} elseif ($dedupChoice -eq "DedupAndCompress") {
-    $DedupMode = $dedupChoice
-
-    # Ask for compression format
-    $CompressionFormat = Request-CompressionFormat
-
-    # Both formats have levels, and both accept being left to Windows.
-    $CompressionLevel = Request-CompressionLevel -Format $CompressionFormat
-    Write-Host "Selected $(Format-CompressionChoice -Format $CompressionFormat -Level $CompressionLevel)" -ForegroundColor Green
 } else {
     $DedupMode = $dedupChoice
-    Write-Host "Selected deduplication only (no compression)" -ForegroundColor Green
+    if ($DedupMode -ne 'Dedup') {
+        $CompressionFormat = Request-CompressionFormat
+        # Both formats have levels, and both accept being left to Windows.
+        $CompressionLevel = Request-CompressionLevel -Format $CompressionFormat
+    }
+    Write-Host "Selected $(Format-DedupModeChoice -Mode $DedupMode -Format $CompressionFormat -Level $CompressionLevel)" -ForegroundColor Green
 }
 
 # Ask when the deduplication jobs should run
@@ -1881,11 +1893,7 @@ if (-not $SkipBitLocker) {
 }
 
 if (-not $SkipDeduplication) {
-    if ($DedupMode -eq "DedupAndCompress") {
-        Write-Host "* Enable ReFS deduplication with $(Format-CompressionChoice -Format $CompressionFormat -Level $CompressionLevel)" -ForegroundColor White
-    } else {
-        Write-Host "* Enable ReFS deduplication only (no compression)" -ForegroundColor White
-    }
+    Write-Host "* Enable ReFS $(Format-DedupModeChoice -Mode $DedupMode -Format $CompressionFormat -Level $CompressionLevel)" -ForegroundColor White
     foreach ($line in (Format-DedupScheduleSummary -DailyTimes $DedupStartTimes -DailyDaysLabel $DedupDailyDaysLabel `
                 -WeeklyDay $ScrubDays -WeeklyStart $ScrubStart -WeeksInterval $ScrubWeeksInterval)) {
         Write-Host "* $($line.Trim())" -ForegroundColor White
@@ -2243,11 +2251,11 @@ try {
             $scheduleParams = $baseScheduleParams.Clone()
             $scheduleParams.Start = $time
 
-            Write-Host "Scheduling deduplication job at $time (${DedupDailyDurationHours}h)" -ForegroundColor Green
+            Write-Host "Scheduling the daily job at $time (${DedupDailyDurationHours}h)" -ForegroundColor Green
             Set-ReFSDedupSchedule @scheduleParams -ErrorAction Stop
         }
 
-        Write-Host "Scheduled daily dedup jobs" -ForegroundColor Green
+        Write-Host "Scheduled the daily jobs" -ForegroundColor Green
 
         Write-Host "Scheduling deduplication scrub jobs" -ForegroundColor Green
         Set-ReFSDedupScrubSchedule -Volume "$devLetterColon" -Days $ScrubDays -Start $ScrubStart -WeeksInterval $ScrubWeeksInterval -ErrorAction Stop
@@ -2311,15 +2319,14 @@ try {
                 }
             }
 
-            Write-Host "Running initial Deduplication Job for $devLetterColon" -ForegroundColor Green
+            Write-Host "Running the initial ReFS job for $devLetterColon" -ForegroundColor Green
 
             if ($DedupMode -eq 'Dedup') {
                 Start-ReFSDedupJob @jobParams -FullRun -ErrorAction Stop | Out-Null
-                Write-Host "Triggered initial dedup job (deduplication only)" -ForegroundColor Green
             } else {
                 Start-ReFSDedupJob @jobParams -ErrorAction Stop | Out-Null
-                Write-Host "Triggered initial dedup job with $(Format-CompressionChoice -Format $CompressionFormat -Level $CompressionLevel)" -ForegroundColor Green
             }
+            Write-Host "Triggered the initial job: $(Format-DedupModeChoice -Mode $DedupMode -Format $CompressionFormat -Level $CompressionLevel)" -ForegroundColor Green
             Write-Host "You should wait for it to complete for the deduplication to properly work" -ForegroundColor Yellow
         }
     } else {

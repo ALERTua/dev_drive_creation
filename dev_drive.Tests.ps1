@@ -161,12 +161,18 @@ Describe 'The script itself' {
             Should -BeNullOrEmpty
     }
 
-    It 'builds every compression message through the one helper that knows about levels' {
+    It 'builds every message about the mode through the one helper that knows the modes' {
         $content = Get-Content -Path $script:ScriptPath -Raw
-        ([regex]::Matches($content, 'Format-CompressionChoice -Format \$CompressionFormat -Level \$CompressionLevel')).Count |
+        ([regex]::Matches($content, 'Format-DedupModeChoice -Mode \$DedupMode -Format \$CompressionFormat -Level \$CompressionLevel')).Count |
             Should -Be 3
         Select-String -Path $script:ScriptPath -Pattern 'Write-Host "[^"]*(?<!-Level )\$CompressionLevel' |
             Should -BeNullOrEmpty
+    }
+
+    It 'reaches the compression wording only through the mode helper' {
+        # One call, inside Format-DedupModeChoice: no message may name a format without its mode.
+        ([regex]::Matches((Get-Content -Path $script:ScriptPath -Raw), 'Format-CompressionChoice -Format')).Count |
+            Should -Be 1
     }
 
     It 'asks for the level whatever the format, not only for ZSTD' {
@@ -1500,6 +1506,63 @@ Describe 'Resolve-DedupDayInput' {
             (Resolve-DedupDayInput -Answer 'someday' -CurrentDay 'Monday' -AllowEmpty).Rejection |
                 Should -Be 'InvalidDay'
         }
+    }
+}
+
+Describe 'Request-DeduplicationChoice' {
+    BeforeEach {
+        Mock Write-Host {}
+    }
+
+    It 'returns <Expected> for answer <Answer>' -TestCases @(
+        @{ Answer = '1'; Expected = 'Dedup' }
+        @{ Answer = '2'; Expected = 'DedupAndCompress' }
+        @{ Answer = '3'; Expected = 'Compress' }
+        @{ Answer = '4'; Expected = 'None' }
+    ) {
+        Mock Read-Host { $Answer }
+        Request-DeduplicationChoice | Should -Be $Expected
+    }
+
+    It 'offers compression without deduplication, the third mode the cmdlet accepts' {
+        Mock Read-Host { '1' }
+        Request-DeduplicationChoice | Out-Null
+        Should -Invoke Write-Host -ParameterFilter { $Object -match 'Compress only, without looking for duplicates' }
+    }
+
+    It 'keeps asking until the answer is one of the four' {
+        $script:answers = @('0', '5', 'yes', '3')
+        $script:index = 0
+        Mock Read-Host { $script:answers[$script:index++] }
+        Request-DeduplicationChoice | Should -Be 'Compress'
+        $script:index | Should -Be 4
+    }
+}
+
+Describe 'Format-DedupModeChoice' {
+    It 'says what each mode does, and names compression only where there is some' -TestCases @(
+        @{ Mode = 'Dedup'; Format = $null; Level = $null; Expected = 'deduplication only, without compression' }
+        @{ Mode = 'DedupAndCompress'; Format = 'ZSTD'; Level = 7; Expected = 'deduplication and ZSTD compression, level 7' }
+        @{ Mode = 'DedupAndCompress'; Format = 'LZ4'; Level = $null; Expected = 'deduplication and LZ4 compression' }
+        @{ Mode = 'Compress'; Format = 'LZ4'; Level = 12; Expected = 'LZ4 compression, level 12, without deduplication' }
+        @{ Mode = 'Compress'; Format = 'ZSTD'; Level = $null; Expected = 'ZSTD compression, without deduplication' }
+    ) {
+        Format-DedupModeChoice -Mode $Mode -Format $Format -Level $Level | Should -Be $Expected
+    }
+
+    It 'never claims deduplication for the mode that does none' {
+        $text = Format-DedupModeChoice -Mode 'Compress' -Format 'ZSTD' -Level 3
+        $text | Should -Match 'without deduplication'
+        $text | Should -Not -Match 'deduplication and'
+    }
+
+    It 'ignores the format entirely when the mode does not compress' {
+        Format-DedupModeChoice -Mode 'Dedup' -Format 'ZSTD' -Level 9 |
+            Should -Be 'deduplication only, without compression'
+    }
+
+    It 'refuses a mode it does not know' {
+        { Format-DedupModeChoice -Mode 'Disabled' -Format 'LZ4' -Level 1 } | Should -Throw
     }
 }
 
