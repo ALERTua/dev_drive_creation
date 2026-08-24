@@ -261,6 +261,28 @@ Describe 'The script itself' {
         Select-String -Path $script:ScriptPath -Pattern 'try again' | Should -BeNullOrEmpty
     }
 
+    It 'catches a failed automatic unlock before it calls the BitLocker setup a success' {
+        # A failure reaching the shared catch reads as the encryption collapsing, and offers a retry.
+        $content = Get-Content -Path $script:ScriptPath -Raw
+        $enableAt = $content.IndexOf('Enable-BitLockerAutoUnlock -MountPoint $devLetterColon -ErrorAction Stop')
+        $catchAt = $content.IndexOf("`$autoUnlockOutcome = 'Failed'")
+        $reportAt = $content.IndexOf('Resolve-BitLockerAutoUnlockReport -MountPoint $devLetterColon')
+        $successAt = $content.IndexOf('$bitLockerSuccess = $true')
+        $enableAt | Should -BeGreaterThan 0
+        $catchAt | Should -BeGreaterThan $enableAt
+        $reportAt | Should -BeGreaterThan $catchAt
+        $successAt | Should -BeGreaterThan $reportAt
+    }
+
+    It 'reads the protection state off the volume before it reports on automatic unlocking' {
+        # The auto-unlock lines are last on purpose, and they lean on that read rather than restating it.
+        $content = Get-Content -Path $script:ScriptPath -Raw
+        $finalStateAt = $content.IndexOf('$finalState = Get-BitLockerProtectionState -MountPoint $devLetterColon')
+        $reportAt = $content.IndexOf('Resolve-BitLockerAutoUnlockReport -MountPoint $devLetterColon')
+        $finalStateAt | Should -BeGreaterThan 0
+        $reportAt | Should -BeGreaterThan $finalStateAt
+    }
+
     It 'checks the target against the size Windows itself reports as the minimum, before it resizes' {
         $content = Get-Content -Path $script:ScriptPath -Raw
         $minBoundAt = $content.IndexOf('$minSize = $supportedSizes.SizeMin')
@@ -861,6 +883,43 @@ Describe 'Resolve-BitLockerFailure' {
         { Resolve-BitLockerFailure -Message '' -RetryCount 1 -MaxRetries 10 } | Should -Not -Throw
         (Resolve-BitLockerFailure -Message '' -RetryCount 1 -MaxRetries 10).Kind | Should -Be 'Other'
     }
+
+    It 'refuses a retry when group policy is what said no' {
+        # 0x8031005E is "group policy will not allow this", and a second attempt meets it again.
+        $verdict = Resolve-BitLockerFailure -Message 'Die Gruppenrichtlinien lassen das nicht zu. (0x8031005E)' `
+            -RetryCount 1 -MaxRetries 10
+        $verdict.Kind | Should -Be 'Other'
+        $verdict.Exhausted | Should -BeFalse
+        $verdict.CanRetry | Should -BeFalse
+        ($verdict.Lines -join "`n") | Should -Match 'same refusal'
+    }
+
+    It 'recognises the policy refusal by its code, not by an English sentence' {
+        # BitLocker takes its messages from a resource, so the words around the code are localized.
+        (Resolve-BitLockerFailure -Message 'anything at all (0x8031005e)' -RetryCount 1 -MaxRetries 10).CanRetry |
+            Should -BeFalse
+    }
+
+    It 'sorts a policy refusal as one even on a run that asks for a password' {
+        # The password branch answers first, so a refusal wording that also mentions a password
+        # would otherwise be retried into the same refusal.
+        $verdict = Resolve-BitLockerFailure -Message 'password complexity (0x8031005E)' `
+            -RetryCount 1 -MaxRetries 10 -PasswordAsked
+        $verdict.Kind | Should -Be 'Other'
+        $verdict.CanRetry | Should -BeFalse
+    }
+
+    It 'still counts the attempts when policy refused on the last one' {
+        $verdict = Resolve-BitLockerFailure -Message 'refused (0x8031005E)' -RetryCount 10 -MaxRetries 10
+        $verdict.Exhausted | Should -BeTrue
+        $verdict.CanRetry | Should -BeFalse
+    }
+
+    It 'still allows a retry for a failure policy had nothing to do with' {
+        $verdict = Resolve-BitLockerFailure -Message 'Encryption failed. (0x80090034)' -RetryCount 1 -MaxRetries 10
+        $verdict.CanRetry | Should -BeTrue
+        ($verdict.Lines -join "`n") | Should -Not -Match 'same refusal'
+    }
 }
 
 Describe 'Resolve-BitLockerRecoveryProtector' {
@@ -1106,6 +1165,17 @@ Describe 'Resolve-BitLockerAbandonedAdvice' {
         $lines | Should -Match 'Get-BitLockerVolume -MountPoint X:'
     }
 
+    It 'says an abandoned encrypted drive needs unlocking by hand after every restart' {
+        # This advice is reached before the automatic-unlock step, so that step never ran.
+        (Resolve-BitLockerAbandonedAdvice -MountPoint 'X:' -VolumeState 'Encrypted') -join "`n" |
+            Should -Match 'drive X: has to be unlocked by hand after every restart'
+    }
+
+    It 'does not raise unlocking on a drive that was never encrypted' {
+        (Resolve-BitLockerAbandonedAdvice -MountPoint 'X:' -VolumeState 'Clear') -join "`n" |
+            Should -Not -Match 'unlocked by hand'
+    }
+
     It 'refuses to call an unreadable volume unencrypted' {
         $lines = (Resolve-BitLockerAbandonedAdvice -MountPoint 'X:' -VolumeState 'Unknown') -join "`n"
         $lines | Should -Match 'could not be read'
@@ -1168,6 +1238,112 @@ Describe 'Resolve-BitLockerUnlockAction' {
         $action.Action | Should -Be 'Explain'
         $action.DeferAutoUnlock | Should -BeTrue
         ($action.Lines -join "`n") | Should -Match 'manage-bde -unlock X:'
+    }
+}
+
+Describe 'Get-BitLockerAutoUnlockState' {
+    It 'reports what the volume answers' {
+        Mock Get-BitLockerVolume { [PSCustomObject]@{ AutoUnlockEnabled = $true } }
+        Get-BitLockerAutoUnlockState -MountPoint 'X:' | Should -Be 'Enabled'
+    }
+
+    It 'passes a volume that does not unlock itself through as disabled' {
+        Mock Get-BitLockerVolume { [PSCustomObject]@{ AutoUnlockEnabled = $false } }
+        Get-BitLockerAutoUnlockState -MountPoint 'X:' | Should -Be 'Disabled'
+    }
+
+    It 'says it could not tell rather than answering for the volume' {
+        # "Unknown" and "Disabled" are different facts, and only the volume may say which it is.
+        Mock Get-BitLockerVolume { throw 'BitLocker is not available on this machine.' }
+        Get-BitLockerAutoUnlockState -MountPoint 'X:' | Should -Be 'Unknown'
+    }
+}
+
+Describe 'Resolve-BitLockerAutoUnlockReport' {
+    It 'credits the volume, not the call, for a working automatic unlock' {
+        (Resolve-BitLockerAutoUnlockReport -MountPoint 'X:' -Outcome 'Enabled') -join "`n" |
+            Should -Match 'the volume confirms it'
+    }
+
+    It 'reports a failed automatic unlock without calling the BitLocker setup failed' {
+        $lines = (Resolve-BitLockerAutoUnlockReport -MountPoint 'X:' -Outcome 'Failed' `
+                -Message 'Die Gruppenrichtlinien lassen das nicht zu. (0x8031005E)') -join "`n"
+        $lines | Should -Match 'Automatic unlocking could not be set up'
+        $lines | Should -Not -Match 'did not finish'
+    }
+
+    It 'claims nothing about the encryption, which only the volume can be asked about' {
+        # The line printed just above this one reads the protection state off the volume; asserting
+        # it here from an outcome name would contradict that read whenever it came back negative.
+        $lines = (Resolve-BitLockerAutoUnlockReport -MountPoint 'X:' -Outcome 'Failed' -Message 'x') -join "`n"
+        $lines | Should -Not -Match 'encrypted'
+        $lines | Should -Not -Match 'protected'
+    }
+
+    It 'repeats the reason in the words Windows used for it' {
+        # The run this came from was a German machine: only the message itself carries the reason.
+        $lines = (Resolve-BitLockerAutoUnlockReport -MountPoint 'X:' -Outcome 'Failed' `
+                -Message 'Die Gruppenrichtlinien lassen das nicht zu. (0x8031005E)') -join "`n"
+        $lines | Should -Match '0x8031005E'
+        $lines | Should -Match 'Gruppenrichtlinien'
+    }
+
+    It 'blames no cause it did not establish' {
+        # Every failure arrives as one outcome, so a standing refusal must not be asserted for what
+        # may have been a one-off.
+        (Resolve-BitLockerAutoUnlockReport -MountPoint 'X:' -Outcome 'Failed' -Message 'x') -join "`n" |
+            Should -Not -Match 'policy|never allow|ever allows'
+    }
+
+    It 'does not throw when Windows said nothing it could quote' {
+        { Resolve-BitLockerAutoUnlockReport -MountPoint 'X:' -Outcome 'Failed' -Message '' } | Should -Not -Throw
+    }
+
+    It 'names the manual unlock after every restart on <Outcome>, in one wording' -TestCases @(
+        @{ Outcome = 'Failed' }
+        @{ Outcome = 'Unconfirmed' }
+        @{ Outcome = 'Deferred' }
+        @{ Outcome = 'NotOffered' }
+    ) {
+        # The consequence a person actually lives with, and the one the run never used to mention.
+        (Resolve-BitLockerAutoUnlockReport -MountPoint 'X:' -Outcome $Outcome -Message 'x') -join "`n" |
+            Should -Match 'drive X: has to be unlocked by hand after every restart'
+    }
+
+    It 'does not warn about unlocking by hand when nothing has to be' {
+        (Resolve-BitLockerAutoUnlockReport -MountPoint 'X:' -Outcome 'Enabled') -join "`n" |
+            Should -Not -Match 'by hand'
+    }
+
+    It 'points a deferred setup at the command that finishes it' {
+        (Resolve-BitLockerAutoUnlockReport -MountPoint 'X:' -Outcome 'Deferred') -join "`n" |
+            Should -Match 'Enable-BitLockerAutoUnlock -MountPoint X:'
+    }
+
+    It 'sends an unconfirmed setup to the volume for the answer' {
+        (Resolve-BitLockerAutoUnlockReport -MountPoint 'X:' -Outcome 'Unconfirmed') -join "`n" |
+            Should -Match 'AutoUnlockEnabled'
+    }
+
+    It 'gives the reason automatic unlocking was never offered, not a claim about the machine' {
+        # It is the operating system drive being unprotected, which the person can change.
+        (Resolve-BitLockerAutoUnlockReport -MountPoint 'X:' -Outcome 'NotOffered') -join "`n" |
+            Should -Match 'operating system drive is not BitLocker-protected'
+    }
+
+    It 'has wording for every outcome it accepts' {
+        # The switch and the ValidateSet are two lists that would otherwise drift apart in silence.
+        $set = (Get-Command Resolve-BitLockerAutoUnlockReport).Parameters['Outcome'].Attributes |
+            Where-Object { $_ -is [System.Management.Automation.ValidateSetAttribute] }
+        @($set.ValidValues).Count | Should -Be 5
+        foreach ($outcome in $set.ValidValues) {
+            @(Resolve-BitLockerAutoUnlockReport -MountPoint 'X:' -Outcome $outcome -Message 'x').Count |
+                Should -BeGreaterThan 0
+        }
+    }
+
+    It 'refuses an outcome that is not one of the five' {
+        { Resolve-BitLockerAutoUnlockReport -MountPoint 'X:' -Outcome 'Whatever' } | Should -Throw
     }
 }
 

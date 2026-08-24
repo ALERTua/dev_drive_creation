@@ -387,6 +387,20 @@ function Get-BitLockerProtectionState {
     }
 }
 
+function Get-BitLockerAutoUnlockState {
+    <# Asks the volume whether automatic unlocking is really on; one that cannot answer says Unknown. #>
+    param([Parameter(Mandatory)][string]$MountPoint)
+
+    try {
+        $volume = Get-BitLockerVolume -MountPoint $MountPoint -ErrorAction Stop
+        if ($volume.AutoUnlockEnabled) { return 'Enabled' }
+        return 'Disabled'
+    }
+    catch {
+        return 'Unknown'
+    }
+}
+
 function Resolve-BitLockerSetupPlan {
     <# Decides which protectors this machine can carry, and the lines explaining why. #>
     param(
@@ -527,8 +541,14 @@ function Resolve-BitLockerFailure {
     $exhausted = $RetryCount -ge $MaxRetries
     $canRetry = -not $exhausted -and -not $Unretryable
 
+    # Matched by its code, not its wording: the sentence around it comes from a localized resource.
+    $policyRefusal = $Message -match '0x8031005E'
+    if ($policyRefusal) {
+        $canRetry = $false
+    }
+
     # Only a run that asks for a password can be failing on one, whatever the message mentions.
-    if ($PasswordAsked -and $Message -match "password.*(complexity|requirements|not.*meet)") {
+    if (-not $policyRefusal -and $PasswordAsked -and $Message -match "password.*(complexity|requirements|not.*meet)") {
         $lines = @("BitLocker rejected the password due to complexity requirements.")
         if ($canRetry) {
             $lines += "Please try a different password. Attempt $RetryCount of $MaxRetries."
@@ -539,6 +559,9 @@ function Resolve-BitLockerFailure {
     }
 
     $lines = @("BitLocker setup did not finish. Windows reported: $Message")
+    if ($policyRefusal) {
+        $lines += "Group policy on this machine refuses it, so trying again meets the same refusal."
+    }
     if ($VolumeState -eq 'Encrypted') {
         $lines += "The Dev Drive is created and formatted, and BitLocker has already started encrypting it."
     } elseif ($VolumeState -eq 'Clear') {
@@ -586,6 +609,56 @@ function Resolve-BitLockerUnlockAction {
             "Drive $MountPoint is locked and this run holds no password for it, so it cannot be unlocked here."
             "Unlock it by hand with: manage-bde -unlock $MountPoint -RecoveryPassword <the key above>"
         )
+    }
+}
+
+function Resolve-BitLockerAutoUnlockReport {
+    <#
+        What to say about automatic unlocking once the volume itself has been asked. Its absence is
+        a convenience lost, not a failed setup, and it costs a manual unlock after every restart.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$MountPoint,
+        [Parameter(Mandatory)][ValidateSet('Enabled', 'Failed', 'Unconfirmed', 'Deferred', 'NotOffered')][string]$Outcome,
+        [AllowNull()][AllowEmptyString()][string]$Message
+    )
+
+    # Built once: every outcome but success ends in the same consequence, worded the same way.
+    $byHand = "drive $MountPoint has to be unlocked by hand after every restart"
+    $command = "Enable-BitLockerAutoUnlock -MountPoint $MountPoint"
+
+    switch ($Outcome) {
+        'Enabled' {
+            return @("Drive $MountPoint unlocks automatically, and the volume confirms it.")
+        }
+        'Failed' {
+            # Says nothing about the encryption: the line above this one read that off the volume.
+            return @(
+                "Automatic unlocking could not be set up on drive $MountPoint."
+                "Windows reported: $Message"
+                "So $byHand."
+                "Set it up later, if this machine allows it, with: $command"
+            )
+        }
+        'Unconfirmed' {
+            return @(
+                "Automatic unlocking was set up on $MountPoint without an error, but the volume does not confirm it is on."
+                "Check it with: (Get-BitLockerVolume -MountPoint $MountPoint).AutoUnlockEnabled"
+                "Until that answers True, assume $byHand."
+            )
+        }
+        'Deferred' {
+            return @(
+                "Automatic unlocking needs the volume unlocked first, so set it up afterwards with: $command"
+                "Until then, $byHand."
+            )
+        }
+        'NotOffered' {
+            return @("The operating system drive is not BitLocker-protected, so automatic unlocking was skipped and $byHand.")
+        }
+        default {
+            throw "No wording for the automatic unlocking outcome '$Outcome'."
+        }
     }
 }
 
@@ -656,6 +729,8 @@ function Resolve-BitLockerAbandonedAdvice {
         return @(
             "Carrying on without finishing BitLocker. Drive $MountPoint is already encrypted."
             "Its recovery key is the only way back into it, so keep the key you wrote down. Read it again with: (Get-BitLockerVolume -MountPoint $MountPoint).KeyProtector"
+            # This path is reached before the automatic-unlock step, so it never ran.
+            "Automatic unlocking was never set up, so drive $MountPoint has to be unlocked by hand after every restart."
         )
     }
 
@@ -2266,11 +2341,23 @@ try {
                     Unlock-BitLocker -MountPoint $devLetterColon -Password $SecurePassword -ErrorAction Stop
                 }
 
-                if ($bitLockerPlan.UseAutoUnlock -and -not $unlockPlan.DeferAutoUnlock) {
+                # Its own try: the shared catch would read a failed auto-unlock as the whole setup collapsing.
+                $autoUnlockMessage = ''
+                if (-not $bitLockerPlan.UseAutoUnlock) {
+                    $autoUnlockOutcome = 'NotOffered'
+                } elseif ($unlockPlan.DeferAutoUnlock) {
+                    $autoUnlockOutcome = 'Deferred'
+                } else {
                     Write-Host "Enabling BitLockerAutoUnlock" -ForegroundColor Green
-                    Enable-BitLockerAutoUnlock -MountPoint $devLetterColon -ErrorAction Stop
-                } elseif ($bitLockerPlan.UseAutoUnlock) {
-                    Write-Host "Automatic unlocking needs the volume unlocked first, so set it up afterwards with: Enable-BitLockerAutoUnlock -MountPoint $devLetterColon" -ForegroundColor Yellow
+                    try {
+                        Enable-BitLockerAutoUnlock -MountPoint $devLetterColon -ErrorAction Stop
+                        # Asked of the volume, not taken from a cmdlet that returned without complaining.
+                        $autoUnlockOutcome = if ((Get-BitLockerAutoUnlockState -MountPoint $devLetterColon) -eq 'Enabled') { 'Enabled' } else { 'Unconfirmed' }
+                    }
+                    catch {
+                        $autoUnlockOutcome = 'Failed'
+                        $autoUnlockMessage = $_.Exception.Message
+                    }
                 }
 
                 $finalState = Get-BitLockerProtectionState -MountPoint $devLetterColon
@@ -2279,6 +2366,12 @@ try {
                 } else {
                     Write-Host "BitLocker setup finished, but $devLetterColon does not report itself as protected or encrypting." -ForegroundColor Yellow
                     Write-Host "Check it with: Get-BitLockerVolume -MountPoint $devLetterColon" -ForegroundColor Yellow
+                }
+
+                # Said last, because a drive that needs unlocking by hand is what a person has to remember.
+                $autoUnlockColour = if ($autoUnlockOutcome -eq 'Enabled') { 'Green' } else { 'Yellow' }
+                foreach ($line in (Resolve-BitLockerAutoUnlockReport -MountPoint $devLetterColon -Outcome $autoUnlockOutcome -Message $autoUnlockMessage)) {
+                    Write-Host $line -ForegroundColor $autoUnlockColour
                 }
                 $bitLockerSuccess = $true
             }

@@ -232,8 +232,10 @@ E           DevDrive     ReFS           Fixed     Healthy      OK               
    - The domain account protector is added only on a machine joined to an Active Directory domain
    - The recovery key goes to Azure AD only on a device joined to Entra ID
    - Automatic unlocking is set only when the operating system drive is BitLocker-protected
+   - The volume is then asked whether automatic unlocking really is on, rather than the call being taken at its word
+   - Where automatic unlocking cannot be set up, the encryption is finished all the same: the run gives the reason in the words Windows used, and says the drive will need unlocking by hand after every restart
    - What the machine can actually do is checked before the plan is shown, and listed in it
-   - A BitLocker failure offers a choice: retry, carry on without it, or stop
+   - A BitLocker failure offers a choice: retry, carry on without it, or stop - except a refusal by group policy, which is not offered a retry that would meet the same refusal
 
 5. **Storage Optimization Setup**
    - Choose what happens to the data: deduplicate only, deduplicate and compress, compress only, or neither
@@ -318,7 +320,7 @@ Reclaiming that space on the host means compacting the file, and there are repor
 - Requires a complex password (8+ chars, upper/lower/digit/special) where one is asked for
 - BitLocker recovery key printed for you to write down, and backed up to Azure AD on an Entra ID device
 - On a device outside Entra ID the key exists only on the volume and on your paper copy, so keep it
-- Auto-unlock enabled where Windows allows it, meaning the operating system drive is protected too
+- Auto-unlock enabled where Windows allows it, meaning the operating system drive is protected too; where it is not allowed, the drive has to be unlocked by hand after every restart
 - Without an Active Directory domain the drive is still encrypted and still has its recovery key
 - Drive marked as trusted for development workloads
 
