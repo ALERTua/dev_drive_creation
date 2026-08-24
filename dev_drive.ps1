@@ -590,8 +590,8 @@ function Resolve-BitLockerUnlockAction {
 function Resolve-DevDriveTrustReport {
     <#
         What to say after marking a volume trusted. The exit code answers whether the command ran;
-        only the volume's own answer says whether it ended up trusted. fsutil speaks the machine's
-        language, so an answer this script cannot read is reported as unread, never as a failure.
+        only the volume's own answer says whether it ended up trusted. fsutil answers in the
+        machine's language, so an answer this script cannot read is shown, not judged.
     #>
     param(
         [Parameter(Mandatory)][string]$MountPoint,
@@ -601,33 +601,30 @@ function Resolve-DevDriveTrustReport {
 
     if ($TrustExitCode -eq 0 -and $QueryOutput -match '(?im)^\s*This is a trusted developer volume') {
         return [PSCustomObject]@{
-            Trusted = $true
+            Outcome = 'Trusted'
             Lines   = @("Dev Drive $MountPoint reports itself trusted, which is the signal for Microsoft Defender to run in performance mode.")
         }
     }
 
-    if ($TrustExitCode -ne 0) {
-        $lines = @("Could not mark $MountPoint as trusted (fsutil exited with code $TrustExitCode).")
-    } else {
-        $lines = @("Marked $MountPoint as trusted, but could not read that back from the volume.")
+    $said = @($QueryOutput -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+
+    if ($TrustExitCode -eq 0) {
+        $lines = @("Marked $MountPoint as trusted. fsutil devdrv query $MountPoint answers in this machine's language:")
+        $lines += if ($said.Count -gt 0) { $said | ForEach-Object { "  $($_.Trim())" } } else { "  (nothing)" }
+        $lines += "It should say the volume is trusted."
+        return [PSCustomObject]@{ Outcome = 'Unconfirmed'; Lines = $lines }
     }
 
-    $said = @($QueryOutput -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    $lines = @("Could not mark $MountPoint as trusted (fsutil exited with code $TrustExitCode).")
     if ($said.Count -gt 0) {
         $lines += "fsutil devdrv query $MountPoint said:"
         $lines += $said | ForEach-Object { "  $($_.Trim())" }
     } else {
         $lines += "fsutil devdrv query $MountPoint said nothing."
     }
-
-    if ($TrustExitCode -eq 0) {
-        $lines += "If that answer says the volume is trusted, in whatever language, nothing is wrong."
-    } else {
-        $lines += "The Dev Drive will still work, but without the Defender performance mode trust enables."
-    }
-
-    $lines += "If it does not, retry by hand with: fsutil devdrv trust /f $MountPoint"
-    return [PSCustomObject]@{ Trusted = $false; Lines = $lines }
+    $lines += "The Dev Drive will still work, but without the Defender performance mode trust enables."
+    $lines += "Retry by hand with: fsutil devdrv trust /f $MountPoint"
+    return [PSCustomObject]@{ Outcome = 'Failed'; Lines = $lines }
 }
 
 function Test-RecoveryKeyAcknowledged {
@@ -1955,7 +1952,8 @@ try {
     # ErrorRecord, and Out-String would render it as a whole error display instead of its text.
     $trustQuery = (fsutil devdrv query "$devLetterColon" 2>&1 | ForEach-Object { "$_" } | Out-String)
     $trustReport = Resolve-DevDriveTrustReport -MountPoint $devLetterColon -TrustExitCode $trustExitCode -QueryOutput $trustQuery
-    $trustColour = if ($trustReport.Trusted) { 'Green' } else { 'Yellow' }
+    # Grey, not yellow, for an answer that could not be read: on a localized Windows that is every run.
+    $trustColour = switch ($trustReport.Outcome) { 'Trusted' { 'Green' } 'Unconfirmed' { 'Gray' } default { 'Yellow' } }
     foreach ($line in $trustReport.Lines) {
         Write-Host $line -ForegroundColor $trustColour
     }

@@ -143,9 +143,9 @@ Describe 'The script itself' {
         $reportAt | Should -BeGreaterThan $queryAt
     }
 
-    It 'colours the trust lines by the verdict, so a refusal is never printed as good news' {
+    It 'colours the trust lines by the outcome, so only a real failure is printed as one' {
         $content = Get-Content -Path $script:ScriptPath -Raw
-        $content | Should -Match "\`$trustColour = if \(\`$trustReport\.Trusted\) \{ 'Green' \} else \{ 'Yellow' \}"
+        $content | Should -Match "switch \(\`$trustReport\.Outcome\) \{ 'Trusted' \{ 'Green' \} 'Unconfirmed' \{ 'Gray' \} default \{ 'Yellow' \} \}"
         $content | Should -Match '(?ms)foreach \(\$line in \$trustReport\.Lines\) \{\s*\r?\n\s*Write-Host \$line -ForegroundColor \$trustColour'
     }
 
@@ -1104,73 +1104,64 @@ Filters currently attached to this developer volume:
 '@
     }
 
-    It 'reports success only when the volume itself says it is trusted' {
+    It 'confirms trust only when the volume itself says it is trusted' {
         $report = Resolve-DevDriveTrustReport -MountPoint 'X:' -TrustExitCode 0 -QueryOutput $script:TrustedOutput
-        $report.Trusted | Should -BeTrue
+        $report.Outcome | Should -Be 'Trusted'
         ($report.Lines -join "`n") | Should -Match 'X: reports itself trusted'
     }
 
-    It 'refuses to call the volume trusted when the command failed, whatever the query says' {
+    It 'says nothing beyond the one line when the volume is trusted' {
+        (Resolve-DevDriveTrustReport -MountPoint 'X:' -TrustExitCode 0 -QueryOutput $script:TrustedOutput).Lines.Count |
+            Should -Be 1
+    }
+
+    It 'calls it a failure only when the command itself failed, whatever the query says' {
         $report = Resolve-DevDriveTrustReport -MountPoint 'X:' -TrustExitCode 1 -QueryOutput $script:TrustedOutput
-        $report.Trusted | Should -BeFalse
-        ($report.Lines -join "`n") | Should -Match 'exited with code 1'
-    }
-
-    It 'refuses to call the volume trusted when the command succeeded but the answer does not say so' {
-        $report = Resolve-DevDriveTrustReport -MountPoint 'X:' -TrustExitCode 0 -QueryOutput 'This is not a developer volume.'
-        $report.Trusted | Should -BeFalse
-        ($report.Lines -join "`n") | Should -Match 'could not read that back'
-    }
-
-    It 'blames the reading, not the volume, when the answer came back in another language' {
-        $report = Resolve-DevDriveTrustReport -MountPoint 'X:' -TrustExitCode 0 -QueryOutput 'Dies ist ein vertrauenswuerdiges Entwicklervolume.'
-        $report.Trusted | Should -BeFalse
+        $report.Outcome | Should -Be 'Failed'
         $lines = $report.Lines -join "`n"
-        $lines | Should -Match 'in whatever language'
+        $lines | Should -Match 'exited with code 1'
+        $lines | Should -Match 'will still work'
+        $lines | Should -Match 'Retry by hand with: fsutil devdrv trust /f X:'
+    }
+
+    It 'reports an answer it cannot read as unconfirmed, not as a failure' -TestCases @(
+        @{ Answer = 'Dies ist ein vertrauenswuerdiges Entwicklervolume.' }
+        @{ Answer = 'This is not a developer volume.' }
+        @{ Answer = 'This is not a trusted developer volume.' }
+    ) {
+        $report = Resolve-DevDriveTrustReport -MountPoint 'X:' -TrustExitCode 0 -QueryOutput $Answer
+        $report.Outcome | Should -Be 'Unconfirmed'
+        $lines = $report.Lines -join "`n"
+        $lines | Should -Match 'answers in this machine.s language'
+        $lines | Should -Match 'It should say the volume is trusted\.'
+    }
+
+    It 'raises no alarm on a run where only the language stopped it reading the answer' {
+        $lines = (Resolve-DevDriveTrustReport -MountPoint 'X:' -TrustExitCode 0 -QueryOutput 'Dies ist ein vertrauenswuerdiges Entwicklervolume.').Lines -join "`n"
+        $lines | Should -Not -Match 'could not'
         $lines | Should -Not -Match 'will still work'
+        $lines | Should -Not -Match 'Retry by hand'
     }
 
-    It 'never calls an English answer that denies trust benign' {
-        $lines = (Resolve-DevDriveTrustReport -MountPoint 'X:' -TrustExitCode 0 -QueryOutput 'This is not a developer volume.').Lines -join "`n"
-        $lines | Should -Not -Match 'nothing is wrong\.$'
-        $lines | Should -Match 'If that answer says the volume is trusted, in whatever language, nothing is wrong\.'
-        $lines | Should -Match 'If it does not, retry by hand'
-    }
-
-    It 'reads a wording it does not know as not trusted' {
-        $report = Resolve-DevDriveTrustReport -MountPoint 'X:' -TrustExitCode 0 -QueryOutput 'This is not a trusted developer volume.'
-        $report.Trusted | Should -BeFalse
-    }
-
-    It 'quotes what the query actually said, so the user is not left guessing' {
-        $lines = (Resolve-DevDriveTrustReport -MountPoint 'X:' -TrustExitCode 0 -QueryOutput 'This is not a developer volume.').Lines -join "`n"
-        $lines | Should -Match 'fsutil devdrv query X: said:'
+    It 'quotes what the query actually said, so the user judges it themselves' -TestCases @(
+        @{ Code = 0 }
+        @{ Code = 1 }
+    ) {
+        $lines = (Resolve-DevDriveTrustReport -MountPoint 'X:' -TrustExitCode $Code -QueryOutput 'This is not a developer volume.').Lines -join "`n"
         $lines | Should -Match 'This is not a developer volume\.'
     }
 
-    It 'says so plainly when the query answered nothing at all' {
-        $lines = (Resolve-DevDriveTrustReport -MountPoint 'X:' -TrustExitCode 0 -QueryOutput '').Lines -join "`n"
-        $lines | Should -Match 'said nothing'
+    It 'says so plainly when the query answered nothing at all' -TestCases @(
+        @{ Code = 0; Expected = '\(nothing\)' }
+        @{ Code = 1; Expected = 'said nothing' }
+    ) {
+        $lines = (Resolve-DevDriveTrustReport -MountPoint 'X:' -TrustExitCode $Code -QueryOutput '').Lines -join "`n"
+        $lines | Should -Match $Expected
     }
 
-    It 'offers the forced retry on every failure path' {
-        foreach ($case in @(
-                @{ Code = 1; Output = '' }
-                @{ Code = 0; Output = 'This is not a developer volume.' }
-            )) {
-            $lines = (Resolve-DevDriveTrustReport -MountPoint 'X:' -TrustExitCode $case.Code -QueryOutput $case.Output).Lines -join "`n"
-            $lines | Should -Match 'fsutil devdrv trust /f X:'
-        }
-    }
-
-    It 'says the drive still works only when the command itself failed' {
-        $lines = (Resolve-DevDriveTrustReport -MountPoint 'X:' -TrustExitCode 1 -QueryOutput '').Lines -join "`n"
-        $lines | Should -Match 'will still work'
-    }
-
-    It 'says nothing beyond the one success line when the volume is trusted' {
-        (Resolve-DevDriveTrustReport -MountPoint 'X:' -TrustExitCode 0 -QueryOutput $script:TrustedOutput).Lines.Count |
-            Should -Be 1
+    It 'returns plain lines rather than an object to unwrap' {
+        (Resolve-DevDriveTrustReport -MountPoint 'X:' -TrustExitCode 0 -QueryOutput $script:TrustedOutput).Lines |
+            Should -BeOfType [string]
     }
 }
 
