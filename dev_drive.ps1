@@ -1387,6 +1387,18 @@ function Resolve-VhdxMountAdvice {
     )
 }
 
+function Resolve-VhdxPortabilityAdvice {
+    <# What carrying the file to another machine costs: the trusted status is per machine. #>
+    param([Parameter(Mandatory)][string]$VhdxPath)
+
+    return @(
+        "Microsoft does not recommend copying $VhdxPath to another machine and carrying on using it as a Dev Drive."
+        "The trusted status is stored on the machine that formatted the volume and does not travel with the file:"
+        "copied elsewhere it mounts as an ordinary volume, every filter attaches, and Defender scans it synchronously."
+        "If you do it anyway, mark it trusted there after mounting it: fsutil devdrv trust /f <drive letter>:"
+    )
+}
+
 function Request-AutoAttachChoice {
     Write-Host "`nMount this virtual hard disk automatically on every Windows startup?" -ForegroundColor Cyan
     Write-Host "Without this, the Dev Drive disappears after each restart until mounted by hand." -ForegroundColor White
@@ -2248,6 +2260,15 @@ try {
     if (-not $VhdxAtBootGranted -and $VhdxMountAdvice) {
         Write-Host ""
         foreach ($line in $VhdxMountAdvice) {
+            Write-Host $line -ForegroundColor Yellow
+        }
+    }
+
+    # Printed at the end only, and whatever automatic mounting did: it is about the file's future,
+    # not about this run, and by here the volume really is a Dev Drive.
+    if ($mode -eq "Vhdx") {
+        Write-Host ""
+        foreach ($line in (Resolve-VhdxPortabilityAdvice -VhdxPath $VhdxPath)) {
             Write-Host $line -ForegroundColor Yellow
         }
     }
