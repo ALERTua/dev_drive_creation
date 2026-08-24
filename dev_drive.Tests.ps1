@@ -128,9 +128,19 @@ Describe 'The script itself' {
         $acPowerAt | Should -BeGreaterThan $weeklyAt
     }
 
-    It 'checks the fsutil devdrv trust exit code before declaring the drive trusted' {
+    It 'takes the fsutil devdrv trust exit code before any other command can overwrite it' {
         $content = Get-Content -Path $script:ScriptPath -Raw
-        $content | Should -Match '(?ms)fsutil devdrv trust /f "\$devLetterColon" \| Out-Null\s*\r?\n\s*if \(\$LASTEXITCODE'
+        $content | Should -Match '(?ms)fsutil devdrv trust /f "\$devLetterColon" \| Out-Null\s*\r?\n\s*#[^\r\n]*\r?\n\s*#[^\r\n]*\r?\n\s*\$trustExitCode = \$LASTEXITCODE'
+    }
+
+    It 'asks the volume for its trust state as well as reading the exit code' {
+        $content = Get-Content -Path $script:ScriptPath -Raw
+        $codeAt = $content.IndexOf('$trustExitCode = $LASTEXITCODE')
+        $queryAt = $content.IndexOf('$trustQuery = (fsutil devdrv query')
+        $reportAt = $content.IndexOf('$trustReport = Resolve-DevDriveTrustReport')
+        $codeAt | Should -BeGreaterThan 0
+        $queryAt | Should -BeGreaterThan $codeAt
+        $reportAt | Should -BeGreaterThan $queryAt
     }
 
     It 'prints a plan summary line when BitLocker is skipped' {
@@ -1071,6 +1081,74 @@ Describe 'Resolve-BitLockerUnlockAction' {
     }
 }
 
+
+Describe 'Resolve-DevDriveTrustReport' {
+    BeforeAll {
+        $script:TrustedOutput = @'
+This is a trusted developer volume.
+
+Developer volumes are protected by antivirus filter.
+
+Filters currently attached to this developer volume:
+    WdFilter
+'@
+    }
+
+    It 'reports success only when the volume itself says it is trusted' {
+        $report = Resolve-DevDriveTrustReport -MountPoint 'X:' -TrustExitCode 0 -QueryOutput $script:TrustedOutput
+        $report.Trusted | Should -BeTrue
+        ($report.Lines -join "`n") | Should -Match 'X: reports itself trusted'
+        ($report.Lines -join "`n") | Should -Match 'performance mode'
+    }
+
+    It 'refuses to call the volume trusted when the command failed, whatever the query says' {
+        $report = Resolve-DevDriveTrustReport -MountPoint 'X:' -TrustExitCode 1 -QueryOutput $script:TrustedOutput
+        $report.Trusted | Should -BeFalse
+        ($report.Lines -join "`n") | Should -Match 'exited with code 1'
+    }
+
+    It 'refuses to call the volume trusted when the command succeeded but the volume disagrees' {
+        $report = Resolve-DevDriveTrustReport -MountPoint 'X:' -TrustExitCode 0 -QueryOutput 'This is not a developer volume.'
+        $report.Trusted | Should -BeFalse
+        ($report.Lines -join "`n") | Should -Match 'does not report itself as trusted'
+    }
+
+    It 'reads a wording it does not know as not trusted' {
+        $report = Resolve-DevDriveTrustReport -MountPoint 'X:' -TrustExitCode 0 -QueryOutput 'This is not a trusted developer volume.'
+        $report.Trusted | Should -BeFalse
+    }
+
+    It 'quotes what the query actually said, so the user is not left guessing' {
+        $lines = (Resolve-DevDriveTrustReport -MountPoint 'X:' -TrustExitCode 0 -QueryOutput 'This is not a developer volume.').Lines -join "`n"
+        $lines | Should -Match 'fsutil devdrv query X: said:'
+        $lines | Should -Match 'This is not a developer volume\.'
+    }
+
+    It 'says so plainly when the query answered nothing at all' {
+        $lines = (Resolve-DevDriveTrustReport -MountPoint 'X:' -TrustExitCode 0 -QueryOutput '').Lines -join "`n"
+        $lines | Should -Match 'said nothing'
+    }
+
+    It 'offers the forced retry on every failure path' {
+        foreach ($case in @(
+                @{ Code = 1; Output = '' }
+                @{ Code = 0; Output = 'This is not a developer volume.' }
+            )) {
+            $lines = (Resolve-DevDriveTrustReport -MountPoint 'X:' -TrustExitCode $case.Code -QueryOutput $case.Output).Lines -join "`n"
+            $lines | Should -Match 'fsutil devdrv trust /f X:'
+        }
+    }
+
+    It 'never says the drive is broken, only that it lost performance mode' {
+        $lines = (Resolve-DevDriveTrustReport -MountPoint 'X:' -TrustExitCode 1 -QueryOutput '').Lines -join "`n"
+        $lines | Should -Match 'will still work'
+    }
+
+    It 'says nothing beyond the one success line when the volume is trusted' {
+        (Resolve-DevDriveTrustReport -MountPoint 'X:' -TrustExitCode 0 -QueryOutput $script:TrustedOutput).Lines.Count |
+            Should -Be 1
+    }
+}
 Describe 'Test-RecoveryKeyAcknowledged' {
     It 'accepts <Description>' -TestCases @(
         @{ Description = 'the word itself'; Answer = 'YES' }

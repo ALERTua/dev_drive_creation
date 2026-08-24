@@ -587,6 +587,45 @@ function Resolve-BitLockerUnlockAction {
     }
 }
 
+function Resolve-DevDriveTrustReport {
+    <#
+        What to say after marking a volume trusted. The exit code answers whether the command ran;
+        only the volume's own answer says whether it ended up trusted, and a wording this script
+        does not recognise counts as not trusted rather than as success.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$MountPoint,
+        [int]$TrustExitCode = 0,
+        [AllowNull()][AllowEmptyString()][string]$QueryOutput
+    )
+
+    $trusted = $TrustExitCode -eq 0 -and $QueryOutput -match '(?im)^\s*This is a trusted developer volume'
+    if ($trusted) {
+        return [PSCustomObject]@{
+            Trusted = $true
+            Lines   = @("Dev Drive $MountPoint reports itself trusted: Microsoft Defender will scan it asynchronously, in performance mode.")
+        }
+    }
+
+    if ($TrustExitCode -ne 0) {
+        $lines = @("Could not mark $MountPoint as trusted (fsutil exited with code $TrustExitCode).")
+    } else {
+        $lines = @("Marked $MountPoint as trusted, but the volume does not report itself as trusted.")
+    }
+
+    $said = ($QueryOutput -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($said) {
+        $lines += "fsutil devdrv query $MountPoint said:"
+        $lines += $said | ForEach-Object { "  $($_.Trim())" }
+    } else {
+        $lines += "fsutil devdrv query $MountPoint said nothing."
+    }
+
+    $lines += "The Dev Drive will still work, but without the Defender performance mode trust enables."
+    $lines += "Retry by hand with: fsutil devdrv trust /f $MountPoint"
+    return [PSCustomObject]@{ Trusted = $false; Lines = $lines }
+}
+
 function Test-RecoveryKeyAcknowledged {
     <# Only the acknowledgement word, in any case and with spaces trimmed, lets the run go on. #>
     param(
@@ -1906,16 +1945,14 @@ try {
     Write-Host "Marking Dev Drive $devLetterColon as trusted for Defender performance" -ForegroundColor Green
     # /f: the designation lands through a dismount, which fsutil skips on a volume in use.
     fsutil devdrv trust /f "$devLetterColon" | Out-Null
-    if ($LASTEXITCODE -eq 0) {
-        Write-Host "Dev Drive marked trusted." -ForegroundColor Green
-    } else {
-        # fsutil is a native tool: a failure here does not throw, so it must be read from
-        # $LASTEXITCODE instead of the surrounding try/catch. The drive is still a fully
-        # working Dev Drive; it only loses the Defender performance mode that trust grants.
-        Write-Host "Could not mark $devLetterColon as trusted (fsutil exited with code $LASTEXITCODE)." -ForegroundColor Yellow
-        Write-Host "The Dev Drive will still work, but without the Defender performance mode trust enables." -ForegroundColor Yellow
-        Write-Host "Check the current state with: fsutil devdrv query $devLetterColon" -ForegroundColor Yellow
-        Write-Host "Retry by hand with: fsutil devdrv trust /f $devLetterColon" -ForegroundColor Yellow
+    # fsutil is a native tool: a failure does not throw, so the code has to be taken before
+    # anything else runs. The volume is then asked what state it is actually in.
+    $trustExitCode = $LASTEXITCODE
+    $trustQuery = (fsutil devdrv query "$devLetterColon" 2>&1 | Out-String)
+    $trustReport = Resolve-DevDriveTrustReport -MountPoint $devLetterColon -TrustExitCode $trustExitCode -QueryOutput $trustQuery
+    $trustColour = if ($trustReport.Trusted) { 'Green' } else { 'Yellow' }
+    foreach ($line in $trustReport.Lines) {
+        Write-Host $line -ForegroundColor $trustColour
     }
 
 
