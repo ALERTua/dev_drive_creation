@@ -12,7 +12,7 @@ This script automates work you are expected to be able to do by hand: it assumes
 - **Smart Drive Selection**: Shows detailed drive information for informed choices
 - **Optional BitLocker**: Encryption that fits the machine, with the recovery key shown before the run goes on and a rejected password asked for again
 - **Advanced ReFS Optimization**: Deduplicate, compress, or both - all three modes ReFS offers
-- **Compression Options**: Choose LZ4 or ZSTD, each with the levels that format really has, or leave the level to Windows
+- **Compression Options**: Take LZ4 or ZSTD at Windows' own level in one answer, or pick the format and level yourself
 - **Real Size Limits**: Shows actual Windows shrinkable limits, not estimates
 - **Power-Aware Scheduling**: Deduplication jobs run only on AC power to preserve battery
 - **Smart Defaults**: Press Enter for maximum partition sizes, sensible defaults throughout
