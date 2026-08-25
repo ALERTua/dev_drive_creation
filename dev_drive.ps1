@@ -1776,7 +1776,75 @@ function Read-StrongPassword {
     }
 }
 
+function Get-DiskPartitionStyleName {
+    <# The partition style Windows reports for a disk, or an empty string when it reports none. #>
+    param([Parameter(Mandatory)]$Disk)
+
+    $style = $Disk.PSObject.Properties['PartitionStyle']
+    if ($null -eq $style -or $null -eq $style.Value) { return '' }
+    return "$($style.Value)"
+}
+
+function Test-DiskStyleSupported {
+    <# Whether this script will create a partition on a disk with this style. #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Style,
+        [Parameter(Mandatory)][string[]]$Supported
+    )
+
+    return $Style -in $Supported
+}
+
+function Format-DiskStyleNote {
+    <# The one line the disk list shows instead of a free-space figure, for a style this script will
+       not use. It reports what Windows said and claims nothing further. #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Style)
+
+    if ([string]::IsNullOrWhiteSpace($Style)) { return 'Cannot be used: no partition style reported' }
+    return "Cannot be used: partition style $Style"
+}
+
+function Resolve-UnusableDiskAdvice {
+    <#
+        What to say when the disk that was chosen has a style this script will not use. One message
+        for every such style: what Windows reported, what is supported, and the remedy offered as a
+        condition rather than as an instruction, because RAW may be a damaged table.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Style,
+        [Parameter(Mandatory)][int]$DiskNumber,
+        [Parameter(Mandatory)][ValidateSet('GPT', 'MBR')][string]$InitializeStyle,
+        [Parameter(Mandatory)][string[]]$Supported
+    )
+
+    $reported = if ([string]::IsNullOrWhiteSpace($Style)) {
+        "Disk $DiskNumber did not report a partition style."
+    } else {
+        "Disk $DiskNumber reports its partition style as $Style."
+    }
+
+    return @(
+        $reported
+        "This script works with $($Supported -join ' and ') disks only, and never initializes a physical disk."
+        ""
+        "If you know this disk is new, you can initialize it yourself. Leave this prompt open, and in"
+        "another PowerShell window run:"
+        ""
+        "    Initialize-Disk -Number $DiskNumber -PartitionStyle $InitializeStyle"
+        ""
+        "WARNING: that writes a new partition table over whatever is already there, which makes every"
+        "file on the disk unreachable. Windows also reports RAW for a table it merely failed to read,"
+        "so a disk that looks empty here may not be. Only run it on a disk you know is new, or whose"
+        "contents you no longer need."
+        ""
+        "Choose a different disk, type this number again once Windows reports it as $($Supported -join ' or '),"
+        "or press Ctrl+C to leave without creating anything."
+    )
+}
+
 function Show-DriveSelection {
+    param([Parameter(Mandatory)][string[]]$SupportedStyles)
+
     Write-Host "`nSelect the physical drive where you want to create your Dev Drive:`n" -ForegroundColor Cyan
 
     $disks = Get-Disk | Where-Object { $_.BusType -ne 'Unknown' } | Sort-Object Number
@@ -1784,16 +1852,23 @@ function Show-DriveSelection {
     foreach ($disk in $disks) {
         $diskNumber = $disk.Number
         $diskSizeGB = ConvertTo-FlooredGB -Bytes $disk.Size
-
-        $freeSpaceGB = ConvertTo-FlooredGB -Bytes (Get-DiskLargestFreeExtent -Disk $disk)
+        $style = Get-DiskPartitionStyleName -Disk $disk
 
         Write-Host "Disk $diskNumber`: $($disk.FriendlyName)" -ForegroundColor Yellow
         Write-Host "  Size: $diskSizeGB GB" -ForegroundColor White
-        # "Unallocated", not "Free": a full disk reads 0 here and must not look broken.
-        Write-Host "  Unallocated: $freeSpaceGB GB in one unbroken block" -ForegroundColor Green
+        if (Test-DiskStyleSupported -Style $style -Supported $SupportedStyles) {
+            # "Unallocated", not "Free": a full disk reads 0 here and must not look broken.
+            $freeSpaceGB = ConvertTo-FlooredGB -Bytes (Get-DiskLargestFreeExtent -Disk $disk)
+            Write-Host "  Unallocated: $freeSpaceGB GB in one unbroken block" -ForegroundColor Green
+        } else {
+            # A free-space figure would invite a choice this script is about to refuse.
+            Write-Host "  $(Format-DiskStyleNote -Style $style)" -ForegroundColor Yellow
+        }
 
         # By number rather than down the pipeline: the same query, and the only shape a test can pass.
-        $driveLetters = (Get-Partition -DiskNumber $diskNumber | Where-Object { $_.DriveLetter } |
+        # Errors silenced: a disk with no partitions raises a record that would land mid-list.
+        $driveLetters = (Get-Partition -DiskNumber $diskNumber -ErrorAction SilentlyContinue |
+                Where-Object { $_.DriveLetter } |
                 Select-Object -ExpandProperty DriveLetter) -join ", "
         if ($driveLetters) {
             Write-Host "  Drives: $driveLetters" -ForegroundColor Gray
@@ -2140,6 +2215,14 @@ if ($windows_build -ge $windows_build_min) {
 # Microsoft's documented minimum size for a Dev Drive volume (https://learn.microsoft.com/en-us/windows/dev-drive/)
 $DevDriveMinSizeGB = 50
 
+# The style this script initializes its own virtual disk with, and the one it tells a user to give
+# a physical disk. Kept together so the advice cannot drift from the behaviour.
+$DiskPartitionStyle = 'GPT'
+
+# The styles a physical disk may have for this script to create a partition on it. Rendered into
+# the refusal as well, so the sentence cannot come to disagree with the check.
+$SupportedPartitionStyles = @('GPT', 'MBR')
+
 # Where "deny write access to fixed drives not protected by BitLocker" takes effect. PolicyManager
 # was empty on the machine that reported this, so the effective path is the one to read.
 $FixedDriveWritePolicyPath = 'HKLM:\SYSTEM\CurrentControlSet\Policies\Microsoft\FVE'
@@ -2184,25 +2267,44 @@ $DedupTaskTreePath = "Task Scheduler Library > " + (($DedupTaskPath.Trim('\') -s
 # Interactive mode only - Gather all information first
 Write-Host "`n=== GATHERING CONFIGURATION ===" -ForegroundColor Cyan
 Write-Host "Let's collect all the information needed to create your Dev Drive." -ForegroundColor White
-Write-Host "No changes will be made until you confirm the plan.`n" -ForegroundColor White
+Write-Host "No changes will be made until you confirm the plan." -ForegroundColor White
+Write-Host "Press Ctrl+C at any of these questions to leave without changing anything.`n" -ForegroundColor White
 
 # Step 1: Ask user to select the creation mode
 $mode = Select-DriveMode
 
 # Step 2: Ask user to select a physical drive. A .vhdx lives on an existing volume instead.
 if ($mode -ne "Vhdx") {
-    Show-DriveSelection
+    Show-DriveSelection -SupportedStyles $SupportedPartitionStyles
 
     Write-Host "`n=== SELECT PHYSICAL DRIVE ===" -ForegroundColor Cyan
     Write-Host "Enter the disk number you want to use for Dev Drive creation:" -ForegroundColor White
+    # Said here as well as in the banner: every disk on the machine may be one this script refuses,
+    # and this is the prompt a refusal comes back to.
+    Write-Host "Press Ctrl+C to leave without creating anything." -ForegroundColor Gray
 
     while ($true) {
-        $selectedDiskInput = Read-Host "Disk number"
+        $selectedDiskInput = (Read-Host "Disk number").Trim()
         if ($selectedDiskInput -match '^\d+$') {
             $selectedDiskNumber = [int]$selectedDiskInput
             # Validate that the disk exists
             $diskExists = Get-Disk -Number $selectedDiskNumber -ErrorAction SilentlyContinue
             if ($diskExists) {
+                # Judged before the disk is accepted, so nothing is asked about a disk that cannot
+                # hold a Dev Drive.
+                $selectedStyle = Get-DiskPartitionStyleName -Disk $diskExists
+                if (-not (Test-DiskStyleSupported -Style $selectedStyle -Supported $SupportedPartitionStyles)) {
+                    Write-Host ""
+                    foreach ($line in (Resolve-UnusableDiskAdvice -Style $selectedStyle -DiskNumber $selectedDiskNumber `
+                                -InitializeStyle $DiskPartitionStyle -Supported $SupportedPartitionStyles)) {
+                        Write-Host $line -ForegroundColor Red
+                    }
+                    Write-Host ""
+                    # Back to the prompt: the disk is read again, so one initialized in another
+                    # window can be chosen without starting over.
+                    continue
+                }
+
                 $DiskNumber = $selectedDiskNumber
                 $selectedDiskName = $diskExists.FriendlyName
                 Write-Host "Selected Disk $DiskNumber`: $selectedDiskName" -ForegroundColor Green
@@ -2211,7 +2313,7 @@ if ($mode -ne "Vhdx") {
                 Write-Host "Disk $selectedDiskNumber does not exist. Please select a valid disk number." -ForegroundColor Red
             }
         } else {
-            Write-Host "Invalid input. Please enter a number (0, 1, 2, etc.)." -ForegroundColor Red
+            Write-Host "Invalid input. Please enter a number (0, 1, 2, etc.), or press Ctrl+C to leave." -ForegroundColor Red
         }
     }
 }
@@ -2425,6 +2527,9 @@ if ($mode -eq "Vhdx") {
     if ($VhdxDiskType -eq 'Fixed') {
         Write-Host "  (a fixed size disk claims all of its space up front, which takes a while)" -ForegroundColor Gray
     }
+    # Said here because the physical modes refuse an uninitialized disk instead.
+    Write-Host "* Initialize the new virtual disk with a $DiskPartitionStyle partition table" -ForegroundColor White
+    Write-Host "  (it will be brand new and empty; this script never initializes a physical disk)" -ForegroundColor Gray
     Write-Host "* Format the attached virtual disk as a Dev Drive using ReFS" -ForegroundColor White
     if ($VhdxAutoAttach) {
         Write-Host "* Register the virtual disk to be mounted on every Windows startup" -ForegroundColor White
@@ -2564,8 +2669,8 @@ try {
             Write-Host $line -ForegroundColor $adviceColour
         }
 
-        Write-Host "Initializing disk $vhdxDiskNumber with a GPT partition table" -ForegroundColor Green
-        Initialize-Disk -Number $vhdxDiskNumber -PartitionStyle GPT -ErrorAction Stop | Out-Null
+        Write-Host "Initializing disk $vhdxDiskNumber with a $DiskPartitionStyle partition table" -ForegroundColor Green
+        Initialize-Disk -Number $vhdxDiskNumber -PartitionStyle $DiskPartitionStyle -ErrorAction Stop | Out-Null
 
         Write-Host "Creating a partition spanning the whole virtual disk" -ForegroundColor Green
         $newPart = New-Partition -DiskNumber $vhdxDiskNumber -UseMaximumSize -AssignDriveLetter -ErrorAction Stop

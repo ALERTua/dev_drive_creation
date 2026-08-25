@@ -290,6 +290,141 @@ Describe 'The script itself' {
         $owned.Count | Should -Be 1
     }
 
+    It 'refuses a disk it cannot use from inside the prompt loop, so the answer can be retyped' {
+        # The refusal has to sit inside the loop: a `continue` outside one is a runtime error, and
+        # ending the run would throw away the mode answer for a disk that was never created.
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($script:ScriptPath, [ref]$null, [ref]$null)
+        $guard = @($ast.FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.IfStatementAst] -and
+                    $node.Clauses[0].Item1.Extent.Text -match 'Test-DiskStyleSupported -Style \$selectedStyle'
+                }, $true))
+        $guard.Count | Should -Be 1
+        $guardBody = $guard[0].Clauses[0].Item2
+
+        $loops = @($ast.FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.WhileStatementAst] -and
+                    $node.Body.Extent.Text -match 'Read-Host "Disk number"'
+                }, $true))
+        $loops.Count | Should -Be 1
+        $guard[0].Extent.StartOffset | Should -BeGreaterThan $loops[0].Extent.StartOffset
+        $guard[0].Extent.EndOffset | Should -BeLessThan $loops[0].Extent.EndOffset
+
+        # The reason is printed, and it is the one this change wrote: without this, replacing the
+        # message with any other line list leaves every test green over a function nobody calls.
+        @($guardBody.FindAll({
+                    param($n)
+                    $n -is [System.Management.Automation.Language.CommandAst] -and
+                    $n.GetCommandName() -eq 'Resolve-UnusableDiskAdvice'
+                }, $true)).Count | Should -Be 1
+        $guardBody.Extent.Text | Should -Match 'Write-Host \$line'
+        # The keyword itself, not the word inside SilentlyContinue.
+        @($guardBody.FindAll({ param($n) $n -is [System.Management.Automation.Language.ContinueStatementAst] }, $true)).Count |
+            Should -Be 1
+        @($guardBody.FindAll({ param($n) $n -is [System.Management.Automation.Language.BreakStatementAst] }, $true)).Count |
+            Should -Be 0
+        $guardBody.Extent.Text | Should -Not -Match '\bexit\b'
+    }
+
+    It 'says how to leave, before the first question and again wherever a refusal lands' {
+        # A single-disk machine whose one disk is refused has no answer that ends the run, so the way
+        # out has to be named rather than assumed. No special answer to type: Ctrl+C already works,
+        # and a typed one would need parsing at every prompt to be worth offering at any.
+        $content = Get-Content -Path $script:ScriptPath -Raw
+        $bannerAt = $content.IndexOf('Press Ctrl+C at any of these questions to leave without changing anything.')
+        $bannerAt | Should -BeGreaterThan 0
+        # The disk prompt, its invalid-input line, and the refusal the prompt loops back from.
+        ([regex]::Matches($content, 'Ctrl\+C to leave')).Count | Should -BeGreaterOrEqual 3
+        # Nothing is left promising an answer that no longer exists.
+        $content | Should -Not -Match 'X to exit'
+    }
+
+    It 'hands the disk list the supported styles, so a live run does not stop asking for them' {
+        # Every test passes the parameter explicitly, so only the call site itself can pin this.
+        # Dropped, the run halts mid-flight on "Supply values for the following parameters".
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($script:ScriptPath, [ref]$null, [ref]$null)
+        $calls = @($ast.FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.CommandAst] -and
+                    $node.GetCommandName() -eq 'Show-DriveSelection'
+                }, $true))
+        $calls.Count | Should -Be 1
+        $calls[0].Extent.Text | Should -Match '-SupportedStyles \$SupportedPartitionStyles'
+    }
+
+    It 'judges the disk before accepting it, and long before anything is asked about it' {
+        $content = Get-Content -Path $script:ScriptPath -Raw
+        $checkAt = $content.IndexOf('Test-DiskStyleSupported -Style $selectedStyle')
+        $acceptAt = $content.IndexOf('$DiskNumber = $selectedDiskNumber')
+        # The first mode-specific question, anchored on code rather than on a comment that may be renamed.
+        $firstQuestionAt = $content.IndexOf('if ($mode -eq "FreeSpace") {')
+        $checkAt | Should -BeGreaterThan 0
+        $acceptAt | Should -BeGreaterThan $checkAt
+        $firstQuestionAt | Should -BeGreaterThan $acceptAt
+    }
+
+    It 'declares the supported partition styles once, and never repeats the set as a check or a sentence' {
+        # The ValidateSet on the initialize style is a different set - what Initialize-Disk accepts -
+        # and is deliberately not counted here.
+        $content = Get-Content -Path $script:ScriptPath -Raw
+        ([regex]::Matches($content, "\`$SupportedPartitionStyles = @\('GPT', 'MBR'\)")).Count | Should -Be 1
+        $content | Should -Not -Match "works with GPT and MBR disks only"
+        $content | Should -Not -Match "\`$Style -in @\('GPT', 'MBR'\)"
+    }
+
+    It 'promises the one initialization it performs, in the plan of the mode that performs it' {
+        # The physical modes refuse an uninitialized disk; the .vhdx mode initializes the disk it
+        # just created. Hoisted out of that branch, this would promise it to every mode.
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($script:ScriptPath, [ref]$null, [ref]$null)
+        $vhdxPlan = @($ast.FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.IfStatementAst] -and
+                    $node.Clauses[0].Item1.Extent.Text -eq '$mode -eq "Vhdx"' -and
+                    $node.Clauses[0].Item2.Extent.Text -match 'Format the attached virtual disk'
+                }, $true))
+        $vhdxPlan.Count | Should -Be 1
+
+        $planText = $vhdxPlan[0].Clauses[0].Item2.Extent.Text
+        $planText | Should -Match '\* Initialize the new virtual disk with a \$DiskPartitionStyle partition table'
+        $planText | Should -Match 'this script never initializes a physical disk'
+        # Future tense, like every other line of a plan that has not run yet.
+        $planText | Should -Match 'it will be brand new and empty'
+
+        $content = Get-Content -Path $script:ScriptPath -Raw
+        # Promised before it happens, which is the whole point of the plan.
+        $content.IndexOf('Initialize-Disk -Number $vhdxDiskNumber') |
+            Should -BeGreaterThan $content.IndexOf('* Initialize the new virtual disk')
+    }
+
+    It 'keeps the partition style in one place rather than beside every use of it' {
+        $content = Get-Content -Path $script:ScriptPath -Raw
+        ([regex]::Matches($content, "\`$DiskPartitionStyle = 'GPT'")).Count | Should -Be 1
+        $content | Should -Not -Match 'Initialize-Disk -Number \$vhdxDiskNumber -PartitionStyle GPT'
+    }
+
+    It 'asks a disk for its partitions without treating "it has none" as a fault' {
+        # A disk with no partitions makes Get-Partition raise an error record, which lands in the
+        # middle of the disk list. It happens on a wiped disk too, not only an uninitialized one.
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($script:ScriptPath, [ref]$null, [ref]$null)
+        $lister = @($ast.FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                    $node.Name -eq 'Show-DriveSelection'
+                }, $true))
+        $lister.Count | Should -Be 1
+
+        $queries = @($lister[0].FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.CommandAst] -and
+                    $node.GetCommandName() -eq 'Get-Partition'
+                }, $true))
+        $queries.Count | Should -BeGreaterThan 0
+        foreach ($query in $queries) {
+            $query.Extent.Text | Should -Match '-ErrorAction SilentlyContinue'
+        }
+    }
+
     It 'refuses to touch any task when the volume would not say which are its own' {
         # Changing tasks that cannot be shown to be this drive's is worse than changing none.
         $ast = [System.Management.Automation.Language.Parser]::ParseFile($script:ScriptPath, [ref]$null, [ref]$null)
@@ -1171,26 +1306,211 @@ Describe 'Show-DriveSelection' {
         # A 500 GB disk whose partitions fill it reads 0 here. The old sum of Basic-or-lettered
         # partitions reported 2.22 GB on exactly such a disk.
         Mock Get-Disk { @([PSCustomObject]@{ Number = 0; FriendlyName = 'Full disk'; Size = 500GB
-                BusType = 'NVMe'; LargestFreeExtent = [uint64]0 }) }
+                BusType = 'NVMe'; PartitionStyle = 'GPT'; LargestFreeExtent = [uint64]0 }) }
         Mock Get-Partition { @() }
-        Show-DriveSelection | Out-Null
+        Show-DriveSelection -SupportedStyles @('GPT', 'MBR') | Out-Null
         Should -Invoke Write-Host -ParameterFilter { $Object -match 'Unallocated: 0 GB in one unbroken block' }
     }
 
     It 'does not call an ordinary full disk free' {
         Mock Get-Disk { @([PSCustomObject]@{ Number = 0; FriendlyName = 'Full disk'; Size = 500GB
-                BusType = 'NVMe'; LargestFreeExtent = [uint64]0 }) }
+                BusType = 'NVMe'; PartitionStyle = 'GPT'; LargestFreeExtent = [uint64]0 }) }
         Mock Get-Partition { @() }
-        Show-DriveSelection | Out-Null
+        Show-DriveSelection -SupportedStyles @('GPT', 'MBR') | Out-Null
         Should -Not -Invoke Write-Host -ParameterFilter { $Object -match 'Free Space' }
     }
 
     It 'reports the block a disk really has' {
         Mock Get-Disk { @([PSCustomObject]@{ Number = 2; FriendlyName = 'Spare'; Size = 119.24GB
-                BusType = 'USB'; LargestFreeExtent = [uint64]118.61GB }) }
+                BusType = 'USB'; PartitionStyle = 'GPT'; LargestFreeExtent = [uint64]118.61GB }) }
         Mock Get-Partition { @() }
-        Show-DriveSelection | Out-Null
+        Show-DriveSelection -SupportedStyles @('GPT', 'MBR') | Out-Null
         Should -Invoke Write-Host -ParameterFilter { $Object -match 'Unallocated: 118\.61 GB' }
+    }
+
+    It 'says a disk with no readable partition table cannot be used, instead of calling it full' {
+        # Observed on an uninitialized disk: Size 60 GB, LargestFreeExtent 0, because free space is
+        # counted between partitions and such a disk has none.
+        Mock Get-Disk { @([PSCustomObject]@{ Number = 3; FriendlyName = 'Brand new'; Size = 60GB
+                BusType = 'NVMe'; PartitionStyle = 'RAW'; LargestFreeExtent = [uint64]0 }) }
+        Mock Get-Partition { @() }
+        Show-DriveSelection -SupportedStyles @('GPT', 'MBR') | Out-Null
+        Should -Invoke Write-Host -ParameterFilter { $Object -match 'Cannot be used: partition style RAW' }
+        Should -Not -Invoke Write-Host -ParameterFilter { $Object -match 'Unallocated' }
+    }
+
+    It 'marks a disk of a style this script does not work with, however much room it reports' {
+        # Not a RAW disk: this one reports its whole size as free, and the old size check would have
+        # let it through. The style is the reason to refuse it, not the number beside it.
+        Mock Get-Disk { @([PSCustomObject]@{ Number = 4; FriendlyName = 'Odd one'; Size = 200GB
+                BusType = 'SAS'; PartitionStyle = 'Unknown'; LargestFreeExtent = [uint64]200GB }) }
+        Mock Get-Partition { @() }
+        Show-DriveSelection -SupportedStyles @('GPT', 'MBR') | Out-Null
+        Should -Invoke Write-Host -ParameterFilter { $Object -match 'Cannot be used: partition style Unknown' }
+        Should -Not -Invoke Write-Host -ParameterFilter { $Object -match 'Unallocated' }
+    }
+
+    It 'still reports the unallocated block on a disk that does have a partition table' {
+        Mock Get-Disk { @([PSCustomObject]@{ Number = 2; FriendlyName = 'Spare'; Size = 119.24GB
+                BusType = 'USB'; PartitionStyle = 'MBR'; LargestFreeExtent = [uint64]119.24GB }) }
+        Mock Get-Partition { @() }
+        Show-DriveSelection -SupportedStyles @('GPT', 'MBR') | Out-Null
+        Should -Invoke Write-Host -ParameterFilter { $Object -match 'Unallocated: 119\.24 GB' }
+        Should -Not -Invoke Write-Host -ParameterFilter { $Object -match 'Cannot be used' }
+    }
+
+    It 'says a disk that reported no style at all cannot be used, rather than throwing' {
+        # Strict mode turns a missing property into an exception, in the middle of the disk list.
+        Mock Get-Disk { @([PSCustomObject]@{ Number = 5; FriendlyName = 'Silent'; Size = 100GB
+                BusType = 'SATA'; LargestFreeExtent = [uint64]100GB }) }
+        Mock Get-Partition { @() }
+        { Show-DriveSelection -SupportedStyles @('GPT', 'MBR') } | Should -Not -Throw
+        Should -Invoke Write-Host -ParameterFilter { $Object -match 'Cannot be used: no partition style reported' }
+    }
+
+    It 'carries on listing when a disk answers that it has no partitions' {
+        # The real cmdlet raises an error record for that, which used to print into the list.
+        Mock Get-Disk { @([PSCustomObject]@{ Number = 2; FriendlyName = 'Spare'; Size = 119.24GB
+                BusType = 'USB'; PartitionStyle = 'MBR'; LargestFreeExtent = [uint64]119.24GB }) }
+        Mock Get-Partition { Write-Error "No MSFT_Partition objects found with property 'DiskNumber' equal to '2'." }
+        $ErrorActionPreference = 'Stop'
+        { Show-DriveSelection -SupportedStyles @('GPT', 'MBR') } | Should -Not -Throw
+        Should -Invoke Write-Host -ParameterFilter { $Object -match 'Unallocated: 119\.24 GB' }
+    }
+}
+
+Describe 'Get-DiskPartitionStyleName' {
+    It 'reports the style the disk answers with' -TestCases @(
+        @{ Style = 'GPT' }
+        @{ Style = 'MBR' }
+        @{ Style = 'RAW' }
+        @{ Style = 'Unknown' }
+    ) {
+        Get-DiskPartitionStyleName -Disk ([PSCustomObject]@{ PartitionStyle = $Style }) | Should -Be $Style
+    }
+
+    It 'answers with an empty string when the disk reports no style' {
+        # Reading a property that is not there throws under strict mode, mid disk list.
+        { Get-DiskPartitionStyleName -Disk ([PSCustomObject]@{ Number = 0 }) } | Should -Not -Throw
+        Get-DiskPartitionStyleName -Disk ([PSCustomObject]@{ Number = 0 }) | Should -Be ''
+        Get-DiskPartitionStyleName -Disk ([PSCustomObject]@{ PartitionStyle = $null }) | Should -Be ''
+    }
+}
+
+Describe 'Test-DiskStyleSupported' {
+    It 'works with <Style>' -TestCases @(
+        @{ Style = 'GPT' }
+        @{ Style = 'MBR' }
+    ) {
+        # MBR was measured, not assumed: a Dev Drive was created on an MBR disk on this machine,
+        # Windows called it a trusted developer volume, and its deduplication task was named after
+        # the volume the same way a GPT one is.
+        Test-DiskStyleSupported -Style $Style -Supported @('GPT', 'MBR') | Should -BeTrue
+    }
+
+    It 'refuses <Style>' -TestCases @(
+        @{ Style = 'RAW' }
+        @{ Style = 'Unknown' }
+        @{ Style = '' }
+        @{ Style = '2' }
+    ) {
+        Test-DiskStyleSupported -Style $Style -Supported @('GPT', 'MBR') | Should -BeFalse
+    }
+
+    It 'takes the supported set from its caller rather than knowing one of its own' {
+        Test-DiskStyleSupported -Style 'MBR' -Supported @('GPT') | Should -BeFalse
+    }
+}
+
+Describe 'Format-DiskStyleNote' {
+    It 'quotes what Windows said, whatever it said' -TestCases @(
+        @{ Style = 'RAW' }
+        @{ Style = 'Unknown' }
+        @{ Style = 'Something new' }
+    ) {
+        # One shape for every unusable style: the list reports, it does not interpret.
+        Format-DiskStyleNote -Style $Style | Should -Be "Cannot be used: partition style $Style"
+    }
+
+    It 'does not invent a style for a disk that reported none' {
+        Format-DiskStyleNote -Style '' | Should -Be 'Cannot be used: no partition style reported'
+    }
+}
+
+Describe 'Resolve-UnusableDiskAdvice' {
+    BeforeAll {
+        function Get-Advice {
+            param([string]$Style, [int]$Number = 3, [string]$Init = 'GPT', [string[]]$Set = @('GPT', 'MBR'))
+            (Resolve-UnusableDiskAdvice -Style $Style -DiskNumber $Number -InitializeStyle $Init -Supported $Set) -join "`n"
+        }
+        $script:RawText = Get-Advice -Style 'RAW'
+    }
+
+    It 'gives one message for <Style>, differing only in what Windows reported' -TestCases @(
+        @{ Style = 'RAW' }
+        @{ Style = 'Unknown' }
+        @{ Style = 'Something new' }
+    ) {
+        # One check, one refusal: nothing here knows enough about a style to say more about it.
+        $text = Get-Advice -Style $Style
+        $text | Should -Match "Disk 3 reports its partition style as $Style"
+        $text | Should -Match 'works with GPT and MBR disks only'
+        $text | Should -Match 'Initialize-Disk -Number 3 -PartitionStyle GPT'
+    }
+
+    It 'does not invent a style for a disk that reported none' {
+        Get-Advice -Style '' | Should -Match 'Disk 3 did not report a partition style'
+    }
+
+    It 'names the supported set it was given, so the sentence cannot outlive the check' {
+        $narrow = Get-Advice -Style 'RAW' -Set @('GPT')
+        $narrow | Should -Match 'works with GPT disks only'
+        $narrow | Should -Match 'once Windows reports it as GPT'
+    }
+
+    It 'hands over the command with the number and the style already in it' {
+        $script:RawText | Should -Match 'Initialize-Disk -Number 3 -PartitionStyle GPT'
+        Get-Advice -Style 'RAW' -Number 7 -Init 'MBR' | Should -Match 'Initialize-Disk -Number 7 -PartitionStyle MBR'
+    }
+
+    It 'refuses to render a style that Initialize-Disk would reject' {
+        { Resolve-UnusableDiskAdvice -Style 'RAW' -DiskNumber 3 -InitializeStyle 'NTFS' -Supported @('GPT', 'MBR') } |
+            Should -Throw
+    }
+
+    It 'says to run the command elsewhere and keep this prompt alive, which is the point of it' {
+        # The script already requires administrator rights, so "elevated" says nothing the reader
+        # does not have. What they need told is that the run is still standing at the prompt.
+        $script:RawText | Should -Match 'Leave this prompt open'
+        $script:RawText | Should -Match 'another PowerShell window'
+    }
+
+    It 'offers the remedy as a condition, not as an instruction' {
+        # A disk that looks empty may be one whose table Windows failed to read.
+        $script:RawText | Should -Match 'If you know this disk is new'
+        $script:RawText | Should -Match 'RAW for a table it merely failed to read'
+    }
+
+    It 'says what initializing costs without overstating what the command does' {
+        # Initialize-Disk writes a new partition table over the old one; the bytes are not erased,
+        # they stop being reachable. Blunt enough, and true.
+        $script:RawText | Should -Match 'makes every\s+file on the disk unreachable'
+        $script:RawText | Should -Not -Match 'destroys every file'
+    }
+
+    It 'claims only what is true: the script does initialize the virtual disk it creates itself' {
+        $script:RawText | Should -Match 'never initializes a physical disk'
+        $script:RawText | Should -Not -Match 'never initializes disks'
+    }
+
+    It 'sends the user back to the same prompt, and says how to leave from there' {
+        $script:RawText | Should -Match 'Choose a different disk, type this number again'
+        $script:RawText | Should -Match 'Ctrl\+C to leave without creating anything'
+    }
+
+    It 'returns plain lines rather than objects to unwrap' {
+        Resolve-UnusableDiskAdvice -Style 'RAW' -DiskNumber 3 -InitializeStyle 'GPT' -Supported @('GPT', 'MBR') |
+            Should -BeOfType [string]
     }
 }
 

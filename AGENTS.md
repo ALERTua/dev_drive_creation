@@ -63,9 +63,10 @@ Two consequences:
   but rendering any value to text uses the machine's regional settings.
 - **A ReFS deduplication task is named after its volume.** `Set-ReFSDedupSchedule` registers it under
   `\Microsoft\Windows\ReFsDedupSvc\` as the volume's `UniqueId` GUID, braced and upper case; the scrub
-  task adds `-Scrub`. Measured on two volumes on separate disks. Take the GUID from `Get-Volume` — an
-  MBR partition has none — and never identify a task by its display name, its trigger times, or a
-  before-and-after listing of the folder. That folder keeps the tasks of volumes that no longer exist.
+  task adds `-Scrub`. Measured on three volumes across separate disks, one of them on an MBR disk.
+  Take the GUID from `Get-Volume`, never from `Get-Partition`: a partition on an MBR disk has no GUID
+  of its own, while its volume does. Never identify a task by its display name, its trigger times, or
+  a before-and-after listing of the folder. That folder keeps the tasks of volumes that no longer exist.
 - **English in the repository**, in code, comments, documentation and commit messages.
 
 ## Line endings
