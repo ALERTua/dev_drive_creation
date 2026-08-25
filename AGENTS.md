@@ -13,6 +13,8 @@ shrinking a partition, or inside a `.vhdx` — then optionally sets up BitLocker
 and compression, and the recurring jobs. `dev_drive.ps1` is the whole product; `dev_drive.Tests.ps1`
 is a Pester suite over it; `README.md` documents it for users.
 
+Documentation on ReFS Deduplication/Optimization/Scrub: https://learn.microsoft.com/en-us/powershell/module/microsoft.refsdedup.commands/set-refsdedupschedule?view=windowsserver2025-ps
+
 ## The three checks
 
 Run all three before saying anything is done. The pre-commit hook runs the same three, so a commit
