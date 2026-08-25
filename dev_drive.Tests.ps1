@@ -117,7 +117,7 @@ Describe 'The script itself' {
         $content = Get-Content -Path $script:ScriptPath -Raw
         $content | Should -Match ('(?ms)if \(-not \$SkipDeduplication\) \{\s*\r?\n\s*' +
             '\$dedupSchedule = Request-DedupSchedule .*?\r?\n\s*' +
-            '\$DedupStartTimes = \$dedupSchedule\.DailyTimes\s*\r?\n\s*' +
+            '\$DedupStartTime = \$dedupSchedule\.DailyTime\s*\r?\n\s*' +
             '\$ScrubDays = \$dedupSchedule\.WeeklyDay\s*\r?\n\s*' +
             '\$ScrubStart = \$dedupSchedule\.WeeklyStart\s*\r?\n\s*\}')
     }
@@ -125,12 +125,35 @@ Describe 'The script itself' {
     It 'builds the plan summary, schedules and reminds using the chosen values, not a literal or a stale default' {
         $content = Get-Content -Path $script:ScriptPath -Raw
         $content | Should -Not -Match '\* Schedule daily optimization jobs at 11:00 and 17:00'
-        $content | Should -Match 'Format-DedupScheduleSummary -DailyTimes \$DedupStartTimes'
-        $content | Should -Match 'foreach \(\$time in \$DedupStartTimes\)'
+        $content | Should -Match 'Format-DedupScheduleSummary -DailyTime \$DedupStartTime'
         $content | Should -Match 'Set-ReFSDedupScrubSchedule -Volume "\$devLetterColon" -Days \$ScrubDays -Start \$ScrubStart'
-        $content | Should -Match ('(?ms)Resolve-DedupScheduleReminder -DailyTimes \$DedupStartTimes .*?' +
+        $content | Should -Match ('(?ms)Resolve-DedupScheduleReminder -DailyTime \$DedupStartTime .*?' +
             '-WeeklyDay \$ScrubDays -WeeklyStart \$ScrubStart .*?' +
             '-TaskNames \$ownTaskNames -VolumeTaskName \$devTaskName')
+    }
+
+    # A text search would pass the moment the loop were spelled differently, so ask the syntax tree.
+    # Both shapes count: a loop statement, and the script block ForEach-Object would be handed.
+    It 'writes the daily schedule with a single call, from no loop of any shape' {
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+            $script:ScriptPath, [ref]$null, [ref]$null)
+
+        $calls = @($ast.FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.CommandAst] -and
+                    $node.GetCommandName() -eq 'Set-ReFSDedupSchedule'
+                }, $true))
+        $calls.Count | Should -Be 1 -Because 'one volume holds one daily schedule'
+
+        $repeated = $null
+        for ($node = $calls[0].Parent; $null -ne $node; $node = $node.Parent) {
+            if ($node -is [System.Management.Automation.Language.LoopStatementAst] -or
+                $node -is [System.Management.Automation.Language.ScriptBlockExpressionAst]) {
+                $repeated = $node.GetType().Name
+                break
+            }
+        }
+        $repeated | Should -BeNullOrEmpty -Because 'a second call would silently discard the first time'
     }
 
     It 'configures the mains-power condition only after the weekly maintenance job it must cover' {
@@ -156,11 +179,11 @@ Describe 'The script itself' {
         $reportAt | Should -BeGreaterThan $queryAt
     }
 
-    It 'asks the volume what it stored after the daily schedules and before the weekly one' {
-        # Reading before the scrub schedule is written is what lets the first entry answer for the
-        # daily jobs; after it, a scrub entry could answer instead.
+    It 'asks the volume what it stored after the daily schedule and before the weekly one' {
+        # After the daily call so there is something to confirm, and before the scrub call: the read
+        # takes the first schedule it is given, and a scrub entry in that list would answer instead.
         $content = Get-Content -Path $script:ScriptPath -Raw
-        $dailyAt = $content.IndexOf('Write-Host "Scheduled the daily jobs"')
+        $dailyAt = $content.IndexOf('Set-ReFSDedupSchedule @scheduleParams -ErrorAction Stop')
         $readBackAt = $content.IndexOf('$dedupVerdict = Resolve-DedupReadBackVerdict')
         $scrubAt = $content.IndexOf('Set-ReFSDedupScrubSchedule -Volume "$devLetterColon"')
         $dailyAt | Should -BeGreaterThan 0
@@ -170,7 +193,8 @@ Describe 'The script itself' {
 
     It 'compares the read-back against what the run asked for, not against literals' {
         $content = Get-Content -Path $script:ScriptPath -Raw
-        $content | Should -Match '(?ms)Resolve-DedupReadBackVerdict -MountPoint \$devLetterColon -ExpectedMode \$DedupMode `\s*\r?\n\s*-ExpectedFormat \$CompressionFormat -ExpectedLevel \$CompressionLevel'
+        $content | Should -Match ('(?ms)Resolve-DedupReadBackVerdict -MountPoint \$devLetterColon -ExpectedMode \$DedupMode `\s*\r?\n\s*' +
+            '-ExpectedFormat \$CompressionFormat -ExpectedLevel \$CompressionLevel -ExpectedStart \$DedupStartTime')
     }
 
     It 'colours the trust lines by the outcome, so only a real failure is printed as one' {
@@ -2776,62 +2800,6 @@ Describe 'Resolve-DedupTimeInput' {
     }
 }
 
-Describe 'Resolve-DedupTimeListInput' {
-    It 'rejects <Answer> as <Rejection>' -TestCases @(
-        @{ Answer = '';               Rejection = 'Empty' }
-        @{ Answer = '   ';            Rejection = 'Empty' }
-        @{ Answer = ',';              Rejection = 'Empty' }
-        @{ Answer = ' , ';            Rejection = 'Empty' }
-        @{ Answer = 'abc';            Rejection = 'InvalidTime' }
-        @{ Answer = '11:00,25:00';    Rejection = 'InvalidTime' }
-        @{ Answer = '11:00,,17:00';   Rejection = 'InvalidTime' }
-        @{ Answer = '11:00,17:00,';   Rejection = 'InvalidTime' }
-        @{ Answer = '11:00,,,,17:00'; Rejection = 'InvalidTime' }
-        @{ Answer = '11:00,11:00';    Rejection = 'DuplicateTime' }
-        @{ Answer = '8:15,08:15';     Rejection = 'DuplicateTime' }
-        @{ Answer = '1:00,2:00,3:00,4:00,5:00'; Rejection = 'TooMany' }
-    ) {
-        (Resolve-DedupTimeListInput -Answer $Answer).Rejection | Should -Be $Rejection
-    }
-
-    It 'accepts a single time' {
-        $verdict = Resolve-DedupTimeListInput -Answer '9:00'
-        $verdict.Rejection | Should -BeNullOrEmpty
-        @($verdict.Times) | Should -Be @('09:00')
-    }
-
-    It 'accepts the maximum of four times' {
-        $verdict = Resolve-DedupTimeListInput -Answer '1:00,2:00,3:00,4:00'
-        $verdict.Rejection | Should -BeNullOrEmpty
-        @($verdict.Times).Count | Should -Be 4
-    }
-
-    It 'trims the spaces around each entry' {
-        (Resolve-DedupTimeListInput -Answer ' 8:15 , 13:00 ').Times | Should -Be @('08:15', '13:00')
-    }
-
-    It 'returns the times in ascending order whatever order they were typed in' {
-        (Resolve-DedupTimeListInput -Answer '17:00,8:15,13:00').Times |
-            Should -Be @('08:15', '13:00', '17:00')
-    }
-
-    Context 'when an empty answer means keeping the current times' {
-        It 'returns the current times for <Answer>' -TestCases @(
-            @{ Answer = '' }
-            @{ Answer = '   ' }
-        ) {
-            $verdict = Resolve-DedupTimeListInput -Answer $Answer -CurrentTimes @('11:00', '17:00') -AllowEmpty
-            $verdict.Rejection | Should -BeNullOrEmpty
-            $verdict.Times | Should -Be @('11:00', '17:00')
-        }
-
-        It 'still rejects a list of nothing but separators' {
-            (Resolve-DedupTimeListInput -Answer ',,' -CurrentTimes @('11:00') -AllowEmpty).Rejection |
-                Should -Be 'Empty'
-        }
-    }
-}
-
 Describe 'Resolve-DedupDayInput' {
     It 'rejects <Answer> as <Rejection>' -TestCases @(
         @{ Answer = '';         Rejection = 'Empty' }
@@ -3002,25 +2970,17 @@ Describe 'Request-Compression' {
 Describe 'Get-DedupVolumeReport' {
     It 'reports what the volume answered, still typed rather than rendered' {
         Mock Get-ReFSDedupSchedule {
-            [PSCustomObject]@{ Type = 'DedupAndCompress'; CompressionFormat = 'ZSTD'; CompressionLevel = [uint16]7 }
+            [PSCustomObject]@{
+                Type = 'DedupAndCompress'; CompressionFormat = 'ZSTD'; CompressionLevel = [uint16]7
+                Start = [datetime]'2026-08-25 17:00:00'
+            }
         }
         $report = Get-DedupVolumeReport -MountPoint 'X:'
         $report.Known | Should -BeTrue
         $report.Mode | Should -Be 'DedupAndCompress'
         $report.Format | Should -Be 'ZSTD'
         $report.Level | Should -Be 7
-    }
-
-    It 'takes the first schedule when the volume has several, since they share these settings' {
-        Mock Get-ReFSDedupSchedule {
-            @(
-                [PSCustomObject]@{ Type = 'Compress'; CompressionFormat = 'LZ4'; CompressionLevel = [uint16]12 }
-                [PSCustomObject]@{ Type = 'Dedup'; CompressionFormat = 'ZSTD'; CompressionLevel = [uint16]7 }
-            )
-        }
-        $report = Get-DedupVolumeReport -MountPoint 'X:'
-        $report.Level | Should -Be 12
-        $report.Mode | Should -Be 'Compress'
+        $report.Start | Should -Be '17:00'
     }
 
     It 'says it could not be asked rather than inventing an answer, and why' {
@@ -3042,21 +3002,28 @@ Describe 'Get-DedupVolumeReport' {
 Describe 'Resolve-DedupReadBackVerdict' {
     BeforeAll {
         function New-Report {
-            param([string]$Mode, [string]$Format, [int]$Level, [bool]$Known = $true, [string]$Reason = '')
-            return [PSCustomObject]@{ Known = $Known; Reason = $Reason; Mode = $Mode; Format = $Format; Level = $Level }
+            param(
+                [string]$Mode, [string]$Format, [int]$Level,
+                [bool]$Known = $true, [string]$Reason = '', [string]$Start = '17:00'
+            )
+            return [PSCustomObject]@{
+                Known = $Known; Reason = $Reason; Mode = $Mode; Format = $Format; Level = $Level; Start = $Start
+            }
         }
     }
 
     It 'agrees when the volume reports what was asked for' {
         $verdict = Resolve-DedupReadBackVerdict -MountPoint 'X:' -ExpectedMode 'DedupAndCompress' `
-            -ExpectedFormat 'ZSTD' -ExpectedLevel 7 -Actual (New-Report -Mode 'DedupAndCompress' -Format 'ZSTD' -Level 7)
+            -ExpectedFormat 'ZSTD' -ExpectedLevel 7 -ExpectedStart '17:00' `
+            -Actual (New-Report -Mode 'DedupAndCompress' -Format 'ZSTD' -Level 7)
         $verdict.Agrees | Should -BeTrue
         $verdict.Lines -join "`n" | Should -Match 'X: confirms it: deduplication and ZSTD compression, level 7\.'
     }
 
     It 'treats a reported level of 0 as the default, which is what asking for no level means' {
         $verdict = Resolve-DedupReadBackVerdict -MountPoint 'X:' -ExpectedMode 'Compress' `
-            -ExpectedFormat 'LZ4' -ExpectedLevel $null -Actual (New-Report -Mode 'Compress' -Format 'LZ4' -Level 0)
+            -ExpectedFormat 'LZ4' -ExpectedLevel $null -ExpectedStart '17:00' `
+            -Actual (New-Report -Mode 'Compress' -Format 'LZ4' -Level 0)
         $verdict.Agrees | Should -BeTrue
         $lines = $verdict.Lines -join "`n"
         $lines | Should -Match 'The compression level is the one Windows picks\.'
@@ -3065,46 +3032,78 @@ Describe 'Resolve-DedupReadBackVerdict' {
 
     It 'accepts any level when none was asked for' {
         $verdict = Resolve-DedupReadBackVerdict -MountPoint 'X:' -ExpectedMode 'DedupAndCompress' `
-            -ExpectedFormat 'ZSTD' -ExpectedLevel $null -Actual (New-Report -Mode 'DedupAndCompress' -Format 'ZSTD' -Level 3)
+            -ExpectedFormat 'ZSTD' -ExpectedLevel $null -ExpectedStart '17:00' `
+            -Actual (New-Report -Mode 'DedupAndCompress' -Format 'ZSTD' -Level 3)
         $verdict.Agrees | Should -BeTrue
         $verdict.Lines -join "`n" | Should -Match 'level 3'
     }
 
     It 'names every setting that came back different' -TestCases @(
-        @{ Mode = 'Compress'; Format = 'ZSTD'; Level = 7; Expect = 'mode: asked for DedupAndCompress, the volume reports Compress' }
-        @{ Mode = 'DedupAndCompress'; Format = 'LZ4'; Level = 7; Expect = 'compression format: asked for ZSTD, the volume reports LZ4' }
-        @{ Mode = 'DedupAndCompress'; Format = 'ZSTD'; Level = 3; Expect = 'compression level: asked for level 7, the volume reports level 3' }
+        @{ Mode = 'Compress'; Format = 'ZSTD'; Level = 7; Start = '17:00'; Expect = 'mode: asked for DedupAndCompress, the volume reports Compress' }
+        @{ Mode = 'DedupAndCompress'; Format = 'LZ4'; Level = 7; Start = '17:00'; Expect = 'compression format: asked for ZSTD, the volume reports LZ4' }
+        @{ Mode = 'DedupAndCompress'; Format = 'ZSTD'; Level = 3; Start = '17:00'; Expect = 'compression level: asked for level 7, the volume reports level 3' }
+        @{ Mode = 'DedupAndCompress'; Format = 'ZSTD'; Level = 7; Start = '11:00'; Expect = 'start time: asked for 17:00, the volume reports 11:00' }
     ) {
         $verdict = Resolve-DedupReadBackVerdict -MountPoint 'X:' -ExpectedMode 'DedupAndCompress' `
-            -ExpectedFormat 'ZSTD' -ExpectedLevel 7 -Actual (New-Report -Mode $Mode -Format $Format -Level $Level)
+            -ExpectedFormat 'ZSTD' -ExpectedLevel 7 -ExpectedStart '17:00' `
+            -Actual (New-Report -Mode $Mode -Format $Format -Level $Level -Start $Start)
         $verdict.Agrees | Should -BeFalse
         $verdict.Lines -join "`n" | Should -Match ([regex]::Escape($Expect))
     }
 
+    # Nothing compared the written time until now.
+    It 'catches a time that was promised and not written' {
+        $verdict = Resolve-DedupReadBackVerdict -MountPoint 'X:' -ExpectedMode 'Dedup' `
+            -ExpectedFormat '' -ExpectedLevel $null -ExpectedStart '11:00' `
+            -Actual (New-Report -Mode 'Dedup' -Format '' -Level 0 -Start '17:00')
+        $verdict.Agrees | Should -BeFalse
+        $verdict.Lines -join "`n" | Should -Match 'start time: asked for 11:00, the volume reports 17:00'
+    }
+
+    It 'names the gap rather than passing silently when no start time could be read' {
+        $verdict = Resolve-DedupReadBackVerdict -MountPoint 'X:' -ExpectedMode 'Dedup' `
+            -ExpectedFormat '' -ExpectedLevel $null -ExpectedStart '17:00' `
+            -Actual (New-Report -Mode 'Dedup' -Format '' -Level 0 -Start '')
+        $verdict.Agrees | Should -BeFalse
+        $verdict.Lines -join "`n" | Should -Match 'the volume reported none that could be read'
+    }
+
+    It 'compares the time for every mode, including the one that does not compress' {
+        $verdict = Resolve-DedupReadBackVerdict -MountPoint 'X:' -ExpectedMode 'Dedup' `
+            -ExpectedFormat 'ZSTD' -ExpectedLevel 9 -ExpectedStart '17:00' `
+            -Actual (New-Report -Mode 'Dedup' -Format 'LZ4' -Level 0 -Start '09:00')
+        $verdict.Agrees | Should -BeFalse
+        $verdict.Lines -join "`n" | Should -Match 'start time: asked for 17:00, the volume reports 09:00'
+    }
+
     It 'calls a level asked for and answered with the default a difference, and names it as the default' {
         $verdict = Resolve-DedupReadBackVerdict -MountPoint 'X:' -ExpectedMode 'DedupAndCompress' `
-            -ExpectedFormat 'ZSTD' -ExpectedLevel 7 -Actual (New-Report -Mode 'DedupAndCompress' -Format 'ZSTD' -Level 0)
+            -ExpectedFormat 'ZSTD' -ExpectedLevel 7 -ExpectedStart '17:00' `
+            -Actual (New-Report -Mode 'DedupAndCompress' -Format 'ZSTD' -Level 0)
         $verdict.Agrees | Should -BeFalse
         $verdict.Lines -join "`n" | Should -Match 'the volume reports the default'
     }
 
     It 'ignores the compression settings for the mode that does not compress' {
         $verdict = Resolve-DedupReadBackVerdict -MountPoint 'X:' -ExpectedMode 'Dedup' `
-            -ExpectedFormat 'ZSTD' -ExpectedLevel 9 -Actual (New-Report -Mode 'Dedup' -Format 'LZ4' -Level 0)
+            -ExpectedFormat 'ZSTD' -ExpectedLevel 9 -ExpectedStart '17:00' `
+            -Actual (New-Report -Mode 'Dedup' -Format 'LZ4' -Level 0)
         $verdict.Agrees | Should -BeTrue
         $verdict.Lines -join "`n" | Should -Be 'X: confirms it: deduplication only, without compression.'
     }
 
     It 'says the drive still works when the settings disagree' {
         $verdict = Resolve-DedupReadBackVerdict -MountPoint 'X:' -ExpectedMode 'Dedup' `
-            -ExpectedFormat '' -ExpectedLevel $null -Actual (New-Report -Mode 'Disabled' -Format 'LZ4' -Level 0)
+            -ExpectedFormat '' -ExpectedLevel $null -ExpectedStart '17:00' `
+            -Actual (New-Report -Mode 'Disabled' -Format 'LZ4' -Level 0)
         $verdict.Agrees | Should -BeFalse
         $verdict.Lines -join "`n" | Should -Match 'created and usable'
     }
 
     It 'asks the user to look for themselves when the volume could not be read' {
         $verdict = Resolve-DedupReadBackVerdict -MountPoint 'X:' -ExpectedMode 'Dedup' `
-            -ExpectedFormat '' -ExpectedLevel $null -Actual (New-Report -Known $false -Mode '' -Format '' -Level 0)
+            -ExpectedFormat '' -ExpectedLevel $null -ExpectedStart '17:00' `
+            -Actual (New-Report -Known $false -Mode '' -Format '' -Level 0 -Start '')
         $verdict.Agrees | Should -BeFalse
         $lines = $verdict.Lines -join "`n"
         $lines | Should -Match 'Could not confirm the deduplication settings on X:'
@@ -3113,13 +3112,15 @@ Describe 'Resolve-DedupReadBackVerdict' {
 
     It 'passes on the reason the volume gave, when there is one' {
         $verdict = Resolve-DedupReadBackVerdict -MountPoint 'X:' -ExpectedMode 'Dedup' -ExpectedFormat '' `
-            -ExpectedLevel $null -Actual (New-Report -Known $false -Mode '' -Format '' -Level 0 -Reason 'Windows said: Access is denied.')
+            -ExpectedLevel $null -ExpectedStart '17:00' `
+            -Actual (New-Report -Known $false -Mode '' -Format '' -Level 0 -Start '' -Reason 'Windows said: Access is denied.')
         $verdict.Lines -join "`n" | Should -Match 'Windows said: Access is denied\.'
     }
 
     It 'refuses a mode it does not know' {
         { Resolve-DedupReadBackVerdict -MountPoint 'X:' -ExpectedMode 'Disabled' -ExpectedFormat '' `
-                -ExpectedLevel $null -Actual (New-Report -Mode 'Disabled' -Format '' -Level 0) } | Should -Throw
+                -ExpectedLevel $null -ExpectedStart '17:00' `
+                -Actual (New-Report -Mode 'Disabled' -Format '' -Level 0) } | Should -Throw
     }
 }
 
@@ -3282,17 +3283,49 @@ Describe 'Format-CompressionChoice' {
     }
 }
 
-Describe 'Format-DedupTimeList' {
-    It 'reads <Times> as <Expected>' -TestCases @(
-        @{ Times = @('11:00');                   Expected = '11:00' }
-        @{ Times = @('11:00', '17:00');          Expected = '11:00 and 17:00' }
-        @{ Times = @('08:15', '11:00', '17:00'); Expected = '08:15, 11:00 and 17:00' }
-    ) {
-        Format-DedupTimeList -Times $Times | Should -Be $Expected
+Describe 'Format-DedupScheduleStart' {
+    It 'renders the hour and minute the cmdlet returns, dropping the date it carries' {
+        # Measured: the cmdlet answers a DateTime stamped with the day the schedule was written.
+        Format-DedupScheduleStart -Start ([datetime]'2026-08-25 17:00:00') | Should -Be '17:00'
     }
 
-    It 'throws for an empty array' {
-        { Format-DedupTimeList -Times @() } | Should -Throw
+    It 'renders the same text whatever the machine regional format is' {
+        $original = [System.Threading.Thread]::CurrentThread.CurrentCulture
+        try {
+            foreach ($name in 'en-US', 'uk-UA', 'de-DE', 'th-TH', 'ar-SA') {
+                [System.Threading.Thread]::CurrentThread.CurrentCulture = [cultureinfo]::new($name)
+                Format-DedupScheduleStart -Start ([datetime]'2026-08-25 19:00:00') | Should -Be '19:00'
+            }
+        }
+        finally {
+            [System.Threading.Thread]::CurrentThread.CurrentCulture = $original
+        }
+    }
+
+    It 'answers empty for <Case>, so a read-back names the gap instead of comparing nothing' -TestCases @(
+        @{ Case = 'null';     Start = $null }
+        @{ Case = 'a string'; Start = '17:00' }
+        @{ Case = 'a number'; Start = 17 }
+    ) {
+        Format-DedupScheduleStart -Start $Start | Should -Be ''
+    }
+
+    # The read-back compares this against what Resolve-DedupTimeInput built. Two unrelated format
+    # strings produce those, and a drive set up correctly would be reported wrong if they diverged.
+    It 'renders <Typed> the same way the answer parser stores it' -TestCases @(
+        @{ Typed = '8:15' }
+        @{ Typed = '08:15' }
+        @{ Typed = '0:00' }
+        @{ Typed = '9:05' }
+        @{ Typed = '17:00' }
+        @{ Typed = '18:30' }
+        @{ Typed = '23:59' }
+    ) {
+        $stored = (Resolve-DedupTimeInput -Answer $Typed).Time
+        $parts = $stored -split ':'
+        $asCmdletReturnsIt = (Get-Date -Year 2026 -Month 8 -Day 25 -Hour ([int]$parts[0]) `
+                -Minute ([int]$parts[1]) -Second 0)
+        Format-DedupScheduleStart -Start $asCmdletReturnsIt | Should -Be $stored
     }
 }
 
@@ -3337,37 +3370,45 @@ Describe 'Format-DedupDailyJobNote' {
 }
 
 Describe 'Format-DedupScheduleSummary' {
-    It 'names the days, the daily times, the weekly day and its start' {
-        $lines = Format-DedupScheduleSummary -DailyTimes @('11:00', '17:00') -DailyDaysLabel 'Monday-Friday' `
+    It 'names the days, the daily time, the weekly day and its start' {
+        $lines = Format-DedupScheduleSummary -DailyTime '17:00' -DailyDaysLabel 'Monday-Friday' `
             -WeeklyDay 'Monday' -WeeklyStart '17:30' -WeeksInterval 1 -WeeklyJob
         $lines.Count | Should -Be 2
-        $lines[0] | Should -Be '  Daily optimization : Monday-Friday at 11:00 and 17:00'
+        $lines[0] | Should -Be '  Daily optimization : Monday-Friday at 17:00'
         $lines[1] | Should -Be '  Weekly maintenance : Monday at 17:30, every 1 week'
     }
 
-    It 'shows the times the user chose rather than the defaults' {
-        $lines = Format-DedupScheduleSummary -DailyTimes @('08:15', '13:00') -DailyDaysLabel 'Monday-Friday' `
+    It 'shows what the user chose rather than the defaults' {
+        $lines = Format-DedupScheduleSummary -DailyTime '08:00' -DailyDaysLabel 'Monday-Friday' `
             -WeeklyDay 'Saturday' -WeeklyStart '09:00' -WeeksInterval 1 -WeeklyJob
-        $lines[0] | Should -Match '08:15 and 13:00'
+        $lines[0] | Should -Match 'at 08:00$'
         $lines[1] | Should -Match 'Saturday at 09:00'
     }
 
+    It 'promises one daily run, never a list' {
+        # The line that told a user their second chosen time would run, when only one ever did.
+        $lines = Format-DedupScheduleSummary -DailyTime '17:00' -DailyDaysLabel 'Monday-Friday' `
+            -WeeklyDay 'Monday' -WeeklyStart '17:30' -WeeksInterval 1 -WeeklyJob
+        $lines[0] | Should -Not -Match ' and '
+        $lines[0] | Should -Not -Match ','
+    }
+
     It 'says weeks in the plural for an interval above one' {
-        $lines = Format-DedupScheduleSummary -DailyTimes @('11:00') -DailyDaysLabel 'Monday-Friday' `
+        $lines = Format-DedupScheduleSummary -DailyTime '11:00' -DailyDaysLabel 'Monday-Friday' `
             -WeeklyDay 'Monday' -WeeklyStart '17:30' -WeeksInterval 2 -WeeklyJob
         $lines[1] | Should -Match 'every 2 weeks'
     }
 
     It 'promises no weekly maintenance where Windows will schedule none' {
         # @(): one line comes back as a bare string, and strict mode refuses .Count on one of those.
-        $lines = @(Format-DedupScheduleSummary -DailyTimes @('11:00', '17:00') -DailyDaysLabel 'Monday-Friday' `
+        $lines = @(Format-DedupScheduleSummary -DailyTime '17:00' -DailyDaysLabel 'Monday-Friday' `
                 -WeeklyDay 'Monday' -WeeklyStart '17:30' -WeeksInterval 1)
         $lines.Count | Should -Be 1
-        $lines[0] | Should -Be '  Daily optimization : Monday-Friday at 11:00 and 17:00'
+        $lines[0] | Should -Be '  Daily optimization : Monday-Friday at 17:00'
     }
 
     It 'needs no weekly day at all when there is no weekly job' {
-        { Format-DedupScheduleSummary -DailyTimes @('11:00') -DailyDaysLabel 'Monday-Friday' } |
+        { Format-DedupScheduleSummary -DailyTime '11:00' -DailyDaysLabel 'Monday-Friday' } |
             Should -Not -Throw
     }
 }
@@ -3466,24 +3507,24 @@ Describe 'Resolve-DedupScheduleReminder' {
         $script:ReminderTask = '{AA0DAF00-0000-0000-0000-100000000000}'
     }
 
-    It 'names the times just chosen, so the user can see what was set without opening anything' {
-        $lines = (Resolve-DedupScheduleReminder -DailyTimes @('08:15', '13:00') -WeeklyDay 'Monday' `
+    It 'names the time just chosen, so the user can see what was set without opening anything' {
+        $lines = (Resolve-DedupScheduleReminder -DailyTime '08:00' -WeeklyDay 'Monday' `
                 -WeeklyStart '17:30' -TaskTreePath $script:TreePath -WeeklyJob) -join "`n"
-        $lines | Should -Match '08:15 and 13:00 daily'
+        $lines | Should -Match '08:00 daily'
         $lines | Should -Match 'Monday at 17:30 weekly'
     }
 
     It 'names no weekly time where no weekly task was created' {
         # Naming one sends the user hunting through Task Scheduler for a task that is not there.
-        $lines = (Resolve-DedupScheduleReminder -DailyTimes @('08:15', '13:00') -WeeklyDay 'Monday' `
+        $lines = (Resolve-DedupScheduleReminder -DailyTime '08:00' -WeeklyDay 'Monday' `
                 -WeeklyStart '17:30' -TaskTreePath $script:TreePath) -join "`n"
-        $lines | Should -Match '08:15 and 13:00 daily\.'
+        $lines | Should -Match '08:00 daily\.'
         $lines | Should -Not -Match 'weekly'
         $lines | Should -Not -Match '17:30'
     }
 
     It 'gives the folder location, the admin steps and the Actions tab warning' {
-        $lines = (Resolve-DedupScheduleReminder -DailyTimes @('11:00', '17:00') -WeeklyDay 'Monday' `
+        $lines = (Resolve-DedupScheduleReminder -DailyTime '17:00' -WeeklyDay 'Monday' `
                 -WeeklyStart '17:30' -TaskTreePath $script:TreePath) -join "`n"
         $lines | Should -Match ([regex]::Escape($script:TreePath))
         $lines | Should -Match 'taskschd\.msc'
@@ -3494,14 +3535,14 @@ Describe 'Resolve-DedupScheduleReminder' {
     }
 
     It 'returns plain lines rather than an object to unwrap' {
-        Resolve-DedupScheduleReminder -DailyTimes @('11:00') -WeeklyDay 'Monday' -WeeklyStart '17:30' `
+        Resolve-DedupScheduleReminder -DailyTime '11:00' -WeeklyDay 'Monday' -WeeklyStart '17:30' `
             -TaskTreePath $script:TreePath | Should -BeOfType [string]
     }
 
     It 'names each task that was read back, and says which job it is' {
         # Two drives scheduled at the same times are indistinguishable by their Triggers column, so
         # the times are not an answer to "which of these is mine".
-        $lines = (Resolve-DedupScheduleReminder -DailyTimes @('11:00', '17:00') -WeeklyDay 'Monday' `
+        $lines = (Resolve-DedupScheduleReminder -DailyTime '17:00' -WeeklyDay 'Monday' `
                 -WeeklyStart '17:30' -TaskTreePath $script:TreePath -VolumeTaskName $script:ReminderTask `
                 -TaskNames @($script:ReminderTask, "$($script:ReminderTask)-Scrub") -WeeklyJob) -join "`n"
         $lines | Should -Match ([regex]::Escape("$($script:ReminderTask)  - the daily job"))
@@ -3511,7 +3552,7 @@ Describe 'Resolve-DedupScheduleReminder' {
 
     It 'names only what it was given, so it cannot promise a task that was never found' {
         # The run says a few lines earlier when no task was found; naming one here would contradict it.
-        $lines = (Resolve-DedupScheduleReminder -DailyTimes @('11:00') -WeeklyDay 'Monday' `
+        $lines = (Resolve-DedupScheduleReminder -DailyTime '11:00' -WeeklyDay 'Monday' `
                 -WeeklyStart '17:30' -TaskTreePath $script:TreePath -VolumeTaskName $script:ReminderTask `
                 -TaskNames @($script:ReminderTask)) -join "`n"
         $lines | Should -Match ([regex]::Escape("$($script:ReminderTask)  - the daily job"))
@@ -3519,7 +3560,7 @@ Describe 'Resolve-DedupScheduleReminder' {
     }
 
     It 'does not call the other tasks stale, because the folder holds live drives too' {
-        $lines = (Resolve-DedupScheduleReminder -DailyTimes @('11:00') -WeeklyDay 'Monday' `
+        $lines = (Resolve-DedupScheduleReminder -DailyTime '11:00' -WeeklyDay 'Monday' `
                 -WeeklyStart '17:30' -TaskTreePath $script:TreePath -VolumeTaskName $script:ReminderTask `
                 -TaskNames @($script:ReminderTask)) -join "`n"
         $lines | Should -Match 'to another drive'
@@ -3529,11 +3570,38 @@ Describe 'Resolve-DedupScheduleReminder' {
     It 'falls back to the times when no task was read back' {
         # Nothing to name then, so the old wording is the only handle the user has left.
         foreach ($none in @(@(), @($null), @('   '))) {
-            $lines = (Resolve-DedupScheduleReminder -DailyTimes @('11:00') -WeeklyDay 'Monday' `
+            $lines = (Resolve-DedupScheduleReminder -DailyTime '11:00' -WeeklyDay 'Monday' `
                     -WeeklyStart '17:30' -TaskTreePath $script:TreePath -TaskNames $none `
                     -VolumeTaskName $script:ReminderTask) -join "`n"
             $lines | Should -Match 'whose Triggers column matches'
             $lines | Should -Not -Match 'named after the volume itself'
+        }
+    }
+
+    Context 'the note about adding further triggers by hand' {
+        It 'appears whether or not the tasks could be named' {
+            foreach ($names in @(@(), @($script:ReminderTask))) {
+                $lines = (Resolve-DedupScheduleReminder -DailyTime '17:00' -WeeklyDay 'Monday' `
+                        -WeeklyStart '17:30' -TaskTreePath $script:TreePath -TaskNames $names `
+                        -VolumeTaskName $script:ReminderTask) -join "`n"
+                $lines | Should -Match 'one daily start time per volume'
+                $lines | Should -Match 'add further triggers'
+            }
+        }
+
+        It 'warns that the next schedule written removes them' {
+            # Measured: a hand-added trigger sticks, and the next Set-ReFSDedupSchedule wipes it.
+            $lines = (Resolve-DedupScheduleReminder -DailyTime '17:00' -WeeklyDay 'Monday' `
+                    -WeeklyStart '17:30' -TaskTreePath $script:TreePath) -join "`n"
+            $lines | Should -Match 'rerunning this script'
+            $lines | Should -Match 'Set-ReFSDedupSchedule'
+            $lines | Should -Match 'they are\s+removed'
+        }
+
+        It 'claims no more than was established, because no run on such a trigger was observed' {
+            $lines = (Resolve-DedupScheduleReminder -DailyTime '17:00' -WeeklyDay 'Monday' `
+                    -WeeklyStart '17:30' -TaskTreePath $script:TreePath) -join "`n"
+            $lines | Should -Match 'has not been\s+confirmed'
         }
     }
 }
@@ -3544,73 +3612,76 @@ Describe 'Request-DedupSchedule' {
         Mock Write-Host { }
     }
 
-    It 'keeps the offered times when the user takes them' {
+    It 'keeps the offered time when the user takes it' {
         Mock Read-Host { '1' }
-        $chosen = Request-DedupSchedule -DailyTimes @('11:00', '17:00') -DailyDaysLabel 'Monday-Friday' `
+        $chosen = Request-DedupSchedule -DailyTime '17:00' -DailyDaysLabel 'Monday-Friday' `
             -WeeklyDay 'Monday' -WeeklyStart '17:30' -WeeksInterval 1 -DailyDurationHours 2 -DailyCpuPercent 60 -BlockDedup
-        $chosen.DailyTimes | Should -Be @('11:00', '17:00')
+        $chosen.DailyTime | Should -Be '17:00'
         $chosen.WeeklyDay | Should -Be 'Monday'
         $chosen.WeeklyStart | Should -Be '17:30'
     }
 
     It 'takes the three answers when the user picks the times' {
-        $script:answers = @('2', '08:15,13:00', 'sat', '9:00')
+        $script:answers = @('2', '08:15', 'sat', '9:00')
         $script:index = 0
         Mock Read-Host { $script:answers[$script:index++] }
-        $chosen = Request-DedupSchedule -DailyTimes @('11:00', '17:00') -DailyDaysLabel 'Monday-Friday' `
+        $chosen = Request-DedupSchedule -DailyTime '17:00' -DailyDaysLabel 'Monday-Friday' `
             -WeeklyDay 'Monday' -WeeklyStart '17:30' -WeeksInterval 1 -DailyDurationHours 2 -DailyCpuPercent 60 -BlockDedup
-        $chosen.DailyTimes | Should -Be @('08:15', '13:00')
+        $chosen.DailyTime | Should -Be '08:15'
         $chosen.WeeklyDay | Should -Be 'Saturday'
         $chosen.WeeklyStart | Should -Be '09:00'
+    }
+
+    It 'keeps a daily time with minutes in it, which is why the question still asks for HH:MM' {
+        $script:answers = @('2', '18:30', 'Mon', '17:30')
+        $script:index = 0
+        Mock Read-Host { $script:answers[$script:index++] }
+        $chosen = Request-DedupSchedule -DailyTime '17:00' -DailyDaysLabel 'Monday-Friday' `
+            -WeeklyDay 'Monday' -WeeklyStart '17:30' -WeeksInterval 1 -DailyDurationHours 2 -DailyCpuPercent 60 -BlockDedup
+        $chosen.DailyTime | Should -Be '18:30'
     }
 
     It 'keeps each current value when the answer is empty' {
         $script:answers = @('2', '', '', '')
         $script:index = 0
         Mock Read-Host { $script:answers[$script:index++] }
-        $chosen = Request-DedupSchedule -DailyTimes @('11:00', '17:00') -DailyDaysLabel 'Monday-Friday' `
+        $chosen = Request-DedupSchedule -DailyTime '17:00' -DailyDaysLabel 'Monday-Friday' `
             -WeeklyDay 'Monday' -WeeklyStart '17:30' -WeeksInterval 1 -DailyDurationHours 2 -DailyCpuPercent 60 -BlockDedup
-        $chosen.DailyTimes | Should -Be @('11:00', '17:00')
+        $chosen.DailyTime | Should -Be '17:00'
         $chosen.WeeklyDay | Should -Be 'Monday'
         $chosen.WeeklyStart | Should -Be '17:30'
     }
 
     It 'keeps asking until each answer is one it can use' {
-        $script:answers = @('9', '2', '11:00,11:00', 'noon', '08:15', 'someday', 'Tue', '99:99', '7:30')
+        # A comma separated list used to be accepted here; it is one answer among the rejected ones now.
+        $script:answers = @('9', '2', '11:00,17:00', 'noon', '08:15', 'someday', 'Tue', '99:99', '7:30')
         $script:index = 0
         Mock Read-Host { $script:answers[$script:index++] }
-        $chosen = Request-DedupSchedule -DailyTimes @('11:00', '17:00') -DailyDaysLabel 'Monday-Friday' `
+        $chosen = Request-DedupSchedule -DailyTime '17:00' -DailyDaysLabel 'Monday-Friday' `
             -WeeklyDay 'Monday' -WeeklyStart '17:30' -WeeksInterval 1 -DailyDurationHours 2 -DailyCpuPercent 60 -BlockDedup
-        $chosen.DailyTimes | Should -Be @('08:15')
+        $chosen.DailyTime | Should -Be '08:15'
         $chosen.WeeklyDay | Should -Be 'Tuesday'
         $chosen.WeeklyStart | Should -Be '07:30'
         $script:index | Should -Be 9
     }
 
-    It 'rejects too many daily times and asks again' {
-        $script:answers = @('2', '1:00,2:00,3:00,4:00,5:00', '08:15', 'Tue', '07:30')
+    It 'never offers to take more than one daily time' {
+        # The question that caused this: it invited a list, and only the last entry was ever written.
+        # Answer 2 first, or the prompt under test never prints and the assertions pass on nothing.
+        $script:answers = @('2', '08:15', 'Mon', '17:30')
         $script:index = 0
         Mock Read-Host { $script:answers[$script:index++] }
-        $chosen = Request-DedupSchedule -DailyTimes @('11:00', '17:00') -DailyDaysLabel 'Monday-Friday' `
-            -WeeklyDay 'Monday' -WeeklyStart '17:30' -WeeksInterval 1 -DailyDurationHours 2 -DailyCpuPercent 60 -BlockDedup
-        $chosen.DailyTimes | Should -Be @('08:15')
-    }
-
-    It 'gives the real reason for the daily-time cap, not a claim about overlap' {
-        $script:answers = @('2', '1:00,2:00,3:00,4:00,5:00', '08:15', 'Tue', '07:30')
-        $script:index = 0
-        Mock Read-Host { $script:answers[$script:index++] }
-        Request-DedupSchedule -DailyTimes @('11:00', '17:00') -DailyDaysLabel 'Monday-Friday' `
-            -WeeklyDay 'Monday' -WeeklyStart '17:30' -WeeksInterval 1 -DailyDurationHours 2 -DailyCpuPercent 60 -BlockDedup |
-            Out-Null
-        Should -Invoke Write-Host -ParameterFilter {
-            $Object -match 'own scheduled task' -and $Object -notmatch 'Overlap'
-        }
+        Request-DedupSchedule -DailyTime '17:00' -DailyDaysLabel 'Monday-Friday' `
+            -WeeklyDay 'Monday' -WeeklyStart '17:30' -WeeksInterval 1 -DailyDurationHours 2 -DailyCpuPercent 60 `
+            -BlockDedup | Out-Null
+        Should -Invoke Write-Host -ParameterFilter { $Object -match 'Start time for the daily optimization' }
+        Should -Not -Invoke Write-Host -ParameterFilter { $Object -match 'comma separated' }
+        Should -Not -Invoke Write-Host -ParameterFilter { $Object -match 'own scheduled task' }
     }
 
     It 'says the daily job, not both jobs, run on mains power for a duration and CPU cap it names' {
         Mock Read-Host { '1' }
-        Request-DedupSchedule -DailyTimes @('11:00', '17:00') -DailyDaysLabel 'Monday-Friday' `
+        Request-DedupSchedule -DailyTime '17:00' -DailyDaysLabel 'Monday-Friday' `
             -WeeklyDay 'Monday' -WeeklyStart '17:30' -WeeksInterval 1 -DailyDurationHours 3 -DailyCpuPercent 45 `
             -BlockDedup | Out-Null
         Should -Invoke Write-Host -ParameterFilter {
@@ -3619,20 +3690,20 @@ Describe 'Request-DedupSchedule' {
     }
 
     It 'asks nothing about a weekly job that cannot exist' {
-        # Compression only: the user picks the daily times and is never asked for a day or a time
+        # Compression only: the user picks the daily time and is never asked for a day or a time
         # for maintenance Windows will refuse to schedule.
-        $script:answers = @('2', '08:15,13:00')
+        $script:answers = @('2', '08:15')
         $script:index = 0
         Mock Read-Host { $script:answers[$script:index++] }
-        $chosen = Request-DedupSchedule -DailyTimes @('11:00', '17:00') -DailyDaysLabel 'Monday-Friday' `
+        $chosen = Request-DedupSchedule -DailyTime '17:00' -DailyDaysLabel 'Monday-Friday' `
             -WeeklyDay 'Monday' -WeeklyStart '17:30' -WeeksInterval 1 -DailyDurationHours 2 -DailyCpuPercent 60
-        $chosen.DailyTimes | Should -Be @('08:15', '13:00')
+        $chosen.DailyTime | Should -Be '08:15'
         $script:index | Should -Be 2
     }
 
     It 'hands back the weekly values it was given when it asked about none' {
         Mock Read-Host { '1' }
-        $chosen = Request-DedupSchedule -DailyTimes @('11:00') -DailyDaysLabel 'Monday-Friday' `
+        $chosen = Request-DedupSchedule -DailyTime '11:00' -DailyDaysLabel 'Monday-Friday' `
             -WeeklyDay 'Monday' -WeeklyStart '17:30' -WeeksInterval 1 -DailyDurationHours 2 -DailyCpuPercent 60
         $chosen.WeeklyDay | Should -Be 'Monday'
         $chosen.WeeklyStart | Should -Be '17:30'
@@ -3640,7 +3711,7 @@ Describe 'Request-DedupSchedule' {
 
     It 'promises no time limit and no CPU share where neither applies' {
         Mock Read-Host { '1' }
-        Request-DedupSchedule -DailyTimes @('11:00') -DailyDaysLabel 'Monday-Friday' `
+        Request-DedupSchedule -DailyTime '11:00' -DailyDaysLabel 'Monday-Friday' `
             -WeeklyDay 'Monday' -WeeklyStart '17:30' -WeeksInterval 1 -DailyDurationHours 3 -DailyCpuPercent 45 |
             Out-Null
         Should -Invoke Write-Host -ParameterFilter { $Object -match 'no time limit and no CPU share' }

@@ -92,7 +92,7 @@ Everything above produces one screen, and nothing on disk has changed when it ap
 * Name the Dev Drive Projects
 * Skip BitLocker encryption
 * Enable ReFS deduplication and ZSTD compression, level 2
-* Daily optimization : Monday-Friday at 11:00 and 17:00
+* Daily optimization : Monday-Friday at 17:00
 * Weekly maintenance : Monday at 17:30, every 1 week
 * Mark Dev Drive as trusted for Windows Defender performance
 * Run initial optimization job to prepare the drive
@@ -182,14 +182,16 @@ Reclaiming that space on the host means compacting the file, and there are repor
 
 ## Scheduled optimization jobs
 
-By default the script creates two daily deduplication jobs and one weekly maintenance job:
+By default the script creates one daily deduplication job and one weekly maintenance job:
 
-- 11:00 and 17:00 daily, Monday-Friday, **only on AC power** (2 hours duration, 60% CPU limit each)
+- 17:00 daily, Monday-Friday, **only on AC power** (2 hours duration, 60% CPU limit)
 - Monday at 17:30 weekly (maintenance pass, every week)
 
-The daily start times and the weekly day and time are asked for during the run; everything else about the jobs is fixed. They live under `Task Scheduler Library > Microsoft > Windows > ReFsDedupSvc`, which is where you change the times later - the script prints that path once at the end of a run.
+**One daily start time, because a volume holds one.** `Set-ReFSDedupSchedule` replaces a volume's schedule rather than adding to it, so a second time can only ever overwrite the first. Task Scheduler will let you add further triggers to the daily task by hand, but nothing here reports them back, the next time a schedule is written for the drive they are removed, and whether the optimization actually runs on a trigger added that way has not been confirmed.
 
-In compress-only mode there is no weekly maintenance job and no duration or CPU limit on the daily one: Windows refuses those settings on a volume that only compresses, and accepts a duration only to drop it. The run creates the daily jobs on AC power and says the weekly one is being skipped.
+The daily start time and the weekly day and time are asked for during the run; everything else about the jobs is fixed. They live under `Task Scheduler Library > Microsoft > Windows > ReFsDedupSvc`, which is where you change the times later - the script prints that path once at the end of a run.
+
+In compress-only mode there is no weekly maintenance job and no duration or CPU limit on the daily one: Windows refuses those settings on a volume that only compresses, and accepts a duration only to drop it. The run creates the daily job on AC power and says the weekly one is being skipped.
 
 ## Troubleshooting
 
