@@ -373,9 +373,13 @@ Describe 'The script itself' {
     }
 
     It 'never names a cause for a refused password that it did not establish' {
-        # Three of the four refusals are not about complexity. The last line before the run exits
-        # lives at the call site, so a function that stopped claiming it is not enough.
-        Select-String -Path $script:ScriptPath -Pattern 'complexity' | Should -BeNullOrEmpty
+        # Three of the four refusals are not about complexity. The verdict function is covered by
+        # its own tests; this pins the one line they cannot see - the last thing printed before the
+        # run exits, which lives at the call site. Scoped to the throw so that rewording the
+        # password prompt, which may legitimately discuss complexity, does not trip it.
+        $throws = @(Select-String -Path $script:ScriptPath -Pattern '^\s*throw "' | ForEach-Object { $_.Line })
+        @($throws | Where-Object { $_ -match 'complexity' }) | Should -BeNullOrEmpty
+        @($throws | Where-Object { $_ -match 'did not accept the password' }).Count | Should -Be 1
     }
 
     It 'never tells the user to just try again' {
@@ -1342,6 +1346,18 @@ Describe 'Format-DevDriveStateAfterFailure' {
         # The one wrong answer here can cost somebody their data.
         Format-DevDriveStateAfterFailure -VolumeState 'Unknown' | Should -Not -Match 'works without BitLocker'
     }
+
+    It 'gives an encrypted drive a next step when the run stops there' {
+        # Nothing prints after this, so a person told their drive is encrypting and nothing else
+        # has been left without the one thing that gets them back into it.
+        (Format-DevDriveStateAfterFailure -VolumeState 'Encrypted' -RunEnding) -join "`n" |
+            Should -Match 'recovery key is the way back'
+    }
+
+    It 'leaves that out where the run carries on and says it later' {
+        (Format-DevDriveStateAfterFailure -VolumeState 'Encrypted') -join "`n" |
+            Should -Not -Match 'recovery key'
+    }
 }
 
 Describe 'Resolve-BitLockerFailure' {
@@ -1363,6 +1379,27 @@ Describe 'Resolve-BitLockerFailure' {
     It 'matches the code whatever case it is written in' {
         (Resolve-BitLockerFailure -Message 'refused (0x803100a4)' -RetryCount 1 -MaxRetries 10 -PasswordAsked).Kind |
             Should -Be 'Password'
+    }
+
+    It 'takes the code from the number when the text does not carry it' {
+        # .NET puts the code in the message today, in both editions. That is one formatting choice
+        # away from being absent, and the exception carries the number regardless.
+        $verdict = Resolve-BitLockerFailure -Message 'Kennwort abgelehnt.' -HResult -2144272255 `
+            -RetryCount 1 -MaxRetries 10 -PasswordAsked
+        $verdict.Kind | Should -Be 'Password'
+    }
+
+    It 'takes a policy refusal from the number too' {
+        $verdict = Resolve-BitLockerFailure -Message 'Abgelehnt.' -HResult -2144272290 `
+            -RetryCount 1 -MaxRetries 10 -PasswordAsked
+        $verdict.Kind | Should -Be 'Other'
+        $verdict.CanRetry | Should -BeFalse
+    }
+
+    It 'reads no code out of an unset number' {
+        # 0 is "nothing was passed", not a code, and must not collide with anything.
+        (Resolve-BitLockerFailure -Message 'Etwas ging schief.' -HResult 0 `
+                -RetryCount 1 -MaxRetries 10 -PasswordAsked).Kind | Should -Be 'Other'
     }
 
     It 'no longer decides by English words: <Description>' -TestCases @(
@@ -1388,6 +1425,13 @@ Describe 'Resolve-BitLockerFailure' {
         $verdict.Kind | Should -Be 'Other'
         $verdict.CanRetry | Should -BeFalse
         ($verdict.Lines -join "`n") | Should -Match 'same refusal'
+    }
+
+    It 'does not call a FIPS refusal a group policy one' {
+        # FIPS is a different machine setting with a different remedy, and the quoted Windows text
+        # above already says which of the two refused. Naming one sends people to the wrong place.
+        ((Resolve-BitLockerFailure -Message 'FIPS. (0x8031006C)' -RetryCount 1 -MaxRetries 10).Lines -join "`n") |
+            Should -Not -Match 'Group policy'
     }
 
     It 'never blames the password on a run that never asks for one' {

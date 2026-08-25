@@ -590,12 +590,19 @@ function Resolve-BitLockerProtectorPlan {
 }
 
 function Format-DevDriveStateAfterFailure {
-    <# What the drive is once BitLocker has failed. Said on every path that ends the run, because a
-       failure after the drive exists must not leave the person guessing what they have. #>
-    param([ValidateSet('Encrypted', 'Clear', 'Unknown')][string]$VolumeState = 'Unknown')
+    <# What the drive is once BitLocker has failed. -RunEnding adds the next step for a run that
+       stops here, where nothing further will be printed to offer one. #>
+    param(
+        [ValidateSet('Encrypted', 'Clear', 'Unknown')][string]$VolumeState = 'Unknown',
+        [switch]$RunEnding
+    )
 
     if ($VolumeState -eq 'Encrypted') {
-        return "The Dev Drive is created and formatted, and BitLocker has already started encrypting it."
+        $lines = @("The Dev Drive is created and formatted, and BitLocker has already started encrypting it.")
+        if ($RunEnding) {
+            $lines += "Its recovery key is the way back into it. Read it with: (Get-BitLockerVolume -MountPoint <drive>).KeyProtector"
+        }
+        return $lines
     }
     if ($VolumeState -eq 'Clear') {
         return "The Dev Drive itself is created and formatted, and works without BitLocker."
@@ -614,6 +621,7 @@ function Resolve-BitLockerFailure {
         [Parameter(Mandatory)][int]$RetryCount,
         [Parameter(Mandatory)][int]$MaxRetries,
         [ValidateSet('Encrypted', 'Clear', 'Unknown')][string]$VolumeState = 'Unknown',
+        [int]$HResult = 0,
         [switch]$Unretryable,
         [switch]$PasswordAsked
     )
@@ -621,15 +629,23 @@ function Resolve-BitLockerFailure {
     $exhausted = $RetryCount -ge $MaxRetries
     $canRetry = -not $exhausted -and -not $Unretryable
 
+    # The number, not only the rendering of it: .NET puts the code in the message text too, but that
+    # is one formatting choice away from being absent, and the exception carries it either way.
+    $searchable = $Message
+    if ($HResult -ne 0) {
+        # 0xFFFFFFFFL, not 0xFFFFFFFF: the second is Int32 -1 and masks nothing off a negative code.
+        $searchable += ' 0x{0:X8}' -f [uint32]($HResult -band 0xFFFFFFFFL)
+    }
+
     # Both sets are matched by code, because the sentence around each comes from a localized
     # message resource. Policy refusals: no recovery key, no password, FIPS forbids passwords.
-    $policyRefusal = $Message -match '0x8031005E|0x8031006A|0x8031006C'
+    $policyRefusal = $searchable -match '0x8031005E|0x8031006A|0x8031006C'
     if ($policyRefusal) {
         $canRetry = $false
     }
 
     # Password refusals: too short, too simple, not printable ASCII, over 256 characters.
-    $passwordRefusal = $Message -match '0x80310080|0x80310081|0x803100A4|0x803100AA'
+    $passwordRefusal = $searchable -match '0x80310080|0x80310081|0x803100A4|0x803100AA'
 
     # Only a run that asked for a password can be failing on one, whatever the message carries.
     if (-not $policyRefusal -and $PasswordAsked -and $passwordRefusal) {
@@ -640,14 +656,16 @@ function Resolve-BitLockerFailure {
         } else {
             # The run ends here, so it must say what the drive is, as every other failure path does.
             $lines += "Maximum retry attempts reached. BitLocker setup failed."
-            $lines += Format-DevDriveStateAfterFailure -VolumeState $VolumeState
+            $lines += Format-DevDriveStateAfterFailure -VolumeState $VolumeState -RunEnding
         }
         return [PSCustomObject]@{ Kind = 'Password'; Exhausted = $exhausted; CanRetry = $canRetry; Lines = $lines }
     }
 
     $lines = @("BitLocker setup did not finish. Windows reported: $Message")
     if ($policyRefusal) {
-        $lines += "Group policy on this machine refuses it, so trying again meets the same refusal."
+        # Not named: two of those three codes are group policy and one is FIPS, and the line above
+        # already quotes which. Naming the wrong setting sends someone to the wrong place.
+        $lines += "This machine refuses it, so trying again meets the same refusal."
     }
     $lines += Format-DevDriveStateAfterFailure -VolumeState $VolumeState
 
@@ -2663,7 +2681,8 @@ try {
                 $failureState = (Get-BitLockerProtectionState -MountPoint $devLetterColon).Label
                 $passwordAsked = $bitLockerPlan.UsePasswordProtector
                 $verdict = Resolve-BitLockerFailure -Message $failure.Exception.Message -RetryCount $retryCount `
-                    -MaxRetries $maxRetries -VolumeState $failureState -Unretryable:$unretryable -PasswordAsked:$passwordAsked
+                    -MaxRetries $maxRetries -VolumeState $failureState -HResult $failure.Exception.HResult `
+                    -Unretryable:$unretryable -PasswordAsked:$passwordAsked
                 foreach ($line in $verdict.Lines) {
                     Write-Host $line -ForegroundColor Red
                 }
