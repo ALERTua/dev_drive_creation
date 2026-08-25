@@ -372,6 +372,16 @@ Describe 'The script itself' {
         $confirmAt | Should -BeGreaterThan $adviceAt
     }
 
+    It 'never names a cause for a refused password that it did not establish' {
+        # Three of the four refusals are not about complexity. The verdict function is covered by
+        # its own tests; this pins the one line they cannot see - the last thing printed before the
+        # run exits, which lives at the call site. Scoped to the throw so that rewording the
+        # password prompt, which may legitimately discuss complexity, does not trip it.
+        $throws = @(Select-String -Path $script:ScriptPath -Pattern '^\s*throw "' | ForEach-Object { $_.Line })
+        @($throws | Where-Object { $_ -match 'complexity' }) | Should -BeNullOrEmpty
+        @($throws | Where-Object { $_ -match 'did not accept the password' }).Count | Should -Be 1
+    }
+
     It 'never tells the user to just try again' {
         Select-String -Path $script:ScriptPath -Pattern 'try again' | Should -BeNullOrEmpty
     }
@@ -1319,36 +1329,154 @@ Describe 'Resolve-BitLockerSetupPlan' {
     }
 }
 
-Describe 'Resolve-BitLockerFailure' {
-    It 'recognises <Description> as a rejected password' -TestCases @(
-        @{ Description = 'a complexity complaint'
-           Message = 'The password does not meet the password complexity requirements.' }
-        @{ Description = 'a requirements complaint'; Message = 'Password requirements not met.' }
+Describe 'Format-DevDriveStateAfterFailure' {
+    It 'names the state for <VolumeState>' -TestCases @(
+        @{ VolumeState = 'Encrypted'; Expected = 'already started encrypting' }
+        @{ VolumeState = 'Clear'; Expected = 'works without BitLocker' }
+        @{ VolumeState = 'Unknown'; Expected = 'could not be read' }
     ) {
+        Format-DevDriveStateAfterFailure -VolumeState $VolumeState | Should -Match $Expected
+    }
+
+    It 'assumes nothing when no state is passed' {
+        Format-DevDriveStateAfterFailure | Should -Match 'could not be read'
+    }
+
+    It 'never calls an unread volume unencrypted' {
+        # The one wrong answer here can cost somebody their data.
+        Format-DevDriveStateAfterFailure -VolumeState 'Unknown' | Should -Not -Match 'works without BitLocker'
+    }
+
+    It 'gives an encrypted drive a next step when the run stops there' {
+        # Nothing prints after this, so a person told their drive is encrypting and nothing else
+        # has been left without the one thing that gets them back into it.
+        (Format-DevDriveStateAfterFailure -VolumeState 'Encrypted' -RunEnding) -join "`n" |
+            Should -Match 'recovery key is the way back'
+    }
+
+    It 'leaves that out where the run carries on and says it later' {
+        (Format-DevDriveStateAfterFailure -VolumeState 'Encrypted') -join "`n" |
+            Should -Not -Match 'recovery key'
+    }
+}
+
+Describe 'Resolve-BitLockerFailure' {
+    It 'recognises <Description> as a rejected password, whatever language said it' -TestCases @(
+        @{ Description = 'too short (0x80310080)'
+           Message = 'Ihr Kennwort erfuellt nicht die Mindestlaenge. (0x80310080)' }
+        @{ Description = 'not complex enough (0x80310081)'
+           Message = 'Ihr Kennwort ist nicht komplex genug. (0x80310081)' }
+        @{ Description = 'not printable ASCII (0x803100A4)'
+           Message = 'Ihr Administrator verlangt nur druckbare ASCII-Zeichen. (0x803100A4)' }
+        @{ Description = 'longer than 256 characters (0x803100AA)'
+           Message = 'Das Kennwort darf 256 Zeichen nicht ueberschreiten. (0x803100AA)' }
+    ) {
+        # Matched by code: the sentence around each is localized.
         (Resolve-BitLockerFailure -Message $Message -RetryCount 1 -MaxRetries 10 -PasswordAsked).Kind |
             Should -Be 'Password'
+    }
+
+    It 'matches the code whatever case it is written in' {
+        (Resolve-BitLockerFailure -Message 'refused (0x803100a4)' -RetryCount 1 -MaxRetries 10 -PasswordAsked).Kind |
+            Should -Be 'Password'
+    }
+
+    It 'takes the code from the number when the text does not carry it' {
+        # .NET puts the code in the message today, in both editions. That is one formatting choice
+        # away from being absent, and the exception carries the number regardless.
+        $verdict = Resolve-BitLockerFailure -Message 'Kennwort abgelehnt.' -HResult -2144272255 `
+            -RetryCount 1 -MaxRetries 10 -PasswordAsked
+        $verdict.Kind | Should -Be 'Password'
+    }
+
+    It 'takes a policy refusal from the number too' {
+        $verdict = Resolve-BitLockerFailure -Message 'Abgelehnt.' -HResult -2144272290 `
+            -RetryCount 1 -MaxRetries 10 -PasswordAsked
+        $verdict.Kind | Should -Be 'Other'
+        $verdict.CanRetry | Should -BeFalse
+    }
+
+    It 'reads no code out of an unset number' {
+        # 0 is "nothing was passed", not a code, and must not collide with anything.
+        (Resolve-BitLockerFailure -Message 'Etwas ging schief.' -HResult 0 `
+                -RetryCount 1 -MaxRetries 10 -PasswordAsked).Kind | Should -Be 'Other'
+    }
+
+    It 'no longer decides by English words: <Description>' -TestCases @(
+        @{ Description = 'the old complexity phrase'
+           Message = 'The password does not meet the password complexity requirements.' }
+        @{ Description = 'the old requirements phrase'; Message = 'Password requirements not met.' }
+    ) {
+        # These carry no code, so there is nothing to retry on. The old matcher took them, which is
+        # why it worked in English and nowhere else; re-adding it "for safety" would fail here.
+        (Resolve-BitLockerFailure -Message $Message -RetryCount 1 -MaxRetries 10 -PasswordAsked).Kind |
+            Should -Be 'Other'
+    }
+
+    It 'keeps the set closed: <Description> is not a password to retype' -TestCases @(
+        @{ Description = 'policy forbids creating a password (0x8031006A)'
+           Message = 'Nicht erlaubt. (0x8031006A)' }
+        @{ Description = 'FIPS forbids passwords (0x8031006C)'
+           Message = 'FIPS. (0x8031006C)' }
+    ) {
+        # Both mention a password and both are refusals a retype cannot change, so they belong with
+        # the policy refusals and must never be offered a retry.
+        $verdict = Resolve-BitLockerFailure -Message $Message -RetryCount 1 -MaxRetries 10 -PasswordAsked
+        $verdict.Kind | Should -Be 'Other'
+        $verdict.CanRetry | Should -BeFalse
+        ($verdict.Lines -join "`n") | Should -Match 'same refusal'
+    }
+
+    It 'does not call a FIPS refusal a group policy one' {
+        # FIPS is a different machine setting with a different remedy, and the quoted Windows text
+        # above already says which of the two refused. Naming one sends people to the wrong place.
+        ((Resolve-BitLockerFailure -Message 'FIPS. (0x8031006C)' -RetryCount 1 -MaxRetries 10).Lines -join "`n") |
+            Should -Not -Match 'Group policy'
     }
 
     It 'never blames the password on a run that never asks for one' {
         # In partition mode nothing is prompted, so a password retry would repeat the same call
         # ten times with nobody to change anything.
         $verdict = Resolve-BitLockerFailure -RetryCount 1 -MaxRetries 10 `
-            -Message 'The password does not meet the password complexity requirements.'
+            -Message 'Your password does not meet the complexity requirements. (0x80310081)'
         $verdict.Kind | Should -Be 'Other'
     }
 
+    It 'says what Windows said rather than guessing which of the four refusals it was' {
+        # Three of the four are not about complexity at all, so naming complexity would be wrong.
+        $lines = (Resolve-BitLockerFailure -Message 'Nur druckbare ASCII-Zeichen. (0x803100A4)' `
+                -RetryCount 1 -MaxRetries 10 -PasswordAsked).Lines -join "`n"
+        $lines | Should -Match 'Nur druckbare ASCII-Zeichen'
+        $lines | Should -Not -Match 'complexity'
+    }
+
     It 'counts the attempts left before giving up' {
-        $verdict = Resolve-BitLockerFailure -Message 'password complexity' -RetryCount 3 -MaxRetries 10 -PasswordAsked
+        $verdict = Resolve-BitLockerFailure -Message 'refused (0x80310081)' -RetryCount 3 -MaxRetries 10 -PasswordAsked
         $verdict.Exhausted | Should -BeFalse
         $verdict.CanRetry | Should -BeTrue
         ($verdict.Lines -join "`n") | Should -Match 'Attempt 3 of 10'
     }
 
     It 'gives up once the attempts are used up' {
-        $verdict = Resolve-BitLockerFailure -Message 'password complexity' -RetryCount 10 -MaxRetries 10 -PasswordAsked
+        $verdict = Resolve-BitLockerFailure -Message 'refused (0x80310081)' -RetryCount 10 -MaxRetries 10 -PasswordAsked
         $verdict.Exhausted | Should -BeTrue
         $verdict.CanRetry | Should -BeFalse
         ($verdict.Lines -join "`n") | Should -Match 'Maximum retry attempts reached'
+    }
+
+    It 'says what the drive is on the one password path that ends the run' {
+        # The run throws right after this, so it is the last thing the user reads. Every other
+        # failure path names the drive's state; this one used to stay silent about it.
+        $lines = (Resolve-BitLockerFailure -Message 'refused (0x80310081)' -RetryCount 10 -MaxRetries 10 `
+                -PasswordAsked -VolumeState 'Clear').Lines -join "`n"
+        $lines | Should -Match 'works without BitLocker'
+    }
+
+    It 'does not clutter a retryable password refusal with the drive state' {
+        # There are nine attempts left; nothing has ended, so nothing needs summarising.
+        $lines = (Resolve-BitLockerFailure -Message 'refused (0x80310081)' -RetryCount 1 -MaxRetries 10 `
+                -PasswordAsked -VolumeState 'Clear').Lines -join "`n"
+        $lines | Should -Not -Match 'works without BitLocker'
     }
 
     It 'treats anything else as a failure the user has to decide about' {
@@ -1375,7 +1503,7 @@ Describe 'Resolve-BitLockerFailure' {
     }
 
     It 'refuses a password retry too once the error cannot change' {
-        $verdict = Resolve-BitLockerFailure -Message 'password complexity' -RetryCount 1 -MaxRetries 10 `
+        $verdict = Resolve-BitLockerFailure -Message 'refused (0x80310081)' -RetryCount 1 -MaxRetries 10 `
             -Unretryable -PasswordAsked
         $verdict.Kind | Should -Be 'Password'
         $verdict.CanRetry | Should -BeFalse
@@ -1431,9 +1559,8 @@ Describe 'Resolve-BitLockerFailure' {
     }
 
     It 'sorts a policy refusal as one even on a run that asks for a password' {
-        # The password branch answers first, so a refusal wording that also mentions a password
-        # would otherwise be retried into the same refusal.
-        $verdict = Resolve-BitLockerFailure -Message 'password complexity (0x8031005E)' `
+        # A message carrying both codes is a refusal policy will repeat, not a password to retype.
+        $verdict = Resolve-BitLockerFailure -Message 'refused (0x8031005E) (0x80310081)' `
             -RetryCount 1 -MaxRetries 10 -PasswordAsked
         $verdict.Kind | Should -Be 'Other'
         $verdict.CanRetry | Should -BeFalse
