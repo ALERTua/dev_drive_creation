@@ -61,6 +61,11 @@ Two consequences:
   resource, so an English phrase cannot be matched on a localized Windows: report what it said
   rather than judging it. Values from .NET are safe — enum member names are compiled identifiers —
   but rendering any value to text uses the machine's regional settings.
+- **A ReFS deduplication task is named after its volume.** `Set-ReFSDedupSchedule` registers it under
+  `\Microsoft\Windows\ReFsDedupSvc\` as the volume's `UniqueId` GUID, braced and upper case; the scrub
+  task adds `-Scrub`. Measured on two volumes on separate disks. Take the GUID from `Get-Volume` — an
+  MBR partition has none — and never identify a task by its display name, its trigger times, or a
+  before-and-after listing of the folder. That folder keeps the tasks of volumes that no longer exist.
 - **English in the repository**, in code, comments, documentation and commit messages.
 
 ## Line endings
