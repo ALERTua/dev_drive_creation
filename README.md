@@ -30,7 +30,7 @@ https://github.com/user-attachments/assets/e5e97018-6966-4c64-8aaf-08764670f31f
 ## What it asks, and in what order
 
 1. **Creation method**: free space on a disk, shrinking an existing drive, or a `.vhdx` file
-2. **Drive selection**: shows every physical drive with its size and free space
+2. **Drive selection**: shows every physical drive with its size, and either its largest unallocated block or, for a partition style this script does not work with, why it cannot be used
 3. **Size**: minimum 50 GB; in free-space mode press Enter for the maximum
 4. **Name**: what the volume is called, or Enter for `DevDrive`
 5. **BitLocker**: optional, with the recovery key shown and acknowledged before the run goes on - except on a machine that denies writes to unencrypted fixed drives, where it is effectively mandatory and the run says so
@@ -111,6 +111,7 @@ After the drive exists, every setting is read back off the volume and reported -
 
 ## Caveats
 
+- **Physical disks must already be partitioned, as GPT or MBR.** Any other partition style - including `RAW`, which is what a disk out of the box reports, and what Windows reports for a partition table it cannot read - is refused at the disk prompt, and you are returned to it to pick another disk. The refusal says what Windows reported, offers the `Initialize-Disk` command as a condition rather than an instruction, and warns that running it writes a new partition table and makes every file already on the disk unreachable. The script never initializes a physical disk itself; it does initialize the virtual disk it creates in `.vhdx` mode, because it made that file moments earlier
 - **No resume and no undo.** A run that fails part-way leaves whatever it already created. It names what it left behind and what a rerun would repeat, but it will not clean up for you
 - **On a machine that denies write access to unencrypted fixed drives, BitLocker is not optional.** The setting is `FDVDenyWriteAccess` under `HKLM\SYSTEM\CurrentControlSet\Policies\Microsoft\FVE`. Without encryption the new drive mounts read-only and the run stops at the write check, having already made the partition. The run reads that setting and says so before the BitLocker question
 - **Windows may open its own encryption prompt** on such a machine while the script is already encrypting. Leave it alone - answering it only produces "BitLocker encryption already enabled"
