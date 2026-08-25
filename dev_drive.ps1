@@ -589,6 +589,20 @@ function Resolve-BitLockerProtectorPlan {
     }
 }
 
+function Format-DevDriveStateAfterFailure {
+    <# What the drive is once BitLocker has failed. Said on every path that ends the run, because a
+       failure after the drive exists must not leave the person guessing what they have. #>
+    param([ValidateSet('Encrypted', 'Clear', 'Unknown')][string]$VolumeState = 'Unknown')
+
+    if ($VolumeState -eq 'Encrypted') {
+        return "The Dev Drive is created and formatted, and BitLocker has already started encrypting it."
+    }
+    if ($VolumeState -eq 'Clear') {
+        return "The Dev Drive itself is created and formatted, and works without BitLocker."
+    }
+    return "The Dev Drive is created and formatted, but its BitLocker state could not be read. Check it with Get-BitLockerVolume before assuming it is unencrypted."
+}
+
 function Resolve-BitLockerFailure {
     <#
         Sorts a BitLocker error into the one kind the loop can retry on its own - a password the
@@ -607,19 +621,26 @@ function Resolve-BitLockerFailure {
     $exhausted = $RetryCount -ge $MaxRetries
     $canRetry = -not $exhausted -and -not $Unretryable
 
-    # Matched by its code, not its wording: the sentence around it comes from a localized resource.
-    $policyRefusal = $Message -match '0x8031005E'
+    # Both sets are matched by code, because the sentence around each comes from a localized
+    # message resource. Policy refusals: no recovery key, no password, FIPS forbids passwords.
+    $policyRefusal = $Message -match '0x8031005E|0x8031006A|0x8031006C'
     if ($policyRefusal) {
         $canRetry = $false
     }
 
-    # Only a run that asks for a password can be failing on one, whatever the message mentions.
-    if (-not $policyRefusal -and $PasswordAsked -and $Message -match "password.*(complexity|requirements|not.*meet)") {
-        $lines = @("BitLocker rejected the password due to complexity requirements.")
+    # Password refusals: too short, too simple, not printable ASCII, over 256 characters.
+    $passwordRefusal = $Message -match '0x80310080|0x80310081|0x803100A4|0x803100AA'
+
+    # Only a run that asked for a password can be failing on one, whatever the message carries.
+    if (-not $policyRefusal -and $PasswordAsked -and $passwordRefusal) {
+        # Quoted, not diagnosed: three of those four refusals are about something else.
+        $lines = @("BitLocker did not accept that password. Windows reported: $Message")
         if ($canRetry) {
             $lines += "Please try a different password. Attempt $RetryCount of $MaxRetries."
         } else {
+            # The run ends here, so it must say what the drive is, as every other failure path does.
             $lines += "Maximum retry attempts reached. BitLocker setup failed."
+            $lines += Format-DevDriveStateAfterFailure -VolumeState $VolumeState
         }
         return [PSCustomObject]@{ Kind = 'Password'; Exhausted = $exhausted; CanRetry = $canRetry; Lines = $lines }
     }
@@ -628,13 +649,7 @@ function Resolve-BitLockerFailure {
     if ($policyRefusal) {
         $lines += "Group policy on this machine refuses it, so trying again meets the same refusal."
     }
-    if ($VolumeState -eq 'Encrypted') {
-        $lines += "The Dev Drive is created and formatted, and BitLocker has already started encrypting it."
-    } elseif ($VolumeState -eq 'Clear') {
-        $lines += "The Dev Drive itself is created and formatted, and works without BitLocker."
-    } else {
-        $lines += "The Dev Drive is created and formatted, but its BitLocker state could not be read. Check it with Get-BitLockerVolume before assuming it is unencrypted."
-    }
+    $lines += Format-DevDriveStateAfterFailure -VolumeState $VolumeState
 
     return [PSCustomObject]@{ Kind = 'Other'; Exhausted = $exhausted; CanRetry = $canRetry; Lines = $lines }
 }
@@ -2656,7 +2671,7 @@ try {
                 if ($verdict.Kind -eq 'Password' -and $verdict.CanRetry) {
                     Write-Host ""
                 } elseif ($verdict.Kind -eq 'Password' -and -not $verdict.CanRetry) {
-                    throw "BitLocker password complexity requirements not met after $retryCount attempts."
+                    throw "BitLocker did not accept the password after $retryCount attempts."
                 } else {
                     # The drive already exists, so this must not end the run unless the user says so.
                     $canRetry = $verdict.CanRetry
