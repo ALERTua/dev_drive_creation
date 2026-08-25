@@ -2044,15 +2044,18 @@ Filters currently attached to this developer volume:
         $report = Resolve-DevDriveTrustReport -MountPoint 'X:' -TrustExitCode 0 -QueryOutput $Answer
         $report.Outcome | Should -Be 'Unconfirmed'
         $lines = $report.Lines -join "`n"
-        $lines | Should -Match 'answers in this machine.s language'
-        $lines | Should -Match 'It should say the volume is trusted\.'
+        $lines | Should -Match 'only works in English'
+        $lines | Should -Match 'everything is as it should be'
     }
 
     It 'raises no alarm on a run where only the language stopped it reading the answer' {
+        # This is what every successful run looks like on a Windows that is not in English, so it
+        # must not read as a fault, and must not ask for anything to be done.
         $lines = (Resolve-DevDriveTrustReport -MountPoint 'X:' -TrustExitCode 0 -QueryOutput 'Dies ist ein vertrauenswuerdiges Entwicklervolume.').Lines -join "`n"
-        $lines | Should -Not -Match 'could not'
+        $lines | Should -Not -Match 'could not mark'
         $lines | Should -Not -Match 'will still work'
         $lines | Should -Not -Match 'Retry by hand'
+        $lines | Should -Not -Match 'It should say'
     }
 
     It 'quotes what the query actually said, so the user judges it themselves' -TestCases @(

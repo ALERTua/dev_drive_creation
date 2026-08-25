@@ -763,9 +763,10 @@ function Resolve-BitLockerAutoUnlockReport {
 
 function Resolve-DevDriveTrustReport {
     <#
-        What to say after marking a volume trusted. The exit code answers whether the command ran;
-        only the volume's own answer says whether it ended up trusted. fsutil answers in the
-        machine's language, so an answer this script cannot read is shown, not judged.
+        What to say after marking a volume trusted. Only fsutil's own words answer whether it is:
+        measured, the exit code is 0 for every real volume, the persistent volume flags read back
+        as zero, and no CIM property carries it. Those words are localized, so an answer this
+        script cannot read is shown, never judged.
     #>
     param(
         [Parameter(Mandatory)][string]$MountPoint,
@@ -783,9 +784,13 @@ function Resolve-DevDriveTrustReport {
     $said = @($QueryOutput -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
 
     if ($TrustExitCode -eq 0) {
-        $lines = @("Marked $MountPoint as trusted. fsutil devdrv query $MountPoint answers in this machine's language:")
+        # This is what a successful run looks like on a Windows that is not in English, so it must
+        # not read as a fault. Nothing else on the machine can be asked instead - see the notes on
+        # the English phrase above.
+        $lines = @("Marked $MountPoint as trusted. Reading it back only works in English, and this machine answers in its own language, so the run cannot confirm it here.")
+        $lines += "fsutil devdrv query $MountPoint said:"
         $lines += if ($said.Count -gt 0) { $said | ForEach-Object { "  $($_.Trim())" } } else { "  (nothing)" }
-        $lines += "It should say the volume is trusted."
+        $lines += "If that says the volume is a trusted developer volume, everything is as it should be."
         return [PSCustomObject]@{ Outcome = 'Unconfirmed'; Lines = $lines }
     }
 
