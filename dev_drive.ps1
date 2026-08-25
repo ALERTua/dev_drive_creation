@@ -146,6 +146,22 @@ function Get-Win32ErrorText {
     return "$([System.ComponentModel.Win32Exception]::new($Code).Message) (error $Code)"
 }
 
+function Get-DiskLargestFreeExtent {
+    <#
+        The largest unbroken block of free space, which is the only thing New-Partition can fill.
+        Disk size minus the partitions counts system and recovery partitions as free, and cannot see
+        a gap split in two. A disk that does not report it answers 0, and says so on the warning stream.
+    #>
+    param([Parameter(Mandatory)]$Disk)
+
+    $extent = $Disk.PSObject.Properties['LargestFreeExtent']
+    if ($null -eq $extent -or $null -eq $extent.Value) {
+        Write-Warning "Windows did not report a largest free extent for this disk, so it is being read as having no room."
+        return 0
+    }
+    return [double]$extent.Value
+}
+
 function ConvertTo-FlooredGB {
     # Floor, never round: a displayed maximum must never exceed the real one.
     # A volume with nothing to give reads as 0, not as a negative.
@@ -1698,26 +1714,18 @@ function Show-DriveSelection {
 
     foreach ($disk in $disks) {
         $diskNumber = $disk.Number
-        $diskSizeGB = [math]::Round($disk.Size / 1GB, 2)
+        $diskSizeGB = ConvertTo-FlooredGB -Bytes $disk.Size
 
-        # Calculate allocated space more accurately
-        $partitions = Get-Partition -DiskNumber $diskNumber
-        $allocatedSize = 0
-        foreach ($partition in $partitions) {
-            # Only count actual data partitions, not system/reserved
-            if ($partition.Type -eq 'Basic' -or $partition.Type -eq 'Dynamic' -or $partition.DriveLetter) {
-                $allocatedSize += $partition.Size
-            }
-        }
-
-        $freeSpaceGB = [math]::Round(($disk.Size - $allocatedSize) / 1GB, 2)
+        $freeSpaceGB = ConvertTo-FlooredGB -Bytes (Get-DiskLargestFreeExtent -Disk $disk)
 
         Write-Host "Disk $diskNumber`: $($disk.FriendlyName)" -ForegroundColor Yellow
         Write-Host "  Size: $diskSizeGB GB" -ForegroundColor White
-        Write-Host "  Free Space: $freeSpaceGB GB" -ForegroundColor Green
+        # "Unallocated", not "Free": a full disk reads 0 here and must not look broken.
+        Write-Host "  Unallocated: $freeSpaceGB GB in one unbroken block" -ForegroundColor Green
 
-        # Show drive letters on this disk
-        $driveLetters = ($disk | Get-Partition | Where-Object { $_.DriveLetter } | Select-Object -ExpandProperty DriveLetter) -join ", "
+        # By number rather than down the pipeline: the same query, and the only shape a test can pass.
+        $driveLetters = (Get-Partition -DiskNumber $diskNumber | Where-Object { $_.DriveLetter } |
+                Select-Object -ExpandProperty DriveLetter) -join ", "
         if ($driveLetters) {
             Write-Host "  Drives: $driveLetters" -ForegroundColor Gray
         }
@@ -2143,21 +2151,17 @@ if ($mode -ne "Vhdx") {
 if ($mode -eq "FreeSpace") {
     # Get disk info for free space calculation
     $selectedDisk = Get-Disk -Number $DiskNumber
-    $partitions = Get-Partition -DiskNumber $DiskNumber
-    $allocatedSize = 0
-    foreach ($partition in $partitions) {
-        if ($partition.Type -eq 'Basic' -or $partition.Type -eq 'Dynamic' -or $partition.DriveLetter) {
-            $allocatedSize += $partition.Size
-        }
-    }
-    $freeSpace = $selectedDisk.Size - $allocatedSize
+    $freeSpace = Get-DiskLargestFreeExtent -Disk $selectedDisk
     # Floor (not round) so the displayed/accepted maximum is never above the real free space
     $freeSpaceGB = ConvertTo-FlooredGB -Bytes $freeSpace
 
-    Write-Host "`nDisk $DiskNumber has $freeSpaceGB GB of free space available." -ForegroundColor Cyan
+    # "Unbroken block", not "free space": a Dev Drive needs one, and a disk with two smaller gaps
+    # has more free space than this number, none of which can be used for it.
+    Write-Host "`nDisk $DiskNumber has $freeSpaceGB GB in its largest unbroken block of free space." -ForegroundColor Cyan
 
     if ($freeSpace -lt ($DevDriveMinSizeGB * 1GB)) {
-        Write-Host "Disk $DiskNumber only has $freeSpaceGB GB of free space, which is below the $DevDriveMinSizeGB GB minimum required for a Dev Drive." -ForegroundColor Red
+        Write-Host "Disk $DiskNumber has $freeSpaceGB GB in its largest unbroken block, which is below the $DevDriveMinSizeGB GB minimum required for a Dev Drive." -ForegroundColor Red
+        Write-Host "A Dev Drive has to fit in one block, so free space scattered between partitions does not count." -ForegroundColor Yellow
         Write-Host "Exiting. Please choose a different disk or free up more space, then run the script again." -ForegroundColor Yellow
         exit 1
     }
@@ -2415,31 +2419,16 @@ try {
         Write-Host "Checking disk $DiskNumber for available free space..." -ForegroundColor Green
         $disk = Get-Disk -Number $DiskNumber -ErrorAction Stop
 
-        # Get total disk size and calculate allocated space
-        $diskSize = $disk.Size
+        $freeSpace = Get-DiskLargestFreeExtent -Disk $disk
+        $freeSpaceGB = ConvertTo-FlooredGB -Bytes $freeSpace
 
-        # Calculate allocated space more accurately
-        $partitions = Get-Partition -DiskNumber $DiskNumber
-        $allocatedSize = 0
-        foreach ($partition in $partitions) {
-            # Only count actual data partitions, not system/reserved
-            if ($partition.Type -eq 'Basic' -or $partition.Type -eq 'Dynamic' -or $partition.DriveLetter) {
-                $allocatedSize += $partition.Size
-            }
-        }
-
-        # Calculate free space
-        $freeSpace = $diskSize - $allocatedSize
-        $freeSpaceGB = [math]::Round($freeSpace / 1GB, 2)
-
-        Write-Host "Disk $DiskNumber total size: $([math]::Round($diskSize / 1GB, 2)) GB" -ForegroundColor Green
-        Write-Host "Disk $DiskNumber allocated space: $([math]::Round($allocatedSize / 1GB, 2)) GB" -ForegroundColor Green
-        Write-Host "Disk $DiskNumber free space: $freeSpaceGB GB" -ForegroundColor Green
+        Write-Host "Disk $DiskNumber total size: $(ConvertTo-FlooredGB -Bytes $disk.Size) GB" -ForegroundColor Green
+        Write-Host "Disk $DiskNumber largest unbroken block of free space: $freeSpaceGB GB" -ForegroundColor Green
 
         # Check if requested size is available
         $requestedSizeBytes = [math]::Round($SizeGB * 1GB, 2)
         if ($freeSpace -lt $requestedSizeBytes) {
-            throw "Insufficient free space on disk $DiskNumber. Requested: $SizeGB GB, Available: $freeSpaceGB GB"
+            throw "Insufficient free space on disk $DiskNumber. Requested: $SizeGB GB, largest unbroken block available: $freeSpaceGB GB"
         }
 
         Write-Host "Creating Dev Drive with $SizeGB GB from free space on disk $DiskNumber" -ForegroundColor Green

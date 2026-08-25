@@ -382,6 +382,26 @@ Describe 'The script itself' {
         @($throws | Where-Object { $_ -match 'did not accept the password' }).Count | Should -Be 1
     }
 
+    It 'never works out free space by summing the partitions it likes the look of' {
+        # Counting only Basic-or-lettered partitions reported 2.22 GB free on a disk that had none.
+        ([regex]::Matches((Get-Content -Path $script:ScriptPath -Raw), '\$allocatedSize')).Count |
+            Should -Be 0
+    }
+
+    It 'lets no free-space figure come from anywhere but the disk itself' {
+        # Three copies of the arithmetic are how they came to disagree with the disk. Not a count of
+        # call sites - a rule about where every one of these two variables may get its value.
+        $lines = @(Select-String -Path $script:ScriptPath -Pattern '^\s*\$freeSpace(GB)?\s*=' |
+                ForEach-Object { $_.Line.Trim() })
+        $lines.Count | Should -Be 5
+        @($lines | Where-Object { $_ -match '^\$freeSpace\s*=' -and $_ -notmatch 'Get-DiskLargestFreeExtent' }) |
+            Should -BeNullOrEmpty
+        @($lines | Where-Object { $_ -match '^\$freeSpaceGB\s*=' -and $_ -notmatch 'ConvertTo-FlooredGB' }) |
+            Should -BeNullOrEmpty
+        ([regex]::Matches((Get-Content -Path $script:ScriptPath -Raw), '(?m)^function Get-DiskLargestFreeExtent')).Count |
+            Should -Be 1
+    }
+
     It 'never tells the user to just try again' {
         Select-String -Path $script:ScriptPath -Pattern 'try again' | Should -BeNullOrEmpty
     }
@@ -1013,6 +1033,81 @@ Describe 'Get-VhdxAlignedSize' {
 
     It 'never rounds up past what the caller asked for' {
         Get-VhdxAlignedSize -SizeBytes ([uint64](1MB + 1)) | Should -Be 1MB
+    }
+}
+
+Describe 'Get-DiskLargestFreeExtent' {
+    It 'answers the largest unbroken block, which is the only thing New-Partition can fill' {
+        Get-DiskLargestFreeExtent -Disk ([PSCustomObject]@{ Size = 500GB; LargestFreeExtent = [uint64]118GB }) |
+            Should -Be 118GB
+    }
+
+    It 'answers 0 for a full disk rather than a leftover from the arithmetic' {
+        Get-DiskLargestFreeExtent -Disk ([PSCustomObject]@{ Size = 500GB; LargestFreeExtent = [uint64]0 }) |
+            Should -Be 0
+    }
+
+    It 'takes a uint64 extent without rounding or throwing' {
+        # An extent on a 4 TB disk does not fit in an Int32, and Get-Disk hands back a uint64.
+        Get-DiskLargestFreeExtent -Disk ([PSCustomObject]@{ LargestFreeExtent = [uint64]3.5TB }) |
+            Should -Be 3.5TB
+    }
+
+    It 'says so when the disk does not report an extent, rather than passing 0 off as a fact' {
+        # The caller exits on 0 and tells the user the disk has no room. It must not say that
+        # about a disk Windows declined to answer for.
+        Mock Write-Warning { }
+        Get-DiskLargestFreeExtent -Disk ([PSCustomObject]@{ Size = 500GB }) | Should -Be 0
+        Should -Invoke Write-Warning -ParameterFilter { $Message -match 'did not report a largest free extent' }
+    }
+
+    It 'says the same when the disk reports nothing at all' {
+        Mock Write-Warning { }
+        Get-DiskLargestFreeExtent -Disk ([PSCustomObject]@{ LargestFreeExtent = $null }) | Should -Be 0
+        Should -Invoke Write-Warning -Times 1
+    }
+
+    It 'stays silent on a disk that answered honestly' {
+        Mock Write-Warning { }
+        Get-DiskLargestFreeExtent -Disk ([PSCustomObject]@{ LargestFreeExtent = [uint64]0 }) | Out-Null
+        Should -Not -Invoke Write-Warning
+    }
+
+    It 'refuses to be called without a disk' {
+        # No caller can pass nothing; answering 0 to that would disguise a bug as a hardware fact.
+        { Get-DiskLargestFreeExtent -Disk $null } | Should -Throw
+    }
+}
+
+Describe 'Show-DriveSelection' {
+    BeforeAll {
+        Mock Write-Host { }
+    }
+
+    It 'shows what one unbroken block holds, not what the arithmetic used to invent' {
+        # A 500 GB disk whose partitions fill it reads 0 here. The old sum of Basic-or-lettered
+        # partitions reported 2.22 GB on exactly such a disk.
+        Mock Get-Disk { @([PSCustomObject]@{ Number = 0; FriendlyName = 'Full disk'; Size = 500GB
+                BusType = 'NVMe'; LargestFreeExtent = [uint64]0 }) }
+        Mock Get-Partition { @() }
+        Show-DriveSelection | Out-Null
+        Should -Invoke Write-Host -ParameterFilter { $Object -match 'Unallocated: 0 GB in one unbroken block' }
+    }
+
+    It 'does not call an ordinary full disk free' {
+        Mock Get-Disk { @([PSCustomObject]@{ Number = 0; FriendlyName = 'Full disk'; Size = 500GB
+                BusType = 'NVMe'; LargestFreeExtent = [uint64]0 }) }
+        Mock Get-Partition { @() }
+        Show-DriveSelection | Out-Null
+        Should -Not -Invoke Write-Host -ParameterFilter { $Object -match 'Free Space' }
+    }
+
+    It 'reports the block a disk really has' {
+        Mock Get-Disk { @([PSCustomObject]@{ Number = 2; FriendlyName = 'Spare'; Size = 119.24GB
+                BusType = 'USB'; LargestFreeExtent = [uint64]118.61GB }) }
+        Mock Get-Partition { @() }
+        Show-DriveSelection | Out-Null
+        Should -Invoke Write-Host -ParameterFilter { $Object -match 'Unallocated: 118\.61 GB' }
     }
 }
 
