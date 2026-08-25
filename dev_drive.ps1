@@ -1325,34 +1325,93 @@ function Format-DedupScheduleSummary {
     return $lines
 }
 
+function Resolve-DedupTaskName {
+    <#
+        A volume's deduplication tasks are named after the volume's own identifier: nothing else in
+        the task names the drive. An identifier not shaped that way answers $null.
+    #>
+    param([Parameter(Mandatory)][AllowNull()][AllowEmptyString()][string]$UniqueId)
+
+    if ([string]::IsNullOrWhiteSpace($UniqueId)) { return $null }
+
+    # Anchored on the whole volume path: a volume with no GUID answers with a device path that
+    # carries a class GUID instead, and an unanchored match would name a task after that.
+    $braced = [regex]::Match($UniqueId, '^\\\\\?\\Volume(\{[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}\})\\?$')
+    if (-not $braced.Success) { return $null }
+
+    return $braced.Groups[1].Value.ToUpperInvariant()
+}
+
+function Resolve-OwnDedupTask {
+    <#
+        Which of the folder's tasks belong to this volume. Everything else there belongs to another
+        drive, or to a volume that no longer exists.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Tasks,
+        [Parameter(Mandatory)][string]$VolumeTaskName
+    )
+
+    # Prefix, not equality: the scrub task appends a suffix to the same name.
+    return @($Tasks | Where-Object {
+            $_.TaskName.StartsWith($VolumeTaskName, [System.StringComparison]::OrdinalIgnoreCase)
+        })
+}
+
 function Resolve-DedupScheduleReminder {
     <#
-        The fixed lines telling the user where these schedule times live and how to change them
-        later. Points at the times just chosen instead of trying to tell which task is which.
+        The lines telling the user where these schedule times live and how to change them later.
+        Names the tasks that were read back out of that folder, and falls back to the times when
+        none were, because then there is nothing to name.
     #>
     param(
         [Parameter(Mandatory)][string[]]$DailyTimes,
         [string]$WeeklyDay,
         [string]$WeeklyStart,
         [Parameter(Mandatory)][string]$TaskTreePath,
+        [string[]]$TaskNames,
+        [string]$VolumeTaskName,
         [switch]$WeeklyJob
     )
 
     $chosen = "Times just chosen: $(Format-DedupTimeList -Times $DailyTimes) daily"
     $chosen += if ($WeeklyJob) { ", $WeeklyDay at $WeeklyStart weekly." } else { "." }
 
-    return @(
+    $lines = @(
         "The ReFS optimization runs on a schedule kept in Task Scheduler, under:"
         "  $TaskTreePath"
         ""
         $chosen
         ""
-        "To change the times later, press Win+R, type taskschd.msc and press Ctrl+Shift+Enter to open"
-        "it as administrator, then open that folder and find the tasks whose Triggers column matches"
-        "the times above. Edit them on the Triggers tab. Leave the Actions tab alone - that is what"
-        "actually runs the optimization."
+    )
+
+    $named = @($TaskNames | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($named.Count -eq 0) {
+        return $lines + @(
+            "To change the times later, press Win+R, type taskschd.msc and press Ctrl+Shift+Enter to open"
+            "it as administrator, then open that folder and find the tasks whose Triggers column matches"
+            "the times above. Edit them on the Triggers tab. Leave the Actions tab alone - that is what"
+            "actually runs the optimization."
+            ""
+            "Other tasks in that folder may belong to Windows or to earlier runs."
+        )
+    }
+
+    $lines += "This drive's tasks, named after the volume itself:"
+    foreach ($name in $named) {
+        # The daily task carries the volume name alone; the scrub task adds to it.
+        $lines += if ($name -eq $VolumeTaskName) { "  $name  - the daily job" }
+        else { "  $name  - the weekly maintenance job" }
+    }
+
+    return $lines + @(
         ""
-        "Other tasks in that folder may belong to Windows or to earlier runs."
+        "To change the times later, press Win+R, type taskschd.msc and press Ctrl+Shift+Enter to open"
+        "it as administrator, then open that folder and look for those names. Edit the times on the"
+        "Triggers tab. Leave the Actions tab alone - that is what actually runs the optimization."
+        ""
+        "The other tasks in that folder belong to Windows, to another drive, or to a volume that no"
+        "longer exists."
     )
 }
 
@@ -1578,19 +1637,29 @@ function Request-DevDriveLabel {
     }
 }
 
-function Get-VolumeLabel {
-    <# The name a volume answers with; one that cannot be read answers $null, not an empty name. #>
-    param([Parameter(Mandatory)][string]$DriveLetter)
+function Get-VolumeProperty {
+    <# One property of a volume; a volume that cannot be read answers $null rather than throwing. #>
+    param(
+        [Parameter(Mandatory)][string]$DriveLetter,
+        [Parameter(Mandatory)][string]$Name
+    )
 
     try {
         # @() and the count check together: reading a property off nothing throws under strict mode.
         $volume = @(Get-Volume -DriveLetter $DriveLetter -ErrorAction Stop)
         if ($volume.Count -ne 1) { return $null }
-        return $volume[0].FileSystemLabel
+        return $volume[0].$Name
     }
     catch {
         return $null
     }
+}
+
+function Get-VolumeLabel {
+    <# The name a volume answers with; one that cannot be read answers $null, not an empty name. #>
+    param([Parameter(Mandatory)][string]$DriveLetter)
+
+    return Get-VolumeProperty -DriveLetter $DriveLetter -Name 'FileSystemLabel'
 }
 
 function Resolve-DevDriveLabelReport {
@@ -2781,45 +2850,63 @@ try {
             Write-Host "No weekly scrub job: Windows has none for a volume that only compresses." -ForegroundColor Yellow
         }
 
-        # Runs after every job this pass scheduled, whichever of them there were, so it sees them all.
-        Write-Host "Configuring the ReFS optimization tasks to run only on AC power..." -ForegroundColor Green
-        try {
-            # Find all ReFS deduplication tasks
-            $dedupTasks = Get-ScheduledTask | Where-Object {$_.TaskPath -Like $DedupTaskPath -And $_.TaskName -ne "Initialization" -And $_.State -ne "Disabled"}
+        # Read once, and used both to pick the tasks and to name them to the user afterwards.
+        $devTaskName = Resolve-DedupTaskName -UniqueId (Get-VolumeProperty -DriveLetter $devLetter -Name 'UniqueId')
+        $ownTaskNames = @()
 
-            $configuredTasks = 0
+        # Runs after every job this pass scheduled, whichever of them there were, so it sees them all.
+        Write-Host "Configuring the ReFS optimization tasks to run only on mains power..." -ForegroundColor Green
+        try {
+            if ([string]::IsNullOrWhiteSpace($devTaskName)) {
+                # Changing tasks that cannot be shown to be this drive's is worse than changing none.
+                throw "$devLetterColon did not give up the identifier its tasks are named after."
+            }
+
+            $dedupTasks = @(Resolve-OwnDedupTask -VolumeTaskName $devTaskName `
+                    -Tasks @(Get-ScheduledTask -TaskPath $DedupTaskPath -ErrorAction Stop))
+            $ownTaskNames = @($dedupTasks | ForEach-Object { $_.TaskName })
+
+            $confirmedTasks = @()
             $taskFailures = @()
             foreach ($task in $dedupTasks) {
                 try {
                     $task.Settings.DisallowStartIfOnBatteries = $true
                     $task.Settings.StopIfGoingOnBatteries = $true
-                    $task | Set-ScheduledTask -ErrorAction Stop | Out-Null
-                    $configuredTasks++
+                    # The claim below is made from what came back, not from the call having returned.
+                    $saved = $task | Set-ScheduledTask -ErrorAction Stop
+                    if ($saved.Settings.DisallowStartIfOnBatteries -and $saved.Settings.StopIfGoingOnBatteries) {
+                        $confirmedTasks += $task.TaskName
+                    }
+                    else {
+                        $taskFailures += "$($task.TaskName) still reports that it may start on battery."
+                    }
                 }
                 catch {
                     # One task's failure must not stop the others, but it must not pass unseen either.
-                    $taskFailures += "Could not configure $($task.TaskName) to run only on AC power: $($_.Exception.Message)"
+                    $taskFailures += "Could not set $($task.TaskName) to mains power only: $($_.Exception.Message)"
                 }
             }
 
-            if ($configuredTasks -gt 0) {
-                Write-Host "Successfully configured $configuredTasks ReFS optimization task(s) to run only on AC power" -ForegroundColor Green
+            foreach ($name in $confirmedTasks) {
+                # "Is set to", not "runs on": a disabled task of this volume is configured and never runs.
+                Write-Host "  $name is set to mains power only" -ForegroundColor Green
             }
             foreach ($failure in $taskFailures) {
                 Write-Host $failure -ForegroundColor Yellow
             }
-            if (-not $dedupTasks) {
-                Write-Host "No ReFS optimization tasks were found to configure. Tasks will run on any power source." -ForegroundColor Yellow
+            if ($dedupTasks.Count -eq 0) {
+                Write-Host "No task named after $devLetterColon was found, so none were changed. The optimization will run on any power source." -ForegroundColor Yellow
             }
         }
         catch {
-            Write-Host "Could not configure AC power condition for the ReFS optimization tasks: $($_.Exception.Message)" -ForegroundColor Yellow
+            Write-Host "Could not set the ReFS optimization tasks to mains power only: $($_.Exception.Message)" -ForegroundColor Yellow
             Write-Host "Tasks will run on any power source." -ForegroundColor Yellow
         }
 
         Write-Host ""
         foreach ($line in (Resolve-DedupScheduleReminder -DailyTimes $DedupStartTimes `
                     -WeeklyDay $ScrubDays -WeeklyStart $ScrubStart -TaskTreePath $DedupTaskTreePath `
+                    -TaskNames $ownTaskNames -VolumeTaskName $devTaskName `
                     -WeeklyJob:$DedupCapability.UsesBlockDedup)) {
             Write-Host $line -ForegroundColor Cyan
         }

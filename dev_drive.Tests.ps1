@@ -129,13 +129,14 @@ Describe 'The script itself' {
         $content | Should -Match 'foreach \(\$time in \$DedupStartTimes\)'
         $content | Should -Match 'Set-ReFSDedupScrubSchedule -Volume "\$devLetterColon" -Days \$ScrubDays -Start \$ScrubStart'
         $content | Should -Match ('(?ms)Resolve-DedupScheduleReminder -DailyTimes \$DedupStartTimes .*?' +
-            '-WeeklyDay \$ScrubDays -WeeklyStart \$ScrubStart')
+            '-WeeklyDay \$ScrubDays -WeeklyStart \$ScrubStart .*?' +
+            '-TaskNames \$ownTaskNames -VolumeTaskName \$devTaskName')
     }
 
     It 'configures the mains-power condition only after the weekly maintenance job it must cover' {
         $content = Get-Content -Path $script:ScriptPath -Raw
         $weeklyAt = $content.IndexOf('Set-ReFSDedupScrubSchedule -Volume "$devLetterColon"')
-        $acPowerAt = $content.IndexOf('Configuring the ReFS optimization tasks to run only on AC power')
+        $acPowerAt = $content.IndexOf('Configuring the ReFS optimization tasks to run only on mains power')
         $weeklyAt | Should -BeGreaterThan 0
         $acPowerAt | Should -BeGreaterThan $weeklyAt
     }
@@ -249,6 +250,56 @@ Describe 'The script itself' {
         $scrubGuard.Count | Should -Be 1
         $scrubGuard[0].ElseClause | Should -Not -BeNullOrEmpty
         $scrubGuard[0].ElseClause.Extent.Text | Should -Match 'No weekly scrub job'
+    }
+
+    It 'asks Task Scheduler for one folder rather than for every task on the machine' {
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($script:ScriptPath, [ref]$null, [ref]$null)
+        $calls = @($ast.FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.CommandAst] -and
+                    $node.GetCommandName() -eq 'Get-ScheduledTask'
+                }, $true))
+        $calls.Count | Should -Be 1
+        $calls[0].Extent.Text | Should -Match '-TaskPath \$DedupTaskPath'
+    }
+
+    It 'does not tell its own tasks apart by an English display name' {
+        # The excluded task is registered by Windows, and nothing promises that name in one language.
+        $content = Get-Content -Path $script:ScriptPath -Raw
+        $content | Should -Not -Match '\$_\.TaskName -(ne|eq) "Initialization"'
+        $content | Should -Not -Match '\$_\.TaskName -ne'
+    }
+
+    It 'changes only the tasks named after the drive it just created' {
+        # The folder holds every drive's tasks and the leftovers of volumes that no longer exist, so
+        # the set to change has to be narrowed before anything is written.
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($script:ScriptPath, [ref]$null, [ref]$null)
+        $picked = @($ast.FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+                    $node.Left.Extent.Text -eq '$dedupTasks'
+                }, $true))
+        $picked.Count | Should -Be 1
+        $picked[0].Right.Extent.Text | Should -Match 'Resolve-OwnDedupTask -VolumeTaskName \$devTaskName'
+
+        $owned = @($ast.FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.CommandAst] -and
+                    $node.GetCommandName() -eq 'Resolve-OwnDedupTask'
+                }, $true))
+        $owned.Count | Should -Be 1
+    }
+
+    It 'refuses to touch any task when the volume would not say which are its own' {
+        # Changing tasks that cannot be shown to be this drive's is worse than changing none.
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($script:ScriptPath, [ref]$null, [ref]$null)
+        $guard = @($ast.FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.IfStatementAst] -and
+                    $node.Clauses[0].Item1.Extent.Text -match '\$devTaskName' -and
+                    $node.Clauses[0].Item2.Extent.Text -match 'throw'
+                }, $true))
+        $guard.Count | Should -Be 1
     }
 
     It 'reaches the compression wording only through the mode helper' {
@@ -938,6 +989,38 @@ Describe 'Get-VolumeLabel' {
     It 'passes an empty name through as empty rather than as no answer' {
         Mock Get-Volume { [PSCustomObject]@{ FileSystemLabel = '' } }
         Get-VolumeLabel -DriveLetter 'X' | Should -Be ''
+    }
+}
+
+Describe 'Get-VolumeProperty' {
+    It 'reports whichever property was asked for' {
+        Mock Get-Volume { [PSCustomObject]@{ UniqueId = '\\?\Volume{240cfe1b-1db4-415a-8ccf-e2675e2b449d}\'; FileSystemLabel = 'Projects' } }
+        Get-VolumeProperty -DriveLetter 'X' -Name 'UniqueId' | Should -Be '\\?\Volume{240cfe1b-1db4-415a-8ccf-e2675e2b449d}\'
+        Get-VolumeProperty -DriveLetter 'X' -Name 'FileSystemLabel' | Should -Be 'Projects'
+    }
+
+    It 'answers nothing rather than throwing when the volume cannot be found' {
+        # Reading a property off an empty result throws under strict mode, and this runs once the
+        # drive already exists, where an abort costs the whole run.
+        Mock Get-Volume { }
+        { Get-VolumeProperty -DriveLetter 'X' -Name 'UniqueId' } | Should -Not -Throw
+        Get-VolumeProperty -DriveLetter 'X' -Name 'UniqueId' | Should -BeNullOrEmpty
+    }
+
+    It 'answers nothing when the query itself fails' {
+        Mock Get-Volume { throw 'The volume could not be read.' }
+        Get-VolumeProperty -DriveLetter 'X' -Name 'UniqueId' | Should -BeNullOrEmpty
+    }
+
+    It 'answers nothing when more than one volume comes back' {
+        Mock Get-Volume { @([PSCustomObject]@{ UniqueId = 'a' }, [PSCustomObject]@{ UniqueId = 'b' }) }
+        Get-VolumeProperty -DriveLetter 'X' -Name 'UniqueId' | Should -BeNullOrEmpty
+    }
+
+    It 'answers nothing rather than throwing for a property the volume does not carry' {
+        Mock Get-Volume { [PSCustomObject]@{ UniqueId = 'a' } }
+        { Get-VolumeProperty -DriveLetter 'X' -Name 'NoSuchProperty' } | Should -Not -Throw
+        Get-VolumeProperty -DriveLetter 'X' -Name 'NoSuchProperty' | Should -BeNullOrEmpty
     }
 }
 
@@ -2969,12 +3052,101 @@ Describe 'Format-DedupScheduleSummary' {
     }
 }
 
+Describe 'Resolve-DedupTaskName' {
+    It 'takes the name from the volume identifier, in the form Windows registers it' {
+        # Measured on two volumes on separate disks: the task is named after the volume's own GUID.
+        Resolve-DedupTaskName -UniqueId '\\?\Volume{240cfe1b-1db4-415a-8ccf-e2675e2b449d}\' |
+            Should -Be '{240CFE1B-1DB4-415A-8CCF-E2675E2B449D}'
+    }
+
+    It 'answers nothing for an identifier that carries no GUID' {
+        Resolve-DedupTaskName -UniqueId 'D:\' | Should -BeNullOrEmpty
+    }
+
+    It 'answers nothing for a device path, whose GUID names an interface class and not the volume' {
+        # A volume with no volume GUID answers with this shape. Naming a task after the class GUID
+        # would look like an answer and be one nobody could act on.
+        Resolve-DedupTaskName -UniqueId '\\?\scsi#disk&ven_x#4&1c9d1cd5&0&000000#{53f56307-b6bf-11d0-94f2-00a0c91efb8b}' |
+            Should -BeNullOrEmpty
+    }
+
+    It 'answers nothing rather than throwing when the volume could not be read' {
+        { Resolve-DedupTaskName -UniqueId $null } | Should -Not -Throw
+        Resolve-DedupTaskName -UniqueId $null | Should -BeNullOrEmpty
+        Resolve-DedupTaskName -UniqueId '   ' | Should -BeNullOrEmpty
+    }
+
+    It 'does not take a shorter run of hex for a volume identifier' {
+        Resolve-DedupTaskName -UniqueId '{240cfe1b-1db4-415a-8ccf}' | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'Resolve-OwnDedupTask' {
+    BeforeAll {
+        $script:OwnTask = '{AA0DAF00-0000-0000-0000-100000000000}'
+        $script:OtherTask = '{240CFE1B-1DB4-415A-8CCF-E2675E2B449D}'
+        $script:Folder = @(
+            'Initialization'
+            $script:OtherTask
+            "$($script:OtherTask)-Scrub"
+            $script:OwnTask
+            "$($script:OwnTask)-Scrub"
+        ) | ForEach-Object { [PSCustomObject]@{ TaskName = $_; State = 'Ready' } }
+    }
+
+    It 'takes this volume''s daily task and its scrub twin, and nothing else' {
+        $picked = @(Resolve-OwnDedupTask -Tasks $script:Folder -VolumeTaskName $script:OwnTask)
+        $picked | Should -HaveCount 2
+        $picked.TaskName | Should -Contain $script:OwnTask
+        $picked.TaskName | Should -Contain "$($script:OwnTask)-Scrub"
+    }
+
+    It 'leaves another drive''s tasks alone' {
+        # That folder holds every drive's tasks, and the tasks of volumes that no longer exist.
+        $picked = @(Resolve-OwnDedupTask -Tasks $script:Folder -VolumeTaskName $script:OwnTask)
+        $picked.TaskName | Should -Not -Contain $script:OtherTask
+        $picked.TaskName | Should -Not -Contain "$($script:OtherTask)-Scrub"
+    }
+
+    It 'leaves the task Windows registers alone without comparing its display name' {
+        # The old exclusion named it in English, which stops matching wherever that name is translated.
+        $picked = @(Resolve-OwnDedupTask -Tasks $script:Folder -VolumeTaskName $script:OwnTask)
+        $picked.TaskName | Should -Not -Contain 'Initialization'
+    }
+
+    It 'hands back the tasks themselves, so nothing has to be looked up again to change them' {
+        $picked = @(Resolve-OwnDedupTask -Tasks $script:Folder -VolumeTaskName $script:OwnTask)
+        $picked[0].State | Should -Be 'Ready'
+    }
+
+    It 'takes a task of this volume that Windows has disabled' {
+        # It is still this volume's, and setting a condition on it is not the same as running it.
+        $disabled = @([PSCustomObject]@{ TaskName = $script:OwnTask; State = 'Disabled' })
+        Resolve-OwnDedupTask -Tasks $disabled -VolumeTaskName $script:OwnTask | Should -HaveCount 1
+    }
+
+    It 'matches whatever case the name is reported in' {
+        $lower = @([PSCustomObject]@{ TaskName = $script:OwnTask.ToLowerInvariant() })
+        Resolve-OwnDedupTask -Tasks $lower -VolumeTaskName $script:OwnTask | Should -HaveCount 1
+    }
+
+    It 'answers an empty list when the folder holds nothing of ours' {
+        $foreign = @([PSCustomObject]@{ TaskName = 'Initialization' })
+        Resolve-OwnDedupTask -Tasks $foreign -VolumeTaskName $script:OwnTask | Should -HaveCount 0
+    }
+
+    It 'answers an empty list for an empty folder rather than asking for a value' {
+        Resolve-OwnDedupTask -Tasks @() -VolumeTaskName $script:OwnTask | Should -HaveCount 0
+    }
+}
+
 Describe 'Resolve-DedupScheduleReminder' {
     BeforeAll {
         $script:TreePath = 'Task Scheduler Library > Microsoft > Windows > ReFsDedupSvc'
+        $script:ReminderTask = '{AA0DAF00-0000-0000-0000-100000000000}'
     }
 
-    It 'names the times just chosen so the right task can be found by its Triggers column' {
+    It 'names the times just chosen, so the user can see what was set without opening anything' {
         $lines = (Resolve-DedupScheduleReminder -DailyTimes @('08:15', '13:00') -WeeklyDay 'Monday' `
                 -WeeklyStart '17:30' -TaskTreePath $script:TreePath -WeeklyJob) -join "`n"
         $lines | Should -Match '08:15 and 13:00 daily'
@@ -3004,6 +3176,45 @@ Describe 'Resolve-DedupScheduleReminder' {
     It 'returns plain lines rather than an object to unwrap' {
         Resolve-DedupScheduleReminder -DailyTimes @('11:00') -WeeklyDay 'Monday' -WeeklyStart '17:30' `
             -TaskTreePath $script:TreePath | Should -BeOfType [string]
+    }
+
+    It 'names each task that was read back, and says which job it is' {
+        # Two drives scheduled at the same times are indistinguishable by their Triggers column, so
+        # the times are not an answer to "which of these is mine".
+        $lines = (Resolve-DedupScheduleReminder -DailyTimes @('11:00', '17:00') -WeeklyDay 'Monday' `
+                -WeeklyStart '17:30' -TaskTreePath $script:TreePath -VolumeTaskName $script:ReminderTask `
+                -TaskNames @($script:ReminderTask, "$($script:ReminderTask)-Scrub") -WeeklyJob) -join "`n"
+        $lines | Should -Match ([regex]::Escape("$($script:ReminderTask)  - the daily job"))
+        $lines | Should -Match ([regex]::Escape("$($script:ReminderTask)-Scrub  - the weekly maintenance job"))
+        $lines | Should -Match 'look for those names'
+    }
+
+    It 'names only what it was given, so it cannot promise a task that was never found' {
+        # The run says a few lines earlier when no task was found; naming one here would contradict it.
+        $lines = (Resolve-DedupScheduleReminder -DailyTimes @('11:00') -WeeklyDay 'Monday' `
+                -WeeklyStart '17:30' -TaskTreePath $script:TreePath -VolumeTaskName $script:ReminderTask `
+                -TaskNames @($script:ReminderTask)) -join "`n"
+        $lines | Should -Match ([regex]::Escape("$($script:ReminderTask)  - the daily job"))
+        $lines | Should -Not -Match 'Scrub'
+    }
+
+    It 'does not call the other tasks stale, because the folder holds live drives too' {
+        $lines = (Resolve-DedupScheduleReminder -DailyTimes @('11:00') -WeeklyDay 'Monday' `
+                -WeeklyStart '17:30' -TaskTreePath $script:TreePath -VolumeTaskName $script:ReminderTask `
+                -TaskNames @($script:ReminderTask)) -join "`n"
+        $lines | Should -Match 'to another drive'
+        $lines | Should -Not -Match 'may belong to'
+    }
+
+    It 'falls back to the times when no task was read back' {
+        # Nothing to name then, so the old wording is the only handle the user has left.
+        foreach ($none in @(@(), @($null), @('   '))) {
+            $lines = (Resolve-DedupScheduleReminder -DailyTimes @('11:00') -WeeklyDay 'Monday' `
+                    -WeeklyStart '17:30' -TaskTreePath $script:TreePath -TaskNames $none `
+                    -VolumeTaskName $script:ReminderTask) -join "`n"
+            $lines | Should -Match 'whose Triggers column matches'
+            $lines | Should -Not -Match 'named after the volume itself'
+        }
     }
 }
 
