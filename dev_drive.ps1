@@ -1918,29 +1918,66 @@ function Request-DevDriveSizeGB {
     }
 }
 
-function Read-StrongPassword {
+function Resolve-UnmetPasswordRequirement {
+    <# Answers the requirements this password does not meet, in the order the prompt lists them, and
+       nothing when it meets them all. Every rule mirrors one BitLocker refuses by its own error
+       code, so nothing obviously refusable is handed over; its policy may still ask for more. #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Plain,
+        [Parameter(Mandatory)][int]$MinimumLength,
+        [Parameter(Mandatory)][int]$MaximumLength
+    )
+
+    # Every class is spelled out in ASCII rather than left to \d or a negated class, because both of
+    # those match beyond ASCII and BitLocker refuses anything outside printable ASCII (0x803100A4).
+    $unmet = @()
+    if ($Plain.Length -lt $MinimumLength)          { $unmet += "at least $MinimumLength characters" }
+    if ($Plain.Length -gt $MaximumLength)          { $unmet += "at most $MaximumLength characters" }
+    if ($Plain -cnotmatch '\A[\x20-\x7E]*\z')      { $unmet += "printable ASCII characters only" }
+    # -cnotmatch, because the case-insensitive form lets [A-Z] match a lowercase letter and vice versa.
+    if ($Plain -cnotmatch '[A-Z]')                 { $unmet += "at least one uppercase letter" }
+    if ($Plain -cnotmatch '[a-z]')                 { $unmet += "at least one lowercase letter" }
+    if ($Plain -cnotmatch '[0-9]')                 { $unmet += "at least one digit" }
+    # Printable ASCII less space and alphanumerics, which is what is left to be a special character.
+    if ($Plain -cnotmatch '[\x21-\x2F\x3A-\x40\x5B-\x60\x7B-\x7E]') { $unmet += "at least one special character" }
+    return $unmet
+}
+
+function Request-StrongPassword {
+    <# Prompts until the password meets every requirement, then answers it as a SecureString. The
+       pointer is freed in a finally: a throw in between would leave the plaintext in unmanaged
+       memory for the life of the process. #>
+    param(
+        [Parameter(Mandatory)][int]$MinimumLength,
+        [Parameter(Mandatory)][int]$MaximumLength
+    )
+
     while ($true) {
-        $secure = Read-Host "Enter password (min 8 chars, incl. upper, lower, digit, special)" -AsSecureString
-        $plain = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
-            [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
-        )
-
-        # Build validation flags
-        $errors = @()
-        if ($plain.Length -lt 8)                  { $errors += "at least 8 characters" }
-        if ($plain -notmatch '[A-Z]')             { $errors += "at least one uppercase letter" }
-        if ($plain -notmatch '[a-z]')             { $errors += "at least one lowercase letter" }
-        if ($plain -notmatch '\d')                { $errors += "at least one digit" }
-        if ($plain -notmatch '[^a-zA-Z\d\s]')     { $errors += "at least one special character" }
-
-        if ($errors.Count -eq 0) {
-            return $secure  # All good
+        $secure = Read-Host "Enter password ($MinimumLength-$MaximumLength printable ASCII chars, incl. upper, lower, digit, special)" -AsSecureString
+        # Outside the try: inside it, a throw from this call would hand the finally a stale pointer.
+        $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
+        try {
+            # PtrToStringBSTR takes the length from the BSTR prefix; the Auto form stops at a null.
+            $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+            # @(): an empty array arrives from a function as $null, and .Count on it throws here.
+            $unmet = @(Resolve-UnmetPasswordRequirement -Plain $plain `
+                    -MinimumLength $MinimumLength -MaximumLength $MaximumLength)
+        }
+        finally {
+            # Erases the unmanaged copy. $plain is a .NET string, so it can only be released.
+            [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+            $plain = $null
         }
 
-        # Output errors
+        if ($unmet.Count -eq 0) {
+            return $secure
+        }
+
+        # The refused attempt is encrypted rather than plaintext, but nothing needs it after this.
+        $secure.Dispose()
         Write-Host "Password does not meet the following requirement(s):" -ForegroundColor Red
-        foreach ($e in $errors) {
-            Write-Host " - $e" -ForegroundColor Yellow
+        foreach ($requirement in $unmet) {
+            Write-Host " - $requirement" -ForegroundColor Yellow
         }
     }
 }
@@ -2402,6 +2439,12 @@ $DevDriveDefaultLabel = "DevDrive"
 # This script's own cap, at the long-standing NTFS label length: Microsoft documents none for
 # Format-Volume -NewFileSystemLabel, so there is nothing to cite and nothing to read off a volume.
 $DevDriveLabelMaxLength = 32
+
+# This script's own floor for the BitLocker password; Windows applies its own policy afterwards.
+$PasswordMinLength = 8
+
+# BitLocker's own ceiling, from the refusal it answers past it: 0x803100AA, "over 256 characters".
+$PasswordMaxLength = 256
 
 # Head-room kept on the volume hosting a fixed size .vhdx, so it is never filled to the last byte.
 $VhdxHostSpareBytes = 1GB
@@ -2948,7 +2991,8 @@ try {
 
                 if ($bitLockerPlan.UsePasswordProtector -and $protectorPlan.TypesToAdd -contains 'Password') {
                     Write-Host "Enter BitLocker password for the new volume. It must be a complex one." -ForegroundColor Yellow
-                    $SecurePassword = Read-StrongPassword
+                    $SecurePassword = Request-StrongPassword -MinimumLength $PasswordMinLength `
+                        -MaximumLength $PasswordMaxLength
                     Write-Host "Adding BitLockerKeyProtector PasswordProtector" -ForegroundColor Green
                     Add-BitLockerKeyProtector -MountPoint $devLetterColon -PasswordProtector -Password $SecurePassword -ErrorAction Stop
                 }

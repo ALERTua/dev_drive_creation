@@ -40,6 +40,33 @@ BeforeAll {
     if (-not $policyPath.Success) { throw 'cannot find $FixedDriveWritePolicyPath in dev_drive.ps1' }
     $script:FixedDriveWritePolicyPath = $policyPath.Groups[1].Value
 
+    # Read out of the script for the same reason: a literal here would let the two drift, and the
+    # password tests would then keep passing against a floor the script no longer uses.
+    $passwordFloor = [regex]::Match((Get-Content -Path $script:ScriptPath -Raw),
+        "(?m)^\`$PasswordMinLength\s*=\s*(\d+)")
+    if (-not $passwordFloor.Success) { throw 'cannot find $PasswordMinLength in dev_drive.ps1' }
+    $script:PasswordFloor = [int]$passwordFloor.Groups[1].Value
+
+    $passwordCeiling = [regex]::Match((Get-Content -Path $script:ScriptPath -Raw),
+        "(?m)^\`$PasswordMaxLength\s*=\s*(\d+)")
+    if (-not $passwordCeiling.Success) { throw 'cannot find $PasswordMaxLength in dev_drive.ps1' }
+    $script:PasswordCeiling = [int]$passwordCeiling.Groups[1].Value
+
+    function Get-ScriptFunction {
+        <# One named function of dev_drive.ps1 as a syntax-tree node, so a test can ask about the
+           text of that function alone. A whole-file match prints the whole file when it fails. #>
+        param([Parameter(Mandatory)][string]$Name)
+
+        $tree = [System.Management.Automation.Language.Parser]::ParseFile($script:ScriptPath, [ref]$null, [ref]$null)
+        $found = @($tree.FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                    $node.Name -eq $Name
+                }, $false))
+        if ($found.Count -ne 1) { throw "dev_drive.ps1 defines $($found.Count) functions named $Name" }
+        return $found[0]
+    }
+
     function New-PlanAnswerSet {
         <# A complete, valid answer table for one mode, so a test can change the single field it is
            about. Mirrors what the body assembles: a key exists only where its question was asked. #>
@@ -126,6 +153,90 @@ Describe 'The script itself' {
     It 'sets the minimum to Microsoft''s documented 50 GB' {
         $line = Select-String -Path $script:ScriptPath -Pattern '^\$DevDriveMinSizeGB\s*=\s*(\d+)'
         [int]$line.Matches[0].Groups[1].Value | Should -Be 50
+    }
+
+    It 'declares each password length bound exactly once, at <Name>' -TestCases @(
+        @{ Name = 'the floor'; Variable = 'PasswordMinLength'; Value = 8 }
+        # BitLocker refuses past 256 with 0x803100AA, so the ceiling is its number, not a choice.
+        @{ Name = 'the ceiling'; Variable = 'PasswordMaxLength'; Value = 256 }
+    ) {
+        $line = Select-String -Path $script:ScriptPath -Pattern "^\`$$Variable\s*=\s*(\d+)"
+        @($line).Count | Should -Be 1
+        [int]$line.Matches[0].Groups[1].Value | Should -Be $Value
+    }
+
+    It 'builds the password prompt from the bounds it was given, never from a second copy of them' {
+        $reader = Get-ScriptFunction -Name 'Request-StrongPassword'
+        # Positive, not a negative against today's wording: a reworded prompt carrying a fresh digit
+        # would slip past "does not say 8", and so would a parameter default.
+        $reader.Extent.Text | Should -Match '\$MinimumLength-\$MaximumLength printable ASCII chars'
+        $reader.Extent.Text | Should -Not -Match '\$M(in|ax)imumLength\s*=\s*\d'
+    }
+
+    It 'has one password caller, and it passes the constants rather than numbers' {
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($script:ScriptPath, [ref]$null, [ref]$null)
+        $calls = @($ast.FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.CommandAst] -and
+                    $node.GetCommandName() -eq 'Request-StrongPassword'
+                }, $true))
+        $calls.Count | Should -Be 1
+        # The arguments themselves, so a second caller under any variable name cannot pass a literal.
+        $passed = @{}
+        for ($i = 1; $i -lt $calls[0].CommandElements.Count - 1; $i++) {
+            $element = $calls[0].CommandElements[$i]
+            if ($element -is [System.Management.Automation.Language.CommandParameterAst]) {
+                $passed[$element.ParameterName] = $calls[0].CommandElements[$i + 1]
+            }
+        }
+        foreach ($pair in @{ MinimumLength = 'PasswordMinLength'; MaximumLength = 'PasswordMaxLength' }.GetEnumerator()) {
+            $passed[$pair.Key] | Should -BeOfType [System.Management.Automation.Language.VariableExpressionAst]
+            $passed[$pair.Key].VariablePath.UserPath | Should -Be $pair.Value
+        }
+    }
+
+    It 'frees the unmanaged password copy in a finally, so a throw cannot leave it behind' {
+        # A ZeroFreeBSTR call sitting after the checks instead of in a finally leaks the plaintext
+        # on every path that throws in between, which is exactly the defect this replaced.
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($script:ScriptPath, [ref]$null, [ref]$null)
+        $tries = @($ast.FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.TryStatementAst] -and
+                    $node.Finally -and
+                    $node.Finally.Extent.Text -match 'ZeroFreeBSTR'
+                }, $true))
+        $tries.Count | Should -Be 1
+        # The conversion must sit in the guarded body, not before the try where nothing frees it.
+        $tries[0].Body.Extent.Text | Should -Match '::PtrToStringBSTR\('
+        # And the pointer must be taken outside it: a throw from that call with it inside would hand
+        # the finally the previous pass's pointer, freeing it twice.
+        $tries[0].Body.Extent.Text | Should -Not -Match '::SecureStringToBSTR\('
+        # The managed copy is released in the same place, so neither survives the loop.
+        $tries[0].Finally.Extent.Text | Should -Match '\$plain\s*=\s*\$null'
+        # The call form, and only within the function: the Auto variant reads to the first null
+        # instead of taking the BSTR length prefix, and a whole-file match would print the file.
+        $reader = Get-ScriptFunction -Name 'Request-StrongPassword'
+        $reader.Extent.Text | Should -Not -Match '::PtrToStringAuto\('
+        # The refused attempt goes too, and before the loop overwrites the variable holding it.
+        $text = $reader.Extent.Text
+        $text.IndexOf('$secure.Dispose()') | Should -BeGreaterThan $text.IndexOf('return $secure')
+    }
+
+    It 'wraps the requirement check so an empty answer cannot throw under strict mode' {
+        # Measured: return @() arrives as $null and return @('one') as a bare string, so .Count on
+        # the bare result throws here. The @() around the call is what makes the count safe.
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($script:ScriptPath, [ref]$null, [ref]$null)
+        $calls = @($ast.FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.CommandAst] -and
+                    $node.GetCommandName() -eq 'Resolve-UnmetPasswordRequirement'
+                }, $true))
+        $calls.Count | Should -Be 1
+        # The exact chain, not any ancestor: a call nested inside some other array expression
+        # somewhere up the tree is not the wrap that makes this .Count safe.
+        $calls[0].Parent | Should -BeOfType [System.Management.Automation.Language.PipelineAst]
+        $calls[0].Parent.Parent | Should -BeOfType [System.Management.Automation.Language.StatementBlockAst]
+        $calls[0].Parent.Parent.Parent | Should -BeOfType [System.Management.Automation.Language.ArrayExpressionAst]
     }
 
     It 'declares the shrink head-room exactly once' {
@@ -4425,3 +4536,125 @@ Describe 'Get-VolumeWriteState' {
         $reason | Should -Not -Match 'Exception calling'
     }
 }
+
+Describe 'Resolve-UnmetPasswordRequirement' {
+    BeforeAll {
+        # The floor and ceiling are read out of the script in the file-level BeforeAll, so the
+        # fixtures that are about length are built from them rather than from numbers of their own.
+        $script:AtFloor = 'Ab1!' + ('c' * [math]::Max(0, $script:PasswordFloor - 4))
+        $script:BelowFloor = $script:AtFloor.Substring(0, $script:AtFloor.Length - 1)
+        $script:FloorMessage = "at least $script:PasswordFloor characters"
+        $script:CeilingMessage = "at most $script:PasswordCeiling characters"
+
+        function Get-Unmet {
+            <# The call every test makes, so the two length arguments are not repeated in each. It
+               unrolls like any function, so a caller wanting .Count wraps it in @() as the script
+               does - the array a return statement carries out of a function is not one. #>
+            param([Parameter(Mandatory)][AllowEmptyString()][string]$Plain)
+
+            return @(Resolve-UnmetPasswordRequirement -Plain $Plain `
+                    -MinimumLength $script:PasswordFloor -MaximumLength $script:PasswordCeiling)
+        }
+    }
+
+    It 'answers nothing for a password that meets every rule' {
+        @(Get-Unmet -Plain $script:AtFloor).Count | Should -Be 0
+    }
+
+    It 'names the length requirement one character below the floor, and not at it' {
+        Get-Unmet -Plain $script:BelowFloor | Should -Contain $script:FloorMessage
+        Get-Unmet -Plain $script:AtFloor | Should -Not -Contain $script:FloorMessage
+    }
+
+    It 'names the ceiling one character above it, and not at it' {
+        # BitLocker answers 0x803100AA past its ceiling, so a longer password is refused here first.
+        $atCeiling = 'Ab1!' + ('c' * ($script:PasswordCeiling - 4))
+        Get-Unmet -Plain $atCeiling | Should -Not -Contain $script:CeilingMessage
+        Get-Unmet -Plain ($atCeiling + 'c') | Should -Contain $script:CeilingMessage
+    }
+
+    It 'refuses an all-lowercase password for want of an uppercase letter' {
+        # -notmatch would accept this: it is case-insensitive, so [A-Z] matches a lowercase letter.
+        Get-Unmet -Plain 'abcdefg1!' | Should -Contain 'at least one uppercase letter'
+    }
+
+    It 'refuses an all-uppercase password for want of a lowercase letter' {
+        Get-Unmet -Plain 'ABCDEFG1!' | Should -Contain 'at least one lowercase letter'
+    }
+
+    It 'names the digit requirement when there is no digit' {
+        Get-Unmet -Plain 'Abcdefgh!' | Should -Contain 'at least one digit'
+    }
+
+    It 'names the special-character requirement when every character is alphanumeric' {
+        Get-Unmet -Plain 'Abcdefg12' | Should -Contain 'at least one special character'
+    }
+
+    It 'does not accept a space as the special character' {
+        Get-Unmet -Plain 'Abcdefg1 ' | Should -Contain 'at least one special character'
+    }
+
+    It 'accepts a space inside an otherwise valid password' {
+        # Space is printable ASCII, so only the special-character rule refuses to count it.
+        @(Get-Unmet -Plain 'Ab 1!cde').Count | Should -Be 0
+    }
+
+    It 'refuses a password Windows would refuse as non-ASCII, for <Name>' -TestCases @(
+        @{ Name = 'a Cyrillic capital'; Code = 0x0416 }
+        @{ Name = 'an Arabic-Indic digit'; Code = 0x0665 }
+        @{ Name = 'an accented Latin letter'; Code = 0x00E9 }
+    ) {
+        # Built from code points so this file stays ASCII. Each of these satisfied the old negated
+        # class or \d and was then refused by BitLocker as non-printable ASCII (0x803100A4).
+        $unmet = @(Get-Unmet -Plain ('Abcdefg1!' + [char]$Code))
+        $unmet.Count | Should -Be 1
+        $unmet | Should -Contain 'printable ASCII characters only'
+    }
+
+    It 'refuses a control character, which is ASCII but not printable' {
+        Get-Unmet -Plain ('Abcdefg1!' + [char]9) | Should -Contain 'printable ASCII characters only'
+    }
+
+    It 'does not count a non-ASCII digit as the digit' {
+        # \d is Unicode in .NET, so it would take an Arabic-Indic five and call the rule met while
+        # BitLocker refuses the password outright. The class is [0-9] for that reason.
+        $unmet = @(Get-Unmet -Plain ('Abcdefg!' + [char]0x0665))
+        $unmet | Should -Contain 'at least one digit'
+        $unmet | Should -Contain 'printable ASCII characters only'
+    }
+
+    It 'counts only ASCII punctuation as the special character' {
+        # The old class counted any non-Latin letter; this one is the printable ASCII range less
+        # space and alphanumerics, so a Cyrillic capital no longer stands in for punctuation.
+        $unmet = @(Get-Unmet -Plain ('Abcdefg1' + [char]0x0416))
+        $unmet | Should -Contain 'at least one special character'
+    }
+
+    It 'names every unmet requirement at once rather than the first' {
+        @(Get-Unmet -Plain '').Count | Should -Be 5
+    }
+
+    It 'answers in the order the prompt lists the requirements' {
+        Get-Unmet -Plain '' | Should -Be @(
+            $script:FloorMessage
+            'at least one uppercase letter'
+            'at least one lowercase letter'
+            'at least one digit'
+            'at least one special character'
+        )
+    }
+
+    It 'takes the lengths from its arguments rather than from literals, for <Floor>' -TestCases @(
+        @{ Floor = 4;  Ceiling = 64;  Plain = 'Ab1!';      Met = $true }
+        @{ Floor = 12; Ceiling = 64;  Plain = 'Abcdefg1!'; Met = $false; Message = 'at least 12 characters' }
+        @{ Floor = 4;  Ceiling = 8;   Plain = 'Abcdefg1!'; Met = $false; Message = 'at most 8 characters' }
+    ) {
+        $unmet = @(Resolve-UnmetPasswordRequirement -Plain $Plain -MinimumLength $Floor -MaximumLength $Ceiling)
+        if ($Met) {
+            $unmet.Count | Should -Be 0
+        } else {
+            $unmet | Should -Contain $Message
+        }
+    }
+}
+
