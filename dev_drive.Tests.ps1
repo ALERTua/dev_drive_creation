@@ -1315,12 +1315,71 @@ Describe 'Format-CreationPlan' {
         (Format-CreationPlan -Answers $answers).Text -join "`n" | Should -Not -Match 'claims all of its space up front'
     }
 
-    It 'ends every mode with the two steps that always run' {
+    It 'names the trusted designation in every mode, where the run actually applies it' {
+        # It used to be listed second to last, after deduplication, while the run applies it right
+        # after formatting - so the plan told the reader it came after the longest step, not before.
         foreach ($mode in 'FreeSpace', 'ShrinkDrive', 'Vhdx') {
-            $plan = (Format-CreationPlan -Answers (New-PlanAnswerSet -Mode $mode)).Text -join "`n"
-            $plan | Should -Match '\* Mark Dev Drive as trusted for Windows Defender performance'
-            $plan | Should -Match '\* Run initial optimization job to prepare the drive'
+            $plan = @((Format-CreationPlan -Answers (New-PlanAnswerSet -Mode $mode)).Text)
+            $trustAt = [array]::FindIndex($plan, [Predicate[string]] { $args[0] -match '^\* Mark Dev Drive as trusted' })
+            $bitLockerAt = [array]::FindIndex($plan, [Predicate[string]] { $args[0] -match '^\* (Enable|Skip) BitLocker' })
+            $nameAt = [array]::FindIndex($plan, [Predicate[string]] { $args[0] -match '^\* Name the Dev Drive' })
+            $trustAt | Should -BeGreaterThan $nameAt
+            $trustAt | Should -BeLessThan $bitLockerAt
         }
+    }
+
+    It 'lists the trusted designation in the order the body carries it out' {
+        # The plan and the body are two lists that have to agree; comparing the plan against a
+        # literal order is what let them drift apart in the first place.
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($script:ScriptPath, [ref]$null, [ref]$null)
+        # The call, not the phrase: two pieces of retry advice quote the same fsutil line earlier in
+        # the file, and matching text would have found one of those instead.
+        $trust = @($ast.FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.CommandAst] -and
+                    $node.GetCommandName() -eq 'fsutil' -and
+                    $node.Extent.Text -match 'devdrv trust'
+                }, $true))
+        $trust.Count | Should -Be 1
+        $format = @($ast.FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.CommandAst] -and
+                    $node.GetCommandName() -eq 'Format-Volume'
+                }, $true))
+        $format.Count | Should -Be 1
+        $bitLockerAt = (Get-Content -Path $script:ScriptPath -Raw).IndexOf('BitLocker setup for $devLetterColon')
+        $trust[0].Extent.StartOffset | Should -BeGreaterThan $format[0].Extent.StartOffset
+        $bitLockerAt | Should -BeGreaterThan $trust[0].Extent.StartOffset
+    }
+
+    It 'promises the initial optimization job only where deduplication is set up' {
+        # An optimization job is a deduplication job: the work sits inside the block that declining
+        # deduplication skips, so promising it to somebody who declined describes an impossible run.
+        $answers = New-PlanAnswerSet -Mode 'Vhdx'
+        $answers.SkipDeduplication = $false
+        (Format-CreationPlan -Answers $answers).Text -join "`n" |
+            Should -Match '\* Run initial optimization job to prepare the drive'
+        $answers.SkipDeduplication = $true
+        (Format-CreationPlan -Answers $answers).Text -join "`n" |
+            Should -Not -Match 'optimization job'
+    }
+
+    It 'keeps the optimization promise inside the branch, not merely near it' {
+        # A proximity check is not a branch check: ask the tree which branch body the line sits in.
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($script:ScriptPath, [ref]$null, [ref]$null)
+        $guards = @($ast.FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.IfStatementAst] -and
+                    $node.Clauses[0].Item1.Extent.Text -eq '$Answers.SkipDeduplication'
+                }, $true))
+        $guards.Count | Should -Be 1
+        $content = Get-Content -Path $script:ScriptPath -Raw
+        $at = $content.IndexOf("'* Run initial optimization job to prepare the drive'")
+        $at | Should -BeGreaterThan 0
+        # The else body, because the guard asks whether deduplication is being skipped.
+        $elseBody = $guards[0].ElseClause.Extent
+        $at | Should -BeGreaterThan $elseBody.StartOffset
+        $at | Should -BeLessThan $elseBody.EndOffset
     }
 
     It 'gives each kind of line the colour that kind is printed in' {

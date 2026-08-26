@@ -1658,6 +1658,8 @@ function Format-CreationPlan {
     }
 
     $lines += New-PlanLine -Text "* Name the Dev Drive $($Answers.DevDriveLabel)"
+    # Where the run does it: straight after formatting, and before the longest step it takes.
+    $lines += New-PlanLine -Text '* Mark Dev Drive as trusted for Windows Defender performance'
 
     if ($Answers.SkipBitLocker) {
         $lines += New-PlanLine -Text '* Skip BitLocker encryption'
@@ -1683,10 +1685,10 @@ function Format-CreationPlan {
                     -WeeklyJob:$Answers.DedupWeeklyJob)) {
             $lines += New-PlanLine -Text "* $($summary.Trim())"
         }
+        # An optimization job is a deduplication job: skip one, skip both.
+        $lines += New-PlanLine -Text '* Run initial optimization job to prepare the drive'
     }
 
-    $lines += New-PlanLine -Text '* Mark Dev Drive as trusted for Windows Defender performance'
-    $lines += New-PlanLine -Text '* Run initial optimization job to prepare the drive'
     $lines += New-PlanLine -Text '' -Colour Cyan
     $lines += New-PlanLine -Text $rule -Colour Cyan
     return $lines
