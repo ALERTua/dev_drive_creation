@@ -30,6 +30,58 @@ BeforeAll {
 
     Initialize-VirtDiskInterop
 
+    # Where the body prints what the plan function decided; several source-order tests anchor on it.
+    $script:PlanPrintLoop = 'foreach ($planLine in (Format-CreationPlan'
+
+    # Lifted functions do not bring the body's constants; the write-access advice defaults to this
+    # one. Read out of the script so the two cannot drift, which a second literal here would allow.
+    $policyPath = [regex]::Match((Get-Content -Path $script:ScriptPath -Raw),
+        "(?m)^\`$FixedDriveWritePolicyPath\s*=\s*'([^']+)'")
+    if (-not $policyPath.Success) { throw 'cannot find $FixedDriveWritePolicyPath in dev_drive.ps1' }
+    $script:FixedDriveWritePolicyPath = $policyPath.Groups[1].Value
+
+    function New-PlanAnswerSet {
+        <# A complete, valid answer table for one mode, so a test can change the single field it is
+           about. Mirrors what the body assembles: a key exists only where its question was asked. #>
+        param([Parameter(Mandatory)][ValidateSet('FreeSpace', 'ShrinkDrive', 'Vhdx')][string]$Mode)
+
+        $answers = @{
+            Mode                = $Mode
+            SizeGB              = 250
+            DevDriveLabel       = 'Projects'
+            SkipBitLocker       = $false
+            WritePolicy         = 'Allow'
+            SkipDeduplication   = $false
+            BitLockerNotes      = @('a note about BitLocker')
+            DedupMode           = 'DedupAndCompress'
+            CompressionFormat   = 'ZSTD'
+            CompressionLevel    = 2
+            DedupStartTime      = '17:00'
+            DedupDailyDaysLabel = 'Monday-Friday'
+            ScrubDays           = 'Monday'
+            ScrubStart          = '17:30'
+            ScrubWeeksInterval  = 1
+            DedupWeeklyJob      = $true
+        }
+        if ($Mode -eq 'Vhdx') {
+            $answers.VhdxPath = 'D:\dev.vhdx'
+            $answers.VhdxDiskType = 'Dynamic'
+            $answers.VhdxAutoAttach = $true
+            # Deliberately not the script's own default, so a hardcoded GPT cannot pass for this.
+            $answers.PartitionStyle = 'MBR'
+        } else {
+            $answers.DiskNumber = 1
+            $answers.DiskName = 'CT4000P3PSSD8'
+        }
+        if ($Mode -eq 'ShrinkDrive') {
+            $answers.DriveLetter = 'D'
+            $answers.DriveLabel = 'ALERT'
+            $answers.ShrinkGB = 200
+            $answers.ShrinkAdjoiningGB = 50
+        }
+        return $answers
+    }
+
     # A machine without the BitLocker feature has no Get-BitLockerVolume for Mock to bind to.
     if (-not (Get-Command Get-BitLockerVolume -ErrorAction SilentlyContinue)) {
         function Get-BitLockerVolume {
@@ -125,7 +177,7 @@ Describe 'The script itself' {
     It 'builds the plan summary, schedules and reminds using the chosen values, not a literal or a stale default' {
         $content = Get-Content -Path $script:ScriptPath -Raw
         $content | Should -Not -Match '\* Schedule daily optimization jobs at 11:00 and 17:00'
-        $content | Should -Match 'Format-DedupScheduleSummary -DailyTime \$DedupStartTime'
+        $content | Should -Match 'Format-DedupScheduleSummary -DailyTime \$Answers\.DedupStartTime'
         $content | Should -Match 'Set-ReFSDedupScrubSchedule -Volume "\$devLetterColon" -Days \$ScrubDays -Start \$ScrubStart'
         $content | Should -Match ('(?ms)Resolve-DedupScheduleReminder -DailyTime \$DedupStartTime .*?' +
             '-WeeklyDay \$ScrubDays -WeeklyStart \$ScrubStart .*?' +
@@ -251,9 +303,35 @@ Describe 'The script itself' {
     }
 
     It 'builds every message about the mode through the one helper that knows the modes' {
-        $content = Get-Content -Path $script:ScriptPath -Raw
-        ([regex]::Matches($content, 'Format-DedupModeChoice -Mode \$DedupMode -Format \$CompressionFormat -Level \$CompressionLevel')).Count |
-            Should -Be 3
+        # By call rather than by exact text: the plan now reads its values off the answers table, so
+        # a literal match would count two of the three and pass while the third drifted.
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+            $script:ScriptPath, [ref]$null, [ref]$null)
+        $calls = @($ast.FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.CommandAst] -and
+                    $node.GetCommandName() -eq 'Format-DedupModeChoice'
+                }, $true))
+        # Four: the plan, the echo after the question, the initial job, and the read-back verdict.
+        $calls.Count | Should -Be 4
+
+        foreach ($call in $calls) {
+            $parameters = @($call.CommandElements |
+                    Where-Object { $_ -is [System.Management.Automation.Language.CommandParameterAst] } |
+                    ForEach-Object { $_.ParameterName })
+            $parameters | Should -Contain 'Mode'
+            $parameters | Should -Contain 'Format'
+            $parameters | Should -Contain 'Level'
+
+            # Names alone would let a literal through, which is the stale-default failure. The
+            # read-back verdict is the one that legitimately passes the volume's own answer.
+            if ($call.Extent.Text -notmatch '\$Actual\.') {
+                $call.Extent.Text | Should -Match '(\$DedupMode|\$Answers\.DedupMode)'
+                $call.Extent.Text | Should -Match '(\$CompressionFormat|\$Answers\.CompressionFormat)'
+                $call.Extent.Text | Should -Match '(\$CompressionLevel|\$Answers\.CompressionLevel)'
+            }
+        }
+
         Select-String -Path $script:ScriptPath -Pattern 'Write-Host "[^"]*(?<!-Level )\$CompressionLevel' |
             Should -BeNullOrEmpty
     }
@@ -434,26 +512,21 @@ Describe 'The script itself' {
 
     It 'promises the one initialization it performs, in the plan of the mode that performs it' {
         # The physical modes refuse an uninitialized disk; the .vhdx mode initializes the disk it
-        # just created. Hoisted out of that branch, this would promise it to every mode.
-        $ast = [System.Management.Automation.Language.Parser]::ParseFile($script:ScriptPath, [ref]$null, [ref]$null)
-        $vhdxPlan = @($ast.FindAll({
-                    param($node)
-                    $node -is [System.Management.Automation.Language.IfStatementAst] -and
-                    $node.Clauses[0].Item1.Extent.Text -eq '$mode -eq "Vhdx"' -and
-                    $node.Clauses[0].Item2.Extent.Text -match 'Format the attached virtual disk'
-                }, $true))
-        $vhdxPlan.Count | Should -Be 1
+        # just created. Asked of the plan itself, rather than of where the branch sits.
+        $vhdx = (Format-CreationPlan -Answers (New-PlanAnswerSet -Mode 'Vhdx')).Text -join "`n"
+        $vhdx | Should -Match '\* Initialize the new virtual disk with a \w+ partition table'
 
-        $planText = $vhdxPlan[0].Clauses[0].Item2.Extent.Text
-        $planText | Should -Match '\* Initialize the new virtual disk with a \$DiskPartitionStyle partition table'
-        $planText | Should -Match 'this script never initializes a physical disk'
-        # Future tense, like every other line of a plan that has not run yet.
-        $planText | Should -Match 'it will be brand new and empty'
+        foreach ($mode in 'FreeSpace', 'ShrinkDrive') {
+            $physical = (Format-CreationPlan -Answers (New-PlanAnswerSet -Mode $mode)).Text -join "`n"
+            $physical | Should -Not -Match 'Initialize' -Because "$mode never initializes a disk"
+        }
 
         $content = Get-Content -Path $script:ScriptPath -Raw
-        # Promised before it happens, which is the whole point of the plan.
-        $content.IndexOf('Initialize-Disk -Number $vhdxDiskNumber') |
-            Should -BeGreaterThan $content.IndexOf('* Initialize the new virtual disk')
+        # Promised before it happens, which is the whole point of the plan. Guarded: an IndexOf that
+        # finds nothing answers -1, and everything is greater than that.
+        $printedAt = $content.IndexOf($script:PlanPrintLoop)
+        $printedAt | Should -BeGreaterThan 0
+        $content.IndexOf('Initialize-Disk -Number $vhdxDiskNumber') | Should -BeGreaterThan $printedAt
     }
 
     It 'keeps the partition style in one place rather than beside every use of it' {
@@ -529,9 +602,9 @@ Describe 'The script itself' {
     It 'settles the BitLocker facts before it prints the plan for confirmation' {
         $content = Get-Content -Path $script:ScriptPath -Raw
         $planLine = $content.IndexOf('$bitLockerPlan = Resolve-BitLockerSetupPlan')
-        $summaryLine = $content.IndexOf('* Enable BitLocker encryption for the Dev Drive')
+        $printedAt = $content.IndexOf($script:PlanPrintLoop)
         $planLine | Should -BeGreaterThan 0
-        $summaryLine | Should -BeGreaterThan $planLine
+        $printedAt | Should -BeGreaterThan $planLine
     }
 
     It 'shows the recovery key before it touches the domain account protector' {
@@ -559,7 +632,7 @@ Describe 'The script itself' {
         # Nothing may be created before the plan is agreed, so the name has to be settled with the rest.
         $content = Get-Content -Path $script:ScriptPath -Raw
         $askedAt = $content.IndexOf('$DevDriveLabel = Request-DevDriveLabel')
-        $planAt = $content.IndexOf('* Name the Dev Drive $DevDriveLabel')
+        $planAt = $content.IndexOf($script:PlanPrintLoop)
         $formatAt = $content.IndexOf('Format-Volume -DriveLetter $devLetter')
         $askedAt | Should -BeGreaterThan 0
         $planAt | Should -BeGreaterThan $askedAt
@@ -607,14 +680,33 @@ Describe 'The script itself' {
         ([regex]::Matches($content, '\$PolicyPath = \$script:FixedDriveWritePolicyPath')).Count | Should -Be 2
     }
 
-    It 'states the setting in the plan when BitLocker is being skipped' {
-        # Nothing exists yet at that point, so the run can still be declined over it.
-        $content = Get-Content -Path $script:ScriptPath -Raw
-        $skipAt = $content.IndexOf('* Skip BitLocker encryption')
-        $adviceAt = $content.IndexOf('Resolve-WriteAccessPolicyAdvice -Policy $WritePolicy', $skipAt)
-        $confirmAt = $content.IndexOf('Are you ready to proceed')
-        $adviceAt | Should -BeGreaterThan $skipAt
-        $confirmAt | Should -BeGreaterThan $adviceAt
+    It 'states the setting in the plan when BitLocker is being skipped, for <Policy>' -TestCases @(
+        @{ Policy = 'Deny' }
+        @{ Policy = 'Unknown' }
+    ) {
+        # The highest-stakes line on the consent screen: it says the drive will mount read-only and
+        # the run will stop. Nothing exists yet at that point, so it can still be declined over.
+        $answers = New-PlanAnswerSet -Mode 'FreeSpace'
+        $answers.SkipBitLocker = $true
+        $answers.Remove('BitLockerNotes')
+        $answers.WritePolicy = $Policy
+
+        $expected = @(Resolve-WriteAccessPolicyAdvice -Policy $Policy -Skipping)
+        $expected.Count | Should -BeGreaterThan 0 -Because "$Policy has something to warn about"
+
+        $lines = @(Format-CreationPlan -Answers $answers)
+        foreach ($advice in $expected) {
+            $carried = @($lines | Where-Object { $_.Text -eq "  - $advice" })
+            $carried.Count | Should -Be 1 -Because 'every line of the advice reaches the plan'
+            $carried[0].Colour | Should -Be 'Yellow'
+        }
+    }
+
+    It 'says nothing about write access where the setting allows it' {
+        $answers = New-PlanAnswerSet -Mode 'FreeSpace'
+        $answers.SkipBitLocker = $true
+        $answers.Remove('BitLockerNotes')
+        (Format-CreationPlan -Answers $answers).Text -join "`n" | Should -Not -Match 'read-only'
     }
 
     It 'never names a cause for a refused password that it did not establish' {
@@ -793,27 +885,27 @@ Describe 'The script itself' {
     It 'warns about the extra space in the plan, before the question that asks to proceed' {
         # The whole point of the change: the user is told the drive comes out larger, and told it
         # while there is still something to say no to.
+        $plan = (Format-CreationPlan -Answers (New-PlanAnswerSet -Mode 'ShrinkDrive')).Text -join "`n"
+        $plan | Should -Match 'will be taken'
+        $plan | Should -Match 'rather than the .* GB being freed'
+
         $content = Get-Content -Path $script:ScriptPath -Raw
-        $noteAt = $content.IndexOf('Format-ShrinkSizeNote -DriveLetter $DriveLetter -ShrinkGB $ShrinkGB')
-        $planAt = $content.IndexOf('DEV DRIVE CREATION PLAN')
+        $planAt = $content.IndexOf($script:PlanPrintLoop)
         $confirmAt = $content.IndexOf('Are you ready to proceed')
         $planAt | Should -BeGreaterThan 0
-        $noteAt | Should -BeGreaterThan $planAt
-        $confirmAt | Should -BeGreaterThan $noteAt
+        $confirmAt | Should -BeGreaterThan $planAt
     }
 
     It 'says the size is approximate where the adjoining space could not be measured' {
         # That branch knows the drive will differ and cannot say by how much, so it must not print
         # the number as though it were the answer. Not "at least", either: alignment can leave the
         # partition a little off the target, so the figure is not a floor.
-        $content = Get-Content -Path $script:ScriptPath -Raw
-        $branchAt = $content.IndexOf('if ($null -eq $ShrinkAdjoiningGB) {')
-        $confirmAt = $content.IndexOf('Are you ready to proceed')
-        $branchAt | Should -BeGreaterThan 0
-        $confirmAt | Should -BeGreaterThan $branchAt
-        $branch = $content.Substring($branchAt, $confirmAt - $branchAt)
-        $branch | Should -Match 'About this much, and likely more'
-        $branch | Should -Match 'could not be measured beforehand'
+        $answers = New-PlanAnswerSet -Mode 'ShrinkDrive'
+        $answers.ShrinkAdjoiningGB = $null
+        $plan = (Format-CreationPlan -Answers $answers).Text -join "`n"
+        $plan | Should -Match 'About this much, and likely more'
+        $plan | Should -Match 'could not be measured beforehand'
+        $plan | Should -Not -Match 'will be taken' -Because 'no figure is known to name'
     }
 
     It 'records the shrunk drive letter right after the resize, before anything else can throw' {
@@ -1009,6 +1101,161 @@ Describe 'Resolve-VhdxPathInput' {
 
     It 'upper cases the drive letter so later messages read the same' {
         (Resolve-VhdxPathInput -Answer 'c:\x\y.vhdx').Path | Should -BeExactly 'C:\x\y.vhdx'
+    }
+}
+
+Describe 'Format-CreationPlan' {
+    # The screen that asks for consent; nothing below it could be tested until it became a function.
+    It 'names in the <Mode> plan only what that mode does' -TestCases @(
+        @{ Mode = 'Vhdx';        Absent = @('on Disk', 'Shrink Drive') }
+        @{ Mode = 'FreeSpace';   Absent = @('virtual hard disk', 'Shrink Drive', 'mounted on every Windows startup') }
+        @{ Mode = 'ShrinkDrive'; Absent = @('virtual hard disk', 'mounted on every Windows startup') }
+    ) {
+        $plan = (Format-CreationPlan -Answers (New-PlanAnswerSet -Mode $Mode)).Text -join "`n"
+        foreach ($phrase in $Absent) {
+            $plan | Should -Not -Match ([regex]::Escape($phrase)) -Because "$Mode does not do that"
+        }
+    }
+
+    It 'says a skipped step is skipped, rather than leaving it out' {
+        $answers = New-PlanAnswerSet -Mode 'FreeSpace'
+        $answers.SkipBitLocker = $true
+        $answers.Remove('BitLockerNotes')
+        $answers.SkipDeduplication = $true
+        $plan = (Format-CreationPlan -Answers $answers).Text -join "`n"
+        $plan | Should -Match '\* Skip BitLocker encryption'
+        $plan | Should -Match '\* Skip deduplication and compression setup'
+        $plan | Should -Not -Match '\* Enable BitLocker'
+        $plan | Should -Not -Match '\* Enable ReFS'
+    }
+
+    It 'names the size, the label and the disk that were answered, not a literal' {
+        $answers = New-PlanAnswerSet -Mode 'FreeSpace'
+        $answers.SizeGB = 512
+        $answers.DevDriveLabel = 'Bench'
+        $answers.DiskNumber = 7
+        $answers.DiskName = 'SOME DISK'
+        $plan = (Format-CreationPlan -Answers $answers).Text -join "`n"
+        $plan | Should -Match '\* Create 512 GB Dev Drive on Disk 7 \(SOME DISK\) using ReFS'
+        $plan | Should -Match '\* Name the Dev Drive Bench'
+    }
+
+    It 'warns about the extra space only where a shrink brought it' {
+        (Format-CreationPlan -Answers (New-PlanAnswerSet -Mode 'ShrinkDrive')).Text -join "`n" |
+            Should -Match '50 GB of unallocated space already sits next to drive D:'
+        (Format-CreationPlan -Answers (New-PlanAnswerSet -Mode 'FreeSpace')).Text -join "`n" |
+            Should -Not -Match 'already sits next to'
+    }
+
+    It 'says which way the virtual disk will be mounted, whichever way that is' {
+        $answers = New-PlanAnswerSet -Mode 'Vhdx'
+        (Format-CreationPlan -Answers $answers).Text -join "`n" |
+            Should -Match 'Register the virtual disk to be mounted on every Windows startup'
+        $answers.VhdxAutoAttach = $false
+        (Format-CreationPlan -Answers $answers).Text -join "`n" |
+            Should -Match 'Skip automatic mounting'
+    }
+
+    It 'warns about the wait only for the disk type that makes you wait' {
+        $answers = New-PlanAnswerSet -Mode 'Vhdx'
+        $answers.VhdxDiskType = 'Fixed'
+        (Format-CreationPlan -Answers $answers).Text -join "`n" | Should -Match 'claims all of its space up front'
+        $answers.VhdxDiskType = 'Dynamic'
+        (Format-CreationPlan -Answers $answers).Text -join "`n" | Should -Not -Match 'claims all of its space up front'
+    }
+
+    It 'ends every mode with the two steps that always run' {
+        foreach ($mode in 'FreeSpace', 'ShrinkDrive', 'Vhdx') {
+            $plan = (Format-CreationPlan -Answers (New-PlanAnswerSet -Mode $mode)).Text -join "`n"
+            $plan | Should -Match '\* Mark Dev Drive as trusted for Windows Defender performance'
+            $plan | Should -Match '\* Run initial optimization job to prepare the drive'
+        }
+    }
+
+    It 'gives each kind of line the colour that kind is printed in' {
+        # Not merely "a colour": the warning that turns yellow into white stops being a warning.
+        $answers = New-PlanAnswerSet -Mode 'ShrinkDrive'
+        $answers.VhdxDiskType = 'Fixed'
+        $lines = @(Format-CreationPlan -Answers $answers)
+        $lines.Count | Should -BeGreaterThan 10
+
+        $colourOf = { param($pattern)
+            $found = @($lines | Where-Object { $_.Text -match $pattern })
+            $found.Count | Should -BeGreaterThan 0 -Because "the plan should carry $pattern"
+            return $found[0].Colour
+        }
+        (& $colourOf 'DEV DRIVE CREATION PLAN') | Should -Be 'Cyan'
+        (& $colourOf '^\* Create ') | Should -Be 'White'
+        (& $colourOf 'already sits next to') | Should -Be 'Yellow'
+        (& $colourOf '^  - a note about BitLocker') | Should -Be 'Gray'
+    }
+
+    It 'refuses a colour that is not one, rather than failing halfway through printing' {
+        { New-PlanLine -Text 'x' -Colour 'Purpel' } | Should -Throw
+    }
+
+    It 'opens and closes with the banner, so the plan reads as one block' {
+        $lines = @(Format-CreationPlan -Answers (New-PlanAnswerSet -Mode 'FreeSpace'))
+        $lines[1].Text | Should -Match 'DEV DRIVE CREATION PLAN'
+        $lines[0].Text | Should -Be $lines[-1].Text
+    }
+
+    It 'refuses a mode it has no plan for, rather than falling into the physical branch' {
+        $answers = New-PlanAnswerSet -Mode 'FreeSpace'
+        $answers.Mode = 'SomethingNew'
+        { Format-CreationPlan -Answers $answers } | Should -Throw
+    }
+
+    It 'names the file, the size and the type of a virtual disk it is about to create' {
+        $answers = New-PlanAnswerSet -Mode 'Vhdx'
+        $answers.VhdxPath = 'E:\somewhere\dev.vhdx'
+        $answers.SizeGB = 300
+        $answers.VhdxDiskType = 'Fixed'
+        (Format-CreationPlan -Answers $answers).Text -join "`n" |
+            Should -Match ([regex]::Escape('* Create a 300 GB Fixed virtual hard disk at E:\somewhere\dev.vhdx'))
+    }
+
+    It 'names the drive it is about to shrink, by letter and by label' {
+        $answers = New-PlanAnswerSet -Mode 'ShrinkDrive'
+        $answers.DriveLetter = 'Q'
+        $answers.DriveLabel = 'Scratch'
+        $answers.ShrinkGB = 123
+        (Format-CreationPlan -Answers $answers).Text -join "`n" |
+            Should -Match '\* Shrink Drive Q \(Scratch\) by 123 GB to free up space'
+    }
+
+    It 'takes the partition table it was told about, not the one it was written beside' {
+        # The fixture deliberately answers MBR while the script's own default is GPT.
+        (Format-CreationPlan -Answers (New-PlanAnswerSet -Mode 'Vhdx')).Text -join "`n" |
+            Should -Match '\* Initialize the new virtual disk with a MBR partition table'
+    }
+
+    It 'reads exactly the keys the run assembles, no more and no fewer' {
+        # Three lists that have to agree: what the body sets, what the function reads, and what the
+        # fixture builds. Left to drift, the fixture keeps the tests green while a real run throws
+        # at the consent screen, after the whole interview.
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+            $script:ScriptPath, [ref]$null, [ref]$null)
+        $function = $ast.FindAll({ param($node)
+                $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -eq 'Format-CreationPlan' }, $false)[0]
+
+        $read = @([regex]::Matches($function.Extent.Text, '\$Answers\.([A-Za-z]+)') |
+                ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique)
+        $read.Count | Should -BeGreaterThan 10
+
+        $body = $ast.Extent.Text.Substring($ast.Extent.Text.IndexOf('$planAnswers = @{'))
+        $body = $body.Substring(0, $body.IndexOf('foreach ($planLine in (Format-CreationPlan'))
+        $set = @(([regex]::Matches($body, '(?m)^\s*([A-Za-z]+)\s*=') |
+                    ForEach-Object { $_.Groups[1].Value }) +
+            ([regex]::Matches($body, '\$planAnswers\.([A-Za-z]+)\s*=') |
+                ForEach-Object { $_.Groups[1].Value }) | Sort-Object -Unique)
+
+        $fixture = @((New-PlanAnswerSet -Mode 'Vhdx').Keys + (New-PlanAnswerSet -Mode 'ShrinkDrive').Keys |
+                Sort-Object -Unique)
+
+        Compare-Object $read $set | Should -BeNullOrEmpty -Because 'the run sets what the plan reads'
+        Compare-Object $read $fixture | Should -BeNullOrEmpty -Because 'the fixture answers what the plan reads'
     }
 }
 
