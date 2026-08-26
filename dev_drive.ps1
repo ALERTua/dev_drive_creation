@@ -1920,26 +1920,27 @@ function Request-DevDriveSizeGB {
 
 function Resolve-UnmetPasswordRequirement {
     <# Answers the requirements this password does not meet, in the order the prompt lists them, and
-       nothing when it meets them all. Every rule mirrors one BitLocker refuses by its own error
-       code, so nothing obviously refusable is handed over; its policy may still ask for more. #>
+       nothing when it meets them all. The ceiling and the ASCII rule are BitLocker's own refusals;
+       the floor and the four classes are this script's, and are stricter than its default policy. #>
     param(
         [Parameter(Mandatory)][AllowEmptyString()][string]$Plain,
         [Parameter(Mandatory)][int]$MinimumLength,
         [Parameter(Mandatory)][int]$MaximumLength
     )
 
-    # Every class is spelled out in ASCII rather than left to \d or a negated class, because both of
-    # those match beyond ASCII and BitLocker refuses anything outside printable ASCII (0x803100A4).
+    # IsMatch throughout, never -match or -notmatch: those are case-insensitive, which is how [A-Z]
+    # came to accept a lowercase letter, and they leave what they matched in $Matches - for the ASCII
+    # pattern that is the whole password. Classes are spelled out in ASCII because \d and a negated
+    # class both reach past it, and BitLocker refuses anything outside printable ASCII (0x803100A4).
     $unmet = @()
-    if ($Plain.Length -lt $MinimumLength)          { $unmet += "at least $MinimumLength characters" }
-    if ($Plain.Length -gt $MaximumLength)          { $unmet += "at most $MaximumLength characters" }
-    if ($Plain -cnotmatch '\A[\x20-\x7E]*\z')      { $unmet += "printable ASCII characters only" }
-    # -cnotmatch, because the case-insensitive form lets [A-Z] match a lowercase letter and vice versa.
-    if ($Plain -cnotmatch '[A-Z]')                 { $unmet += "at least one uppercase letter" }
-    if ($Plain -cnotmatch '[a-z]')                 { $unmet += "at least one lowercase letter" }
-    if ($Plain -cnotmatch '[0-9]')                 { $unmet += "at least one digit" }
-    # Printable ASCII less space and alphanumerics, which is what is left to be a special character.
-    if ($Plain -cnotmatch '[\x21-\x2F\x3A-\x40\x5B-\x60\x7B-\x7E]') { $unmet += "at least one special character" }
+    if ($Plain.Length -lt $MinimumLength) { $unmet += "at least $MinimumLength characters" }
+    if ($Plain.Length -gt $MaximumLength) { $unmet += "at most $MaximumLength characters" }
+    if (-not [regex]::IsMatch($Plain, '\A[\x20-\x7E]*\z')) { $unmet += "printable ASCII characters only" }
+    if (-not [regex]::IsMatch($Plain, '[A-Z]')) { $unmet += "at least one uppercase letter" }
+    if (-not [regex]::IsMatch($Plain, '[a-z]')) { $unmet += "at least one lowercase letter" }
+    if (-not [regex]::IsMatch($Plain, '[0-9]')) { $unmet += "at least one digit" }
+    # Printable ASCII less space and alphanumerics.
+    if (-not [regex]::IsMatch($Plain, '[\x21-\x2F\x3A-\x40\x5B-\x60\x7B-\x7E]')) { $unmet += "at least one special character" }
     return $unmet
 }
 
@@ -2991,6 +2992,8 @@ try {
 
                 if ($bitLockerPlan.UsePasswordProtector -and $protectorPlan.TypesToAdd -contains 'Password') {
                     Write-Host "Enter BitLocker password for the new volume. It must be a complex one." -ForegroundColor Yellow
+                    # The retry loop comes back here, so the attempt BitLocker refused goes first.
+                    if ($SecurePassword) { $SecurePassword.Dispose() }
                     $SecurePassword = Request-StrongPassword -MinimumLength $PasswordMinLength `
                         -MaximumLength $PasswordMaxLength
                     Write-Host "Adding BitLockerKeyProtector PasswordProtector" -ForegroundColor Green

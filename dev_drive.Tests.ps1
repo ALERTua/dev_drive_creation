@@ -18,10 +18,12 @@ BeforeAll {
     # dev_drive.ps1 is a linear script that starts asking questions when it runs, so its functions
     # are lifted out of the syntax tree instead of dot-sourcing the file.
     $parseErrors = $null
-    $ast = [System.Management.Automation.Language.Parser]::ParseFile($script:ScriptPath, [ref]$null, [ref]$parseErrors)
+    # Kept for the tests that ask the tree questions, so none of them parses the file again.
+    $script:Ast = [System.Management.Automation.Language.Parser]::ParseFile($script:ScriptPath, [ref]$null, [ref]$parseErrors)
     if ($parseErrors) {
         throw "dev_drive.ps1 does not parse: $($parseErrors[0].Message)"
     }
+    $ast = $script:Ast
 
     $functions = $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $false)
     foreach ($function in $functions) {
@@ -33,32 +35,29 @@ BeforeAll {
     # Where the body prints what the plan function decided; several source-order tests anchor on it.
     $script:PlanPrintLoop = 'foreach ($planLine in (Format-CreationPlan'
 
-    # Lifted functions do not bring the body's constants; the write-access advice defaults to this
-    # one. Read out of the script so the two cannot drift, which a second literal here would allow.
-    $policyPath = [regex]::Match((Get-Content -Path $script:ScriptPath -Raw),
-        "(?m)^\`$FixedDriveWritePolicyPath\s*=\s*'([^']+)'")
-    if (-not $policyPath.Success) { throw 'cannot find $FixedDriveWritePolicyPath in dev_drive.ps1' }
-    $script:FixedDriveWritePolicyPath = $policyPath.Groups[1].Value
+    $script:ScriptText = Get-Content -Path $script:ScriptPath -Raw
 
-    # Read out of the script for the same reason: a literal here would let the two drift, and the
-    # password tests would then keep passing against a floor the script no longer uses.
-    $passwordFloor = [regex]::Match((Get-Content -Path $script:ScriptPath -Raw),
-        "(?m)^\`$PasswordMinLength\s*=\s*(\d+)")
-    if (-not $passwordFloor.Success) { throw 'cannot find $PasswordMinLength in dev_drive.ps1' }
-    $script:PasswordFloor = [int]$passwordFloor.Groups[1].Value
+    function Get-ScriptConstant {
+        <# The value the body assigns to one top-level constant, so no test carries a copy of it.
+           Pattern is the capture for the value; a constant that has moved or gone throws here. #>
+        param([Parameter(Mandatory)][string]$Name, [Parameter(Mandatory)][string]$Pattern)
 
-    $passwordCeiling = [regex]::Match((Get-Content -Path $script:ScriptPath -Raw),
-        "(?m)^\`$PasswordMaxLength\s*=\s*(\d+)")
-    if (-not $passwordCeiling.Success) { throw 'cannot find $PasswordMaxLength in dev_drive.ps1' }
-    $script:PasswordCeiling = [int]$passwordCeiling.Groups[1].Value
+        $found = [regex]::Match($script:ScriptText, "(?m)^\`$$Name\s*=\s*$Pattern")
+        if (-not $found.Success) { throw "cannot find `$$Name in dev_drive.ps1" }
+        return $found.Groups[1].Value
+    }
+
+    # Lifted functions do not bring the body's constants, and a literal here would let the two drift.
+    $script:FixedDriveWritePolicyPath = Get-ScriptConstant -Name 'FixedDriveWritePolicyPath' -Pattern "'([^']+)'"
+    $script:PasswordFloor = [int](Get-ScriptConstant -Name 'PasswordMinLength' -Pattern '(\d+)')
+    $script:PasswordCeiling = [int](Get-ScriptConstant -Name 'PasswordMaxLength' -Pattern '(\d+)')
 
     function Get-ScriptFunction {
         <# One named function of dev_drive.ps1 as a syntax-tree node, so a test can ask about the
            text of that function alone. A whole-file match prints the whole file when it fails. #>
         param([Parameter(Mandatory)][string]$Name)
 
-        $tree = [System.Management.Automation.Language.Parser]::ParseFile($script:ScriptPath, [ref]$null, [ref]$null)
-        $found = @($tree.FindAll({
+        $found = @($script:Ast.FindAll({
                     param($node)
                     $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
                     $node.Name -eq $Name
@@ -165,7 +164,7 @@ Describe 'The script itself' {
         [int]$line.Matches[0].Groups[1].Value | Should -Be $Value
     }
 
-    It 'builds the password prompt from the bounds it was given, never from a second copy of them' {
+    It 'writes the password prompt with the bounds interpolated, never with numbers of its own' {
         $reader = Get-ScriptFunction -Name 'Request-StrongPassword'
         # Positive, not a negative against today's wording: a reworded prompt carrying a fresh digit
         # would slip past "does not say 8", and so would a parameter default.
@@ -174,7 +173,8 @@ Describe 'The script itself' {
     }
 
     It 'has one password caller, and it passes the constants rather than numbers' {
-        $ast = [System.Management.Automation.Language.Parser]::ParseFile($script:ScriptPath, [ref]$null, [ref]$null)
+        # The tree the file-level BeforeAll already parsed, rather than a fourth parse of the file.
+        $ast = $script:Ast
         $calls = @($ast.FindAll({
                     param($node)
                     $node -is [System.Management.Automation.Language.CommandAst] -and
@@ -198,7 +198,8 @@ Describe 'The script itself' {
     It 'frees the unmanaged password copy in a finally, so a throw cannot leave it behind' {
         # A ZeroFreeBSTR call sitting after the checks instead of in a finally leaks the plaintext
         # on every path that throws in between, which is exactly the defect this replaced.
-        $ast = [System.Management.Automation.Language.Parser]::ParseFile($script:ScriptPath, [ref]$null, [ref]$null)
+        # The tree the file-level BeforeAll already parsed, rather than a fourth parse of the file.
+        $ast = $script:Ast
         $tries = @($ast.FindAll({
                     param($node)
                     $node -is [System.Management.Automation.Language.TryStatementAst] -and
@@ -217,15 +218,54 @@ Describe 'The script itself' {
         # instead of taking the BSTR length prefix, and a whole-file match would print the file.
         $reader = Get-ScriptFunction -Name 'Request-StrongPassword'
         $reader.Extent.Text | Should -Not -Match '::PtrToStringAuto\('
-        # The refused attempt goes too, and before the loop overwrites the variable holding it.
-        $text = $reader.Extent.Text
-        $text.IndexOf('$secure.Dispose()') | Should -BeGreaterThan $text.IndexOf('return $secure')
+        # The rule function tests none of its patterns with an operator: -match and -notmatch are
+        # case-insensitive, which is the original defect, and they copy what matched into $Matches -
+        # for the ASCII pattern that copy is the whole password.
+        $rule = Get-ScriptFunction -Name 'Resolve-UnmetPasswordRequirement'
+        # One per pattern rule: printable ASCII, uppercase, lowercase, digit, special.
+        @([regex]::Matches($rule.Extent.Text, '\[regex\]::IsMatch\(')).Count | Should -Be 5
+        # The operators by node, not by text: the comment above them names the ones being avoided.
+        @($rule.FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.BinaryExpressionAst] -and
+                    $node.Operator.ToString() -match '^(I|C)not?match$'
+                }, $true)).Count | Should -Be 0
+    }
+
+    It 'disposes the refused attempt inside the loop, after the accepted one has left' {
+        # By position in the loop body, not by text offset: an IndexOf that finds nothing answers
+        # -1, and -1 is less than any real offset, so a reworded return would pass this silently.
+        $loop = @((Get-ScriptFunction -Name 'Request-StrongPassword').FindAll({
+                    param($node) $node -is [System.Management.Automation.Language.WhileStatementAst]
+                }, $true))
+        $loop.Count | Should -Be 1
+        $statements = @($loop[0].Body.Statements)
+        $disposeAt = [array]::FindIndex($statements, [Predicate[object]] { $args[0].Extent.Text -match '\$secure\.Dispose\(\)' })
+        $returnAt = [array]::FindIndex($statements, [Predicate[object]] { $args[0].Extent.Text -match 'return \$secure' })
+        $disposeAt | Should -BeGreaterThan 0
+        $returnAt | Should -BeGreaterThan 0
+        $disposeAt | Should -BeGreaterThan $returnAt
+    }
+
+    It 'disposes the attempt BitLocker refused before the retry asks for another' {
+        # The prompt loop is not the whole story: the BitLocker loop comes back to the same line and
+        # would otherwise leave one SecureString per attempt alive for the rest of the run.
+        $calls = @($script:Ast.FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.CommandAst] -and
+                    $node.GetCommandName() -eq 'Request-StrongPassword'
+                }, $true))
+        $calls.Count | Should -Be 1
+        $before = $script:ScriptText.Substring(0, $calls[0].Extent.StartOffset)
+        $before.LastIndexOf('$SecurePassword.Dispose()') |
+            Should -BeGreaterThan $before.LastIndexOf('$SecurePassword = $null')
     }
 
     It 'wraps the requirement check so an empty answer cannot throw under strict mode' {
         # Measured: return @() arrives as $null and return @('one') as a bare string, so .Count on
         # the bare result throws here. The @() around the call is what makes the count safe.
-        $ast = [System.Management.Automation.Language.Parser]::ParseFile($script:ScriptPath, [ref]$null, [ref]$null)
+        # The tree the file-level BeforeAll already parsed, rather than a fourth parse of the file.
+        $ast = $script:Ast
         $calls = @($ast.FindAll({
                     param($node)
                     $node -is [System.Management.Automation.Language.CommandAst] -and
@@ -4594,6 +4634,15 @@ Describe 'Resolve-UnmetPasswordRequirement' {
         Get-Unmet -Plain 'Abcdefg1 ' | Should -Contain 'at least one special character'
     }
 
+    It 'refuses a password of nothing but spaces on all four class rules and no other' {
+        # Named in the issue as untested. Spaces are printable ASCII and reach the floor, so this is
+        # the one input where every class rule fires while the length and ASCII rules pass.
+        $unmet = @(Get-Unmet -Plain (' ' * $script:PasswordFloor))
+        $unmet.Count | Should -Be 4
+        $unmet | Should -Not -Contain $script:FloorMessage
+        $unmet | Should -Not -Contain 'printable ASCII characters only'
+    }
+
     It 'accepts a space inside an otherwise valid password' {
         # Space is printable ASCII, so only the special-character rule refuses to count it.
         @(Get-Unmet -Plain 'Ab 1!cde').Count | Should -Be 0
@@ -4644,10 +4693,12 @@ Describe 'Resolve-UnmetPasswordRequirement' {
         )
     }
 
-    It 'takes the lengths from its arguments rather than from literals, for <Floor>' -TestCases @(
-        @{ Floor = 4;  Ceiling = 64;  Plain = 'Ab1!';      Met = $true }
-        @{ Floor = 12; Ceiling = 64;  Plain = 'Abcdefg1!'; Met = $false; Message = 'at least 12 characters' }
-        @{ Floor = 4;  Ceiling = 8;   Plain = 'Abcdefg1!'; Met = $false; Message = 'at most 8 characters' }
+    It 'takes the lengths from its arguments rather than from literals, <Name>' -TestCases @(
+        @{ Name = 'inside both'; Floor = 4; Ceiling = 64; Plain = 'Ab1!'; Met = $true }
+        @{ Name = 'under a raised floor'; Floor = 12; Ceiling = 64; Plain = 'Abcdefg1!'; Met = $false
+            Message = 'at least 12 characters' }
+        @{ Name = 'over a lowered ceiling'; Floor = 4; Ceiling = 8; Plain = 'Abcdefg1!'; Met = $false
+            Message = 'at most 8 characters' }
     ) {
         $unmet = @(Resolve-UnmetPasswordRequirement -Plain $Plain -MinimumLength $Floor -MaximumLength $Ceiling)
         if ($Met) {
@@ -4657,4 +4708,3 @@ Describe 'Resolve-UnmetPasswordRequirement' {
         }
     }
 }
-
