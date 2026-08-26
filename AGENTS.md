@@ -94,7 +94,7 @@ pwsh -NoProfile -c "foreach ($f in 'dev_drive.ps1','dev_drive.Tests.ps1') { $p =
   breaks the shell, and PowerShell examples are full of them.
 - **`gh pr edit` fails on this repository** — the token lacks the scopes its query needs. Edit
   through the API instead: `gh api repos/ALERTua/dev_drive_creation/pulls/<n> -X PATCH --input body.json`.
-- **CI only runs on pull requests targeting `main`.** A pull request retargeted automatically after
-  a dependency merges does not re-trigger it; closing and reopening does.
+- **CI runs on pull requests targeting `main`, and on pushes to `main`.** A pull request retargeted
+  automatically after a dependency merges does not re-trigger it; closing and reopening does.
 - **Closing keywords are read from commit messages too**, and negation is ignored. "does not close
   #32" still links it. Check with `gh pr view <n> --json closingIssuesReferences`.
