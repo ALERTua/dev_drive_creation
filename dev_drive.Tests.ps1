@@ -132,6 +132,41 @@ Describe 'The script itself' {
             '-TaskNames \$ownTaskNames -VolumeTaskName \$devTaskName')
     }
 
+    # Measured on a scratch disk laid out as A(15) | gap 15 GB | C(5) | tail 25 GB: -UseMaximumSize
+    # put the partition in the tail and left the freed 15 GB untouched. So the shrink branch must
+    # place its partition itself, and only the .vhdx branch - one disk, one free run, made moments
+    # earlier - may still ask for the maximum.
+    It 'places the shrink partition itself, and asks for the maximum only inside the vhdx branch' {
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+            $script:ScriptPath, [ref]$null, [ref]$null)
+
+        $calls = @($ast.FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.CommandAst] -and
+                    $node.GetCommandName() -eq 'New-Partition'
+                }, $true))
+        $calls.Count | Should -BeGreaterThan 1
+
+        foreach ($call in $calls) {
+            $parameters = @($call.CommandElements |
+                    Where-Object { $_ -is [System.Management.Automation.Language.CommandParameterAst] } |
+                    ForEach-Object { $_.ParameterName })
+            if ($parameters -contains 'UseMaximumSize') {
+                # The one allowed use names the virtual disk's own number, nothing else.
+                $call.Extent.Text | Should -Match '\$vhdxDiskNumber' -Because 'only the vhdx branch may take the maximum'
+            }
+            else {
+                $parameters | Should -Contain 'Size' -Because 'every other partition is given an explicit size'
+            }
+        }
+
+        $shrinkCall = @($calls | Where-Object { $_.Extent.Text -match '\$freedOffset' })
+        $shrinkCall.Count | Should -Be 1
+        @($shrinkCall[0].CommandElements |
+                Where-Object { $_ -is [System.Management.Automation.Language.CommandParameterAst] } |
+                ForEach-Object { $_.ParameterName }) | Should -Contain 'Offset'
+    }
+
     # A text search would pass the moment the loop were spelled differently, so ask the syntax tree.
     # Both shapes count: a loop statement, and the script block ForEach-Object would be handed.
     It 'writes the daily schedule with a single call, from no loop of any shape' {
@@ -638,46 +673,147 @@ Describe 'The script itself' {
         $reportAt | Should -BeGreaterThan $finalStateAt
     }
 
-    It 'checks the target against the size Windows itself reports as the minimum, before it resizes' {
+    It 'decides the resize with the sizes Windows reported for that very partition' {
+        # Without this the function could be tested to perfection and still be handed the wrong
+        # arguments - a literal minimum, or the current size passed as the maximum.
         $content = Get-Content -Path $script:ScriptPath -Raw
+        $content | Should -Match ('(?ms)\$shrinkPlan = Resolve-ShrinkPlan -CurrentSize \$partitionInfo\.Size -MaxSize \$maxSize `\s*\r?\n\s*' +
+            '-MinSize \$minSize -ShrinkBytes \(ConvertTo-ByteCount -GB \$ShrinkGB\)')
         $minBoundAt = $content.IndexOf('$minSize = $supportedSizes.SizeMin')
-        $guardAt = $content.IndexOf('if ($targetSize -lt $minSize)')
+        $guardAt = $content.IndexOf('if ($shrinkPlan.Rejection) {', $minBoundAt)
         $resizeAt = $content.IndexOf('Resize-Partition -DiskNumber $diskNum')
         $minBoundAt | Should -BeGreaterThan 0
         $guardAt | Should -BeGreaterThan $minBoundAt
         $resizeAt | Should -BeGreaterThan $guardAt
     }
 
-    It 'ends the run on a plain refusal, not a throw, when the target is below what Windows allows' {
+    It 'ends the run on a plain refusal, not a throw, when the numbers do not allow the shrink' {
         # The guard fires before Resize-Partition ever runs, so this must not fall into the catch
         # that would otherwise warn a shrink already happened.
         $content = Get-Content -Path $script:ScriptPath -Raw
-        $guardAt = $content.IndexOf('if ($targetSize -lt $minSize)')
+        $minBoundAt = $content.IndexOf('$minSize = $supportedSizes.SizeMin')
+        $guardAt = $content.IndexOf('if ($shrinkPlan.Rejection) {', $minBoundAt)
         $blockEnd = $content.IndexOf('Write-Host "Resizing Partition')
+        $guardAt | Should -BeGreaterThan 0
         $guardBlock = $content.Substring($guardAt, $blockEnd - $guardAt)
         $guardBlock | Should -Not -Match 'throw'
         $guardBlock | Should -Match 'exit 1'
     }
 
-    It 'names both the target and the Windows minimum in that refusal with the rounding helpers' {
+    It 'hands that refusal the Windows minimum, rounded the safe way, and never a rejection name' {
+        # Ceilinged, not floored: a floored minimum would name a size Windows still refuses.
         $content = Get-Content -Path $script:ScriptPath -Raw
-        $guardAt = $content.IndexOf('if ($targetSize -lt $minSize)')
+        $minBoundAt = $content.IndexOf('$minSize = $supportedSizes.SizeMin')
+        $guardAt = $content.IndexOf('if ($shrinkPlan.Rejection) {', $minBoundAt)
         $blockEnd = $content.IndexOf('Write-Host "Resizing Partition')
         $guardBlock = $content.Substring($guardAt, $blockEnd - $guardAt)
-        $guardBlock | Should -Match 'ConvertTo-FlooredGB -Bytes \$targetSize'
+        $guardBlock | Should -Match 'Format-ShrinkRefusal -DriveLetter \$DriveLetter -ShrinkGB \$ShrinkGB -Rejection \$shrinkPlan\.Rejection'
         $guardBlock | Should -Match 'ConvertTo-CeilingedGB -Bytes \$minSize'
+        $guardBlock | Should -Not -Match '\$\(\$shrinkPlan\.Rejection\)'
     }
 
     It 'shows the resize target and its sizes with the rounding helpers, not a bare Math.Round' {
         # Scoped to the try block's resize section, not the earlier drive-selection prompt, which
-        # has its own bare Round calls outside this change's reach.
+        # has its own bare Round calls outside this change's reach. Ends at the creation call so the
+        # size printed just above it stays inside the region this guards.
         $content = Get-Content -Path $script:ScriptPath -Raw
         $blockStart = $content.IndexOf('# Use stored partition information to avoid redundant API calls')
-        $blockEnd = $content.IndexOf('# Create Dev Drive from the freed space')
+        $blockEnd = $content.IndexOf('$newPart = New-Partition -DiskNumber $diskNum -Offset')
         $blockStart | Should -BeGreaterThan 0
         $blockEnd | Should -BeGreaterThan $blockStart
         $block = $content.Substring($blockStart, $blockEnd - $blockStart)
         $block | Should -Not -Match '\[math\]::Round\([^)]*/ 1GB, 2\)'
+    }
+
+    It 'derives where and how big the new partition is from the read-back, not from the prediction' {
+        # Alignment can leave the partition a little off the target, and the offset written to disk
+        # has to be where the partition actually ends.
+        $content = Get-Content -Path $script:ScriptPath -Raw
+        $content | Should -Match '\$shrunkPart = Get-Partition -DiskNumber \$diskNum -PartitionNumber \$partitionInfo\.PartitionNumber'
+        $content | Should -Match ('(?ms)Resolve-AlignedPlacement -Offset \(\$shrunkPart\.Offset \+ \$shrunkPart\.Size\) `\s*\r?\n\s*' +
+            '-Size \(\$maxSize - \$shrunkPart\.Size\)')
+        $content | Should -Not -Match 'Resolve-AlignedPlacement -Offset .*\$shrinkPlan\.'
+    }
+
+    It 'aligns the start before New-Partition, because an offset off a megabyte is refused outright' {
+        # Measured: five non-round shrink amounts produced five unaligned offsets, and every one was
+        # refused - after the volume had already been shrunk.
+        $content = Get-Content -Path $script:ScriptPath -Raw
+        $guardAt = $content.IndexOf('if ($shrunkPart.Size -gt $maxSize) {')
+        $alignAt = $content.IndexOf('$placement = Resolve-AlignedPlacement -Offset')
+        $offsetAt = $content.IndexOf('$freedOffset = $placement.Offset')
+        $createAt = $content.IndexOf('$newPart = New-Partition -DiskNumber $diskNum -Offset')
+        $guardAt | Should -BeGreaterThan 0
+        $alignAt | Should -BeGreaterThan $guardAt
+        $offsetAt | Should -BeGreaterThan $alignAt
+        $createAt | Should -BeGreaterThan $offsetAt
+    }
+
+    It 'names the adjoining space after the refusal and before the question, never before both' {
+        # Before the refusal it would promise a drive the very next line turns down; after the
+        # question it would come too late to inform the number.
+        $content = Get-Content -Path $script:ScriptPath -Raw
+        $refuseAt = $content.IndexOf('below the $DevDriveMinSizeGB GB minimum required for a Dev Drive')
+        $measureAt = $content.IndexOf('$ShrinkAdjoiningGB = ConvertTo-FlooredGB -Bytes ($supportedSizes.SizeMax - $partitionInfo.Size)')
+        $noteAt = $content.IndexOf('Format-ShrinkAdjoiningNote -DriveLetter $DriveLetter')
+        $askAt = $content.IndexOf("Request-DevDriveSizeGB -MaxGB `$realMaxShrinkableGB -Subject 'Shrink amount'")
+        $refuseAt | Should -BeGreaterThan 0
+        $measureAt | Should -BeGreaterThan $refuseAt
+        $noteAt | Should -BeGreaterThan $measureAt
+        $askAt | Should -BeGreaterThan $noteAt
+    }
+
+    # The headline behaviour: without this the plan could quietly go back to naming the amount
+    # freed, every existing test would stay green, and the note would read "comes out 200 GB
+    # rather than the 200 GB being freed".
+    It 'plans the drive at the size the shrink decision gives, not at the amount freed' {
+        $content = Get-Content -Path $script:ScriptPath -Raw
+        $content | Should -Match ('(?ms)\$shrinkPlan = Resolve-ShrinkPlan -CurrentSize \$partitionInfo\.Size ' +
+            '-MaxSize \$supportedSizes\.SizeMax `\s*\r?\n\s*-MinSize \$supportedSizes\.SizeMin ' +
+            '-ShrinkBytes \(ConvertTo-ByteCount -GB \$ShrinkGB\)')
+        $content | Should -Match '\$SizeGB = ConvertTo-FlooredGB -Bytes \$shrinkPlan\.DevDriveBytes'
+    }
+
+    It 'refuses a drive that came out below the minimum, rather than only reporting its size' {
+        $content = Get-Content -Path $script:ScriptPath -Raw
+        $floorAt = $content.IndexOf('if ($freedSize -lt ($DevDriveMinSizeGB * 1GB)) {')
+        $createAt = $content.IndexOf('$newPart = New-Partition -DiskNumber $diskNum -Offset')
+        $floorAt | Should -BeGreaterThan 0
+        $createAt | Should -BeGreaterThan $floorAt
+    }
+
+    It 'says so when the space behind the drive did not come to what the plan named' {
+        $content = Get-Content -Path $script:ScriptPath -Raw
+        # Compared at the precision the two are shown in, so the megabyte the alignment takes back
+        # cannot make every single run announce a discrepancy nobody can see.
+        $content | Should -Match '\(ConvertTo-FlooredGB -Bytes \$freedSize\) -ne \(ConvertTo-FlooredGB -Bytes \$shrinkPlan\.DevDriveBytes\)'
+        $content | Should -Match 'not the \$\(ConvertTo-FlooredGB -Bytes \$shrinkPlan\.DevDriveBytes\) GB the plan named'
+    }
+
+    It 'warns about the extra space in the plan, before the question that asks to proceed' {
+        # The whole point of the change: the user is told the drive comes out larger, and told it
+        # while there is still something to say no to.
+        $content = Get-Content -Path $script:ScriptPath -Raw
+        $noteAt = $content.IndexOf('Format-ShrinkSizeNote -DriveLetter $DriveLetter -ShrinkGB $ShrinkGB')
+        $planAt = $content.IndexOf('DEV DRIVE CREATION PLAN')
+        $confirmAt = $content.IndexOf('Are you ready to proceed')
+        $planAt | Should -BeGreaterThan 0
+        $noteAt | Should -BeGreaterThan $planAt
+        $confirmAt | Should -BeGreaterThan $noteAt
+    }
+
+    It 'says the size is approximate where the adjoining space could not be measured' {
+        # That branch knows the drive will differ and cannot say by how much, so it must not print
+        # the number as though it were the answer. Not "at least", either: alignment can leave the
+        # partition a little off the target, so the figure is not a floor.
+        $content = Get-Content -Path $script:ScriptPath -Raw
+        $branchAt = $content.IndexOf('if ($null -eq $ShrinkAdjoiningGB) {')
+        $confirmAt = $content.IndexOf('Are you ready to proceed')
+        $branchAt | Should -BeGreaterThan 0
+        $confirmAt | Should -BeGreaterThan $branchAt
+        $branch = $content.Substring($branchAt, $confirmAt - $branchAt)
+        $branch | Should -Match 'About this much, and likely more'
+        $branch | Should -Match 'could not be measured beforehand'
     }
 
     It 'records the shrunk drive letter right after the resize, before anything else can throw' {
@@ -873,6 +1009,218 @@ Describe 'Resolve-VhdxPathInput' {
 
     It 'upper cases the drive letter so later messages read the same' {
         (Resolve-VhdxPathInput -Answer 'c:\x\y.vhdx').Path | Should -BeExactly 'C:\x\y.vhdx'
+    }
+}
+
+Describe 'Resolve-ShrinkPlan' {
+    # SizeMax is the partition's size plus the unallocated space right behind it - measured on a
+    # scratch disk, where a 20 GB partition with a 10 GB gap behind it reported SizeMax 30 GB.
+    It 'takes the amount asked for off the partition, and hands the drive the whole free run behind it' {
+        # Drive D is 1000 GB with 50 GB unallocated next to it; the user frees 200 GB.
+        $plan = Resolve-ShrinkPlan -CurrentSize 1000GB -MaxSize 1050GB -MinSize 300GB -ShrinkBytes 200GB
+        $plan.Rejection | Should -BeNullOrEmpty
+        $plan.TargetBytes | Should -Be 800GB -Because 'the partition gives up exactly what was asked for'
+        $plan.DevDriveBytes | Should -Be 250GB -Because 'the 200 GB freed plus the 50 GB already there'
+        $plan.AdjoiningBytes | Should -Be 50GB
+    }
+
+    # Measured end to end on a USB disk laid out as shrinkme(40) | gap 4 | part(5) | tail 70.23:
+    # freeing 6 GB left the volume at 34 GB and produced a 10 GB partition right behind it.
+    It 'matches what a real disk did, including that the far larger tail was not what it measured' {
+        $plan = Resolve-ShrinkPlan -CurrentSize 40GB -MaxSize 44GB -MinSize 3.05GB -ShrinkBytes 6GB
+        $plan.TargetBytes | Should -Be 34GB
+        $plan.DevDriveBytes | Should -Be 10GB
+        $plan.AdjoiningBytes | Should -Be 4GB
+    }
+
+    It 'hands the drive exactly the amount freed when nothing adjoins the partition' {
+        $plan = Resolve-ShrinkPlan -CurrentSize 1000GB -MaxSize 1000GB -MinSize 300GB -ShrinkBytes 200GB
+        $plan.TargetBytes | Should -Be 800GB
+        $plan.DevDriveBytes | Should -Be 200GB
+        $plan.AdjoiningBytes | Should -Be 0
+    }
+
+    # The defect this replaced: the target was SizeMax minus the shrink amount, so a partition with
+    # more space behind it than the user asked to free was made LARGER by a request to shrink it.
+    It 'never grows the partition, however much unallocated space adjoins it' {
+        $plan = Resolve-ShrinkPlan -CurrentSize 1000GB -MaxSize 1050GB -MinSize 300GB -ShrinkBytes 20GB
+        $plan.TargetBytes | Should -Be 980GB
+        $plan.TargetBytes | Should -BeLessThan 1000GB
+        $plan.DevDriveBytes | Should -Be 70GB
+    }
+
+    It 'refuses <Case>' -TestCases @(
+        @{ Case = 'a target below what Windows will allow'; Current = 1000GB; Max = 1000GB; Min = 900GB; Shrink = 200GB; Rejection = 'TargetBelowMinimum' }
+        @{ Case = 'shrinking by the whole partition';       Current = 1000GB; Max = 1000GB; Min = 0;     Shrink = 1000GB; Rejection = 'ShrinkExceedsPartition' }
+        @{ Case = 'shrinking by more than there is';        Current = 1000GB; Max = 1000GB; Min = 0;     Shrink = 1200GB; Rejection = 'ShrinkExceedsPartition' }
+        @{ Case = 'a maximum below the current size';       Current = 1000GB; Max = 900GB;  Min = 0;     Shrink = 100GB; Rejection = 'MaxBelowCurrent' }
+    ) {
+        $plan = Resolve-ShrinkPlan -CurrentSize $Current -MaxSize $Max -MinSize $Min -ShrinkBytes $Shrink
+        $plan.Rejection | Should -Be $Rejection
+    }
+
+    # Its own vocabulary: Resolve-DevDriveSizeInput answers 'BelowMinimum' about a typed size, and a
+    # shared literal would let a mis-wired comparison read one function's verdict as the other's.
+    It 'names its rejections apart from the ones the size question uses' {
+        $plan = Resolve-ShrinkPlan -CurrentSize 1000GB -MaxSize 1000GB -MinSize 900GB -ShrinkBytes 200GB
+        $plan.Rejection | Should -Not -Be 'BelowMinimum'
+    }
+
+    It 'answers zero sizes when it refuses <Case>, so a caller cannot act on a number it never got' -TestCases @(
+        @{ Case = 'a target below what Windows will allow'; Current = 1000GB; Max = 1000GB; Min = 900GB; Shrink = 200GB }
+        @{ Case = 'shrinking by the whole partition';       Current = 1000GB; Max = 1000GB; Min = 0;     Shrink = 1000GB }
+        @{ Case = 'a maximum below the current size';       Current = 1000GB; Max = 900GB;  Min = 0;     Shrink = 100GB }
+    ) {
+        $plan = Resolve-ShrinkPlan -CurrentSize $Current -MaxSize $Max -MinSize $Min -ShrinkBytes $Shrink
+        $plan.Rejection | Should -Not -BeNullOrEmpty
+        $plan.TargetBytes | Should -Be 0
+        $plan.DevDriveBytes | Should -Be 0
+        $plan.AdjoiningBytes | Should -Be 0
+    }
+}
+
+Describe 'Format-ShrinkAdjoiningNote' {
+    It 'names the drive, the amount, and that it joins the new Dev Drive' {
+        $note = @(Format-ShrinkAdjoiningNote -DriveLetter 'D' -AdjoiningGB 4)
+        $note | Should -HaveCount 1
+        $note[0] | Should -Match 'Unallocated right behind D: 4 GB'
+        $note[0] | Should -Match 'it joins the new Dev Drive'
+    }
+
+    It 'stays silent for <Adjoining> GB, so no run invents a number' -TestCases @(
+        @{ Adjoining = 0 }
+        @{ Adjoining = -1 }
+    ) {
+        @(Format-ShrinkAdjoiningNote -DriveLetter 'D' -AdjoiningGB $Adjoining) | Should -HaveCount 0
+    }
+}
+
+Describe 'Resolve-AlignedPlacement' {
+    # Measured: New-Partition refused all five offsets a non-round shrink produced - remainders of
+    # 125952, 12800, 545280, 923136 and 82432 bytes against 1 MB - with "The specified offset is not
+    # valid". A resize lands 20 to 389 bytes off its target, so this is the ordinary case, not a rare one.
+    It 'moves an offset with a remainder of <Remainder> forward to the next megabyte' -TestCases @(
+        @{ Remainder = 125952 }
+        @{ Remainder = 12800 }
+        @{ Remainder = 545280 }
+        @{ Remainder = 923136 }
+        @{ Remainder = 82432 }
+        @{ Remainder = 1 }
+        @{ Remainder = 1048575 }
+    ) {
+        $offset = [uint64](64MB + $Remainder)
+        $placement = Resolve-AlignedPlacement -Offset $offset -Size 100GB
+        $placement.Rejection | Should -BeNullOrEmpty
+        $placement.Offset % 1MB | Should -Be 0
+        $placement.Offset | Should -BeGreaterThan $offset
+        $placement.ShiftedBy | Should -Be (1MB - $Remainder)
+    }
+
+    It 'leaves an offset that is already a whole number of megabytes exactly where it is' {
+        $placement = Resolve-AlignedPlacement -Offset 36523999232 -Size 100GB
+        $placement.Offset | Should -Be 36523999232
+        $placement.Size | Should -Be 100GB
+        $placement.ShiftedBy | Should -Be 0
+    }
+
+    It 'gives back from the size exactly what the nudge took from the front' {
+        $placement = Resolve-AlignedPlacement -Offset ([uint64](64MB + 700000)) -Size 100GB
+        $placement.Offset + $placement.Size | Should -Be (64MB + 700000 + 100GB) -Because 'the run must end where it ended'
+    }
+
+    It 'refuses rather than answer a size of zero or less when the run is shorter than the nudge' -TestCases @(
+        @{ Size = 1 }
+        @{ Size = 300000 }
+        @{ Size = 348576 }
+    ) {
+        $placement = Resolve-AlignedPlacement -Offset ([uint64](64MB + 700000)) -Size $Size
+        $placement.Rejection | Should -Be 'NothingLeftAfterAligning'
+        $placement.Size | Should -Be 0
+    }
+
+    It 'stays exact on offsets too large for a double to hold to the byte' {
+        # 8 TB and change: dividing this by 1 MB as a double and multiplying back loses bytes.
+        $offset = [uint64]8796093022209
+        $placement = Resolve-AlignedPlacement -Offset $offset -Size 100GB
+        $placement.Offset % 1MB | Should -Be 0
+        $placement.Offset | Should -Be ([uint64]8796094070784)
+    }
+}
+
+Describe 'Format-ShrinkRefusal' {
+    It 'says why in plain words for <Rejection>, naming no rejection token' -TestCases @(
+        @{ Rejection = 'TargetBelowMinimum';     Expect = 'will not take it below 900 GB' }
+        @{ Rejection = 'ShrinkExceedsPartition'; Expect = 'the whole volume is only 1000 GB' }
+        @{ Rejection = 'MaxBelowCurrent';        Expect = 'maximum size below its current size' }
+    ) {
+        $line = (Format-ShrinkRefusal -DriveLetter 'D' -ShrinkGB 200 -Rejection $Rejection `
+                -MinSizeGB 900 -CurrentSizeGB 1000) -join ' '
+        $line | Should -Match ([regex]::Escape($Expect))
+        $line | Should -Not -Match $Rejection
+    }
+
+    It 'refuses a rejection name it has no wording for' {
+        { Format-ShrinkRefusal -DriveLetter 'D' -ShrinkGB 200 -Rejection 'Whatever' `
+                -MinSizeGB 900 -CurrentSizeGB 1000 } | Should -Throw
+    }
+
+    # The case that will actually happen: a rejection added to Resolve-ShrinkPlan and to the
+    # ValidateSet, but never given wording. A default arm carrying one message would hide it.
+    It 'has wording for every rejection Resolve-ShrinkPlan can answer' {
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+            $script:ScriptPath, [ref]$null, [ref]$null)
+        $plan = $ast.FindAll({ param($node)
+                $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -eq 'Resolve-ShrinkPlan' }, $false)[0]
+        $answered = @([regex]::Matches($plan.Extent.Text, "Rejection = '([A-Za-z]+)'") |
+                ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique)
+        $answered.Count | Should -BeGreaterThan 0
+
+        foreach ($rejection in $answered) {
+            { Format-ShrinkRefusal -DriveLetter 'D' -ShrinkGB 200 -Rejection $rejection `
+                    -MinSizeGB 900 -CurrentSizeGB 1000 } | Should -Not -Throw -Because "$rejection needs wording"
+        }
+    }
+}
+
+Describe 'ConvertTo-ByteCount' {
+    It 'reads <GB> GB as <Bytes> bytes' -TestCases @(
+        @{ GB = 0;    Bytes = 0 }
+        @{ GB = 1;    Bytes = 1073741824 }
+        @{ GB = 2.5;  Bytes = 2684354560 }
+        @{ GB = 0.01; Bytes = 10737418 }
+    ) {
+        ConvertTo-ByteCount -GB $GB | Should -Be $Bytes
+    }
+
+    It 'answers an unsigned whole number, which is what the storage cmdlets take' {
+        ConvertTo-ByteCount -GB 1.5 | Should -BeOfType [uint64]
+    }
+}
+
+Describe 'Format-ShrinkSizeNote' {
+    It 'says the drive comes out larger, by how much, and why' {
+        $note = (Format-ShrinkSizeNote -DriveLetter 'D' -ShrinkGB 200 -DevDriveGB 250) -join ' '
+        $note | Should -Match '50 GB of unallocated space already sits next to drive D:'
+        $note | Should -Match 'comes out 250 GB rather than the 200 GB being freed'
+    }
+
+    # Three figures on one screen: a reader adds the first two and expects the third.
+    It 'shows an extra of <Extra> GB that is exactly the difference between the two sizes' -TestCases @(
+        @{ Shrink = 200;    DevDrive = 250;    Extra = 50 }
+        @{ Shrink = 50.999; DevDrive = 55.005; Extra = 4.006 }
+        @{ Shrink = 0.01;   DevDrive = 0.02;   Extra = 0.01 }
+    ) {
+        $note = (Format-ShrinkSizeNote -DriveLetter 'D' -ShrinkGB $Shrink -DevDriveGB $DevDrive) -join ' '
+        $note | Should -Match ([regex]::Escape("$Extra GB of unallocated space"))
+        $note | Should -Match ([regex]::Escape("comes out $DevDrive GB rather than the $Shrink GB"))
+    }
+
+    It 'stays silent when the drive is no larger than the amount freed' -TestCases @(
+        @{ Shrink = 200; DevDrive = 200 }
+        @{ Shrink = 200; DevDrive = 199 }
+    ) {
+        @(Format-ShrinkSizeNote -DriveLetter 'D' -ShrinkGB $Shrink -DevDriveGB $DevDrive) | Should -HaveCount 0
     }
 }
 

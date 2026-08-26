@@ -177,6 +177,12 @@ function ConvertTo-CeilingedGB {
     return [math]::Ceiling($Bytes / 1GB * 100) / 100
 }
 
+function ConvertTo-ByteCount {
+    # The other direction: a GB figure the user typed, as whole bytes for the storage cmdlets.
+    param([Parameter(Mandatory)][decimal]$GB)
+    return [uint64][math]::Round($GB * 1GB)
+}
+
 function Get-VhdxAlignedSize {
     # A .vhdx virtual size must be a whole number of sectors, so a fractional GB has to be trimmed.
     param([Parameter(Mandatory)][uint64]$SizeBytes)
@@ -1477,6 +1483,116 @@ function Request-DedupSchedule {
     return [PSCustomObject]@{ DailyTime = $chosenTime; WeeklyDay = $chosenDay; WeeklyStart = $chosenStart }
 }
 
+function Resolve-ShrinkPlan {
+    <#
+        What shrinking a partition by the requested amount produces. SizeMax is the partition's size
+        plus the unallocated run right behind it, so the space left free by the resize is SizeMax
+        minus the new size, not the amount asked for. Rejection is $null when the numbers work.
+    #>
+    param(
+        [Parameter(Mandatory)][uint64]$CurrentSize,
+        [Parameter(Mandatory)][uint64]$MaxSize,
+        [Parameter(Mandatory)][uint64]$MinSize,
+        [Parameter(Mandatory)][uint64]$ShrinkBytes
+    )
+
+    $result = [PSCustomObject]@{
+        Rejection = $null; TargetBytes = [uint64]0; DevDriveBytes = [uint64]0; AdjoiningBytes = [uint64]0
+    }
+
+    # Guards before the subtraction: a difference that goes negative is not a size.
+    if ($MaxSize -lt $CurrentSize) { $result.Rejection = 'MaxBelowCurrent'; return $result }
+    if ($ShrinkBytes -ge $CurrentSize) { $result.Rejection = 'ShrinkExceedsPartition'; return $result }
+
+    $target = $CurrentSize - $ShrinkBytes
+    if ($target -lt $MinSize) { $result.Rejection = 'TargetBelowMinimum'; return $result }
+
+    $result.TargetBytes = $target
+    $result.DevDriveBytes = $MaxSize - $target
+    $result.AdjoiningBytes = $MaxSize - $CurrentSize
+    return $result
+}
+
+function Resolve-AlignedPlacement {
+    <#
+        Where a partition can actually start in the run just freed. New-Partition refuses an offset
+        that is not a whole number of megabytes, and a resize lands wherever the cluster size leaves
+        it, so the start is nudged forward and the size gives back exactly what the nudge took.
+    #>
+    param(
+        [Parameter(Mandatory)][uint64]$Offset,
+        [Parameter(Mandatory)][uint64]$Size
+    )
+
+    $result = [PSCustomObject]@{ Rejection = $null; Offset = [uint64]0; Size = [uint64]0; ShiftedBy = [uint64]0 }
+
+    # Integer arithmetic throughout: a byte offset this large loses precision as a double.
+    $remainder = $Offset % 1MB
+    $shift = if ($remainder -eq 0) { [uint64]0 } else { [uint64](1MB - $remainder) }
+    if ($shift -ge $Size) { $result.Rejection = 'NothingLeftAfterAligning'; return $result }
+
+    $result.Offset = $Offset + $shift
+    $result.Size = $Size - $shift
+    $result.ShiftedBy = $shift
+    return $result
+}
+
+function Format-ShrinkRefusal {
+    <# Why a shrink cannot go ahead, in the user's terms. One wording for both call sites, so
+       neither drifts nor prints a rejection name. #>
+    param(
+        [Parameter(Mandatory)][string]$DriveLetter,
+        [Parameter(Mandatory)][decimal]$ShrinkGB,
+        [Parameter(Mandatory)][ValidateSet('MaxBelowCurrent', 'ShrinkExceedsPartition', 'TargetBelowMinimum')][string]$Rejection,
+        [Parameter(Mandatory)][decimal]$MinSizeGB,
+        [Parameter(Mandatory)][decimal]$CurrentSizeGB
+    )
+
+    switch ($Rejection) {
+        'TargetBelowMinimum' {
+            return @("Cannot shrink drive ${DriveLetter}: by $ShrinkGB GB; Windows will not take it below $MinSizeGB GB.")
+        }
+        'ShrinkExceedsPartition' {
+            return @("Cannot shrink drive ${DriveLetter}: by $ShrinkGB GB; the whole volume is only $CurrentSizeGB GB.")
+        }
+        'MaxBelowCurrent' {
+            return @("Cannot plan a shrink for drive ${DriveLetter}: Windows reports a maximum size below its current size.")
+        }
+        # A rejection added to Resolve-ShrinkPlan must be given wording here, not inherit somebody else's.
+        default { throw "Format-ShrinkRefusal has no wording for $Rejection" }
+    }
+}
+
+function Format-ShrinkAdjoiningNote {
+    <# The one line shown beside the shrink limits: what already sits behind the drive and joins it. #>
+    param(
+        [Parameter(Mandatory)][string]$DriveLetter,
+        [Parameter(Mandatory)][decimal]$AdjoiningGB
+    )
+
+    if ($AdjoiningGB -le 0) { return @() }
+    return @("  Unallocated right behind ${DriveLetter}: $AdjoiningGB GB - it joins the new Dev Drive")
+}
+
+function Format-ShrinkSizeNote {
+    <# Says the drive will come out bigger than the amount freed, and why. Nothing to say when no
+       unallocated space adjoins the partition. #>
+    param(
+        [Parameter(Mandatory)][string]$DriveLetter,
+        [Parameter(Mandatory)][decimal]$ShrinkGB,
+        [Parameter(Mandatory)][decimal]$DevDriveGB
+    )
+
+    # Taken as the difference between the two figures shown, so the three always add up on screen.
+    $extraGB = $DevDriveGB - $ShrinkGB
+    if ($extraGB -le 0) { return @() }
+
+    return @(
+        "$extraGB GB of unallocated space already sits next to drive ${DriveLetter}: and will be taken"
+        "as well, so the Dev Drive comes out $DevDriveGB GB rather than the $ShrinkGB GB being freed."
+    )
+}
+
 function Resolve-DevDriveSizeInput {
     <#
         Decides what one typed answer to the size question means. Kept free of Read-Host and of
@@ -2381,8 +2497,34 @@ if ($mode -eq "FreeSpace") {
         exit 1
     }
 
+    # After the refusal above, never before it: naming space that joins a drive the next line
+    # refuses would promise something and take it back.
+    $ShrinkAdjoiningGB = $null
+    if ($partitionInfo) {
+        $ShrinkAdjoiningGB = ConvertTo-FlooredGB -Bytes ($supportedSizes.SizeMax - $partitionInfo.Size)
+        foreach ($line in (Format-ShrinkAdjoiningNote -DriveLetter $DriveLetter -AdjoiningGB $ShrinkAdjoiningGB)) {
+            Write-Host $line -ForegroundColor Cyan
+        }
+    }
+
     $ShrinkGB = Request-DevDriveSizeGB -MaxGB $realMaxShrinkableGB -Subject 'Shrink amount'
-    $SizeGB = $ShrinkGB  # The Dev Drive fills exactly the space that was freed
+
+    # The drive takes the whole free run behind the partition: the amount freed plus what adjoins it.
+    $SizeGB = $ShrinkGB
+    if ($partitionInfo) {
+        $shrinkPlan = Resolve-ShrinkPlan -CurrentSize $partitionInfo.Size -MaxSize $supportedSizes.SizeMax `
+            -MinSize $supportedSizes.SizeMin -ShrinkBytes (ConvertTo-ByteCount -GB $ShrinkGB)
+        if ($shrinkPlan.Rejection) {
+            foreach ($line in (Format-ShrinkRefusal -DriveLetter $DriveLetter -ShrinkGB $ShrinkGB -Rejection $shrinkPlan.Rejection `
+                        -MinSizeGB (ConvertTo-CeilingedGB -Bytes $supportedSizes.SizeMin) `
+                        -CurrentSizeGB (ConvertTo-FlooredGB -Bytes $partitionInfo.Size))) {
+                Write-Host $line -ForegroundColor Red
+            }
+            Write-Host "Exiting. Nothing has been changed." -ForegroundColor Yellow
+            exit 1
+        }
+        $SizeGB = ConvertTo-FlooredGB -Bytes $shrinkPlan.DevDriveBytes
+    }
 } else { # Vhdx
     # Compile the interop now rather than after every question, so a machine that forbids Add-Type
     # fails before the user has answered anything.
@@ -2493,6 +2635,19 @@ if ($mode -eq "Vhdx") {
     }
 } else {
     Write-Host "* Create $SizeGB GB Dev Drive on Disk $DiskNumber ($selectedDiskName) using ReFS" -ForegroundColor White
+    if ($mode -eq "ShrinkDrive") {
+        if ($null -eq $ShrinkAdjoiningGB) {
+            # Windows would not say how much sits behind the drive, so the size above is a floor.
+            Write-Host "  About this much, and likely more: the drive also takes any unallocated space already" -ForegroundColor Yellow
+            Write-Host "  behind ${DriveLetter}:, which could not be measured beforehand. Its real size is reported once it exists." -ForegroundColor Yellow
+        }
+        else {
+            foreach ($note in (Format-ShrinkSizeNote -DriveLetter $DriveLetter -ShrinkGB $ShrinkGB `
+                        -DevDriveGB $SizeGB)) {
+                Write-Host "  $note" -ForegroundColor Yellow
+            }
+        }
+    }
 }
 
 Write-Host "* Name the Dev Drive $DevDriveLabel" -ForegroundColor White
@@ -2555,7 +2710,7 @@ try {
         Write-Host "Disk $DiskNumber largest unbroken block of free space: $freeSpaceGB GB" -ForegroundColor Green
 
         # Check if requested size is available
-        $requestedSizeBytes = [math]::Round($SizeGB * 1GB, 2)
+        $requestedSizeBytes = ConvertTo-ByteCount -GB $SizeGB
         if ($freeSpace -lt $requestedSizeBytes) {
             throw "Insufficient free space on disk $DiskNumber. Requested: $SizeGB GB, largest unbroken block available: $freeSpaceGB GB"
         }
@@ -2583,29 +2738,58 @@ try {
             $minSize = $supportedSizes.SizeMin
         }
 
-        Write-Host "Maximum size for $DriveLetter`: $(ConvertTo-FlooredGB -Bytes $maxSize) GB" -ForegroundColor Green
-        $targetSize = $maxSize - [math]::Round($ShrinkGB * 1GB, 2)
-        Write-Host "Target size after shrinking: $(ConvertTo-FlooredGB -Bytes $targetSize) GB" -ForegroundColor Green
-        if ($targetSize -lt $minSize) {
-            Write-Host "Cannot shrink drive $DriveLetter to $(ConvertTo-FlooredGB -Bytes $targetSize) GB; Windows will not take it below $(ConvertTo-CeilingedGB -Bytes $minSize) GB." -ForegroundColor Red
-            Write-Host "Exiting. Please choose a different drive or use free space mode, then run the script again." -ForegroundColor Yellow
+        $shrinkPlan = Resolve-ShrinkPlan -CurrentSize $partitionInfo.Size -MaxSize $maxSize `
+            -MinSize $minSize -ShrinkBytes (ConvertTo-ByteCount -GB $ShrinkGB)
+        if ($shrinkPlan.Rejection) {
+            foreach ($line in (Format-ShrinkRefusal -DriveLetter $DriveLetter -ShrinkGB $ShrinkGB -Rejection $shrinkPlan.Rejection `
+                        -MinSizeGB (ConvertTo-CeilingedGB -Bytes $minSize) `
+                        -CurrentSizeGB (ConvertTo-FlooredGB -Bytes $partitionInfo.Size))) {
+                Write-Host $line -ForegroundColor Red
+            }
+            Write-Host "Exiting. Nothing has been changed." -ForegroundColor Yellow
             exit 1
         }
 
-        Write-Host "Resizing Partition $($partitionInfo.PartitionNumber) of disk $diskNum to $(ConvertTo-FlooredGB -Bytes $targetSize) GB ..." -ForegroundColor Green
-        Resize-Partition -DiskNumber $diskNum -PartitionNumber $partitionInfo.PartitionNumber -Size $targetSize -ErrorAction Stop
+        Write-Host "Resizing Partition $($partitionInfo.PartitionNumber) of disk $diskNum to $(ConvertTo-FlooredGB -Bytes $shrinkPlan.TargetBytes) GB ..." -ForegroundColor Green
+        Resize-Partition -DiskNumber $diskNum -PartitionNumber $partitionInfo.PartitionNumber -Size $shrinkPlan.TargetBytes -ErrorAction Stop
         $ShrunkDriveLetter = $DriveLetter
-        Write-Host "Shrunk drive $DriveLetter by $ShrinkGB GB" -ForegroundColor Green
 
-        # Create Dev Drive from the freed space
-        Write-Host "Creating a new partition from the freed space on disk $diskNum" -ForegroundColor Green
-        $newPart = New-Partition -DiskNumber $diskNum -UseMaximumSize -AssignDriveLetter -ErrorAction Stop
+        # Read back rather than assume: alignment can leave the partition a little off the target.
+        $shrunkPart = Get-Partition -DiskNumber $diskNum -PartitionNumber $partitionInfo.PartitionNumber -ErrorAction Stop
+        Write-Host "Shrunk drive $DriveLetter to $(ConvertTo-FlooredGB -Bytes $shrunkPart.Size) GB" -ForegroundColor Green
+
+        # The shrink already happened, so this subtraction decides what gets written next; a negative
+        # difference would reach New-Partition as a binding error rather than as an explanation.
+        if ($shrunkPart.Size -gt $maxSize) {
+            throw "Drive $DriveLetter reports $(ConvertTo-FlooredGB -Bytes $shrunkPart.Size) GB after the resize, more than the $(ConvertTo-FlooredGB -Bytes $maxSize) GB Windows said it could hold. Nothing further was created."
+        }
+
+        # Placed explicitly: -UseMaximumSize takes the largest free run on the disk, which can be elsewhere.
+        # Measured: an offset that is not a whole number of megabytes is refused outright, and a
+        # resize lands a few hundred bytes off its target, so the start has to be nudged forward.
+        $placement = Resolve-AlignedPlacement -Offset ($shrunkPart.Offset + $shrunkPart.Size) `
+            -Size ($maxSize - $shrunkPart.Size)
+        if ($placement.Rejection) {
+            throw "Nothing usable was left behind ${DriveLetter}: after aligning the start of the new partition. The drive was shrunk; nothing was created."
+        }
+        $freedOffset = $placement.Offset
+        $freedSize = $placement.Size
+
+        # Judged, not merely reported: every other entry point refuses a drive below this floor.
+        if ($freedSize -lt ($DevDriveMinSizeGB * 1GB)) {
+            throw "The space behind ${DriveLetter}: came to $(ConvertTo-FlooredGB -Bytes $freedSize) GB, below the $DevDriveMinSizeGB GB a Dev Drive needs. The drive was shrunk; nothing was created."
+        }
+        if ((ConvertTo-FlooredGB -Bytes $freedSize) -ne (ConvertTo-FlooredGB -Bytes $shrinkPlan.DevDriveBytes)) {
+            Write-Host "The space behind ${DriveLetter}: came to $(ConvertTo-FlooredGB -Bytes $freedSize) GB, not the $(ConvertTo-FlooredGB -Bytes $shrinkPlan.DevDriveBytes) GB the plan named." -ForegroundColor Yellow
+        }
+        Write-Host "Creating a $(ConvertTo-FlooredGB -Bytes $freedSize) GB partition in the space behind ${DriveLetter}: on disk $diskNum" -ForegroundColor Green
+        $newPart = New-Partition -DiskNumber $diskNum -Offset $freedOffset -Size $freedSize -AssignDriveLetter -ErrorAction Stop
     } else { # Vhdx
         Write-Host "Creating a $SizeGB GB $VhdxDiskType virtual hard disk at $VhdxPath" -ForegroundColor Green
         if ($VhdxDiskType -eq 'Fixed') {
             Write-Host "Allocating the whole file up front. This may take several minutes and cannot be interrupted." -ForegroundColor Yellow
         }
-        New-VirtualDiskFile -Path $VhdxPath -SizeBytes ([uint64][math]::Round($SizeGB * 1GB)) -DiskType $VhdxDiskType
+        New-VirtualDiskFile -Path $VhdxPath -SizeBytes (ConvertTo-ByteCount -GB $SizeGB) -DiskType $VhdxDiskType
 
         Write-Host "Attaching $VhdxPath" -ForegroundColor Green
         $VhdxAtBootGranted = Add-VirtualDiskAttachment -Path $VhdxPath -AtBoot:$VhdxAutoAttach

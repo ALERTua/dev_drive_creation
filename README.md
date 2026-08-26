@@ -88,7 +88,9 @@ Everything above produces one screen, and nothing on disk has changed when it ap
 ===============================================================================
 
 * Shrink Drive D (ALERT) by 199 GB to free up space
-* Create 199 GB Dev Drive on Disk 1 (CT4000P3PSSD8) using ReFS
+* Create 249 GB Dev Drive on Disk 1 (CT4000P3PSSD8) using ReFS
+  50 GB of unallocated space already sits next to drive D and will be taken
+  as well, so the Dev Drive comes out 249 GB rather than the 199 GB being freed.
 * Name the Dev Drive Projects
 * Skip BitLocker encryption
 * Enable ReFS deduplication and ZSTD compression, level 2
@@ -196,6 +198,7 @@ In compress-only mode there is no weekly maintenance job and no duration or CPU 
 ## Troubleshooting
 
 - **Windows will not shrink the volume far enough.** Shrinking stops at the last written file block, so fragmentation limits it regardless of free space. The script shows the real limit Windows reports and suggests a third-party tool where that is not enough
+- **Shrink mode takes the whole free run behind the drive, and says so before you agree.** The volume gives up exactly the amount you asked to free, and the Dev Drive then fills everything unallocated immediately behind it - the space just freed plus anything already sitting there. The plan names the resulting size and where the extra came from - or, on the rare drive whose limits Windows will not report, says the size shown is only a floor. Unallocated space elsewhere on the disk is never touched
 - **The drive comes up read-only.** That is `FDVDenyWriteAccess` - see [Caveats](#caveats). Enable BitLocker, or clear the setting if it is yours to clear
 - **The `.vhdx` is gone after a restart.** Windows refused `ATTACH_VIRTUAL_DISK_FLAG_AT_BOOT`, or automatic mounting was declined. Mount it by hand with the command the script printed
 - **A run failed part-way.** It names what it left behind - a `.vhdx` still attached, or a volume already shrunk. Undo that before running again: a rerun starts from the beginning and would shrink the drive a second time
