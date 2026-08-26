@@ -1593,6 +1593,105 @@ function Format-ShrinkSizeNote {
     )
 }
 
+function New-PlanLine {
+    <# One line of the plan: the text, and the colour the run prints it in. The colour is typed, so
+       a mistyped one fails on the way in rather than halfway through printing the plan. #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Text,
+        [System.ConsoleColor]$Colour = 'White'
+    )
+
+    return [PSCustomObject]@{ Text = $Text; Colour = $Colour }
+}
+
+function Format-CreationPlan {
+    <#
+        Every line of the plan the user approves, decided here so the screen that asks for consent
+        can be tested. A mode's keys are present only where its branch asked the question.
+    #>
+    param([Parameter(Mandatory)][hashtable]$Answers)
+
+    if ($Answers.Mode -notin @('FreeSpace', 'ShrinkDrive', 'Vhdx')) {
+        throw "Format-CreationPlan has no plan for mode '$($Answers.Mode)'"
+    }
+
+    $rule = '==============================================================================='
+    $lines = @(
+        New-PlanLine -Text $rule -Colour Cyan
+        New-PlanLine -Text '                        DEV DRIVE CREATION PLAN' -Colour Cyan
+        New-PlanLine -Text $rule -Colour Cyan
+        New-PlanLine -Text ''
+    )
+
+    if ($Answers.Mode -eq 'ShrinkDrive') {
+        $lines += New-PlanLine -Text "* Shrink Drive $($Answers.DriveLetter) ($($Answers.DriveLabel)) by $($Answers.ShrinkGB) GB to free up space"
+    }
+
+    if ($Answers.Mode -eq 'Vhdx') {
+        $lines += New-PlanLine -Text "* Create a $($Answers.SizeGB) GB $($Answers.VhdxDiskType) virtual hard disk at $($Answers.VhdxPath)"
+        if ($Answers.VhdxDiskType -eq 'Fixed') {
+            $lines += New-PlanLine -Text '  (a fixed size disk claims all of its space up front, which takes a while)' -Colour Gray
+        }
+        # Said here because the physical modes refuse an uninitialized disk instead.
+        $lines += New-PlanLine -Text "* Initialize the new virtual disk with a $($Answers.PartitionStyle) partition table"
+        $lines += New-PlanLine -Text '* Format the attached virtual disk as a Dev Drive using ReFS'
+        $lines += if ($Answers.VhdxAutoAttach) {
+            New-PlanLine -Text '* Register the virtual disk to be mounted on every Windows startup'
+        } else {
+            New-PlanLine -Text '* Skip automatic mounting; the Dev Drive mount point is gone after every restart until mounted by hand'
+        }
+    } else {
+        $lines += New-PlanLine -Text "* Create $($Answers.SizeGB) GB Dev Drive on Disk $($Answers.DiskNumber) ($($Answers.DiskName)) using ReFS"
+        if ($Answers.Mode -eq 'ShrinkDrive') {
+            if ($null -eq $Answers.ShrinkAdjoiningGB) {
+                # Windows would not say how much sits behind the drive, so the size above is a floor.
+                $lines += New-PlanLine -Text '  About this much, and likely more: the drive also takes any unallocated space already' -Colour Yellow
+                $lines += New-PlanLine -Text "  behind $($Answers.DriveLetter):, which could not be measured beforehand. Its real size is reported once it exists." -Colour Yellow
+            }
+            else {
+                foreach ($note in (Format-ShrinkSizeNote -DriveLetter $Answers.DriveLetter `
+                            -ShrinkGB $Answers.ShrinkGB -DevDriveGB $Answers.SizeGB)) {
+                    $lines += New-PlanLine -Text "  $note" -Colour Yellow
+                }
+            }
+        }
+    }
+
+    $lines += New-PlanLine -Text "* Name the Dev Drive $($Answers.DevDriveLabel)"
+
+    if ($Answers.SkipBitLocker) {
+        $lines += New-PlanLine -Text '* Skip BitLocker encryption'
+        # Said here, before anything exists, rather than left for the write check to discover afterwards.
+        foreach ($advice in (Resolve-WriteAccessPolicyAdvice -Policy $Answers.WritePolicy -Skipping)) {
+            $lines += New-PlanLine -Text "  - $advice" -Colour Yellow
+        }
+    } else {
+        $lines += New-PlanLine -Text '* Enable BitLocker encryption for the Dev Drive'
+        foreach ($note in $Answers.BitLockerNotes) {
+            $lines += New-PlanLine -Text "  - $note" -Colour Gray
+        }
+    }
+
+    if ($Answers.SkipDeduplication) {
+        $lines += New-PlanLine -Text '* Skip deduplication and compression setup'
+    } else {
+        $lines += New-PlanLine -Text ("* Enable ReFS " + (Format-DedupModeChoice -Mode $Answers.DedupMode `
+                    -Format $Answers.CompressionFormat -Level $Answers.CompressionLevel))
+        foreach ($summary in (Format-DedupScheduleSummary -DailyTime $Answers.DedupStartTime `
+                    -DailyDaysLabel $Answers.DedupDailyDaysLabel -WeeklyDay $Answers.ScrubDays `
+                    -WeeklyStart $Answers.ScrubStart -WeeksInterval $Answers.ScrubWeeksInterval `
+                    -WeeklyJob:$Answers.DedupWeeklyJob)) {
+            $lines += New-PlanLine -Text "* $($summary.Trim())"
+        }
+    }
+
+    $lines += New-PlanLine -Text '* Mark Dev Drive as trusted for Windows Defender performance'
+    $lines += New-PlanLine -Text '* Run initial optimization job to prepare the drive'
+    $lines += New-PlanLine -Text '' -Colour Cyan
+    $lines += New-PlanLine -Text $rule -Colour Cyan
+    return $lines
+}
+
 function Resolve-DevDriveSizeInput {
     <#
         Decides what one typed answer to the size question means. Kept free of Read-Host and of
@@ -2608,79 +2707,47 @@ if (-not $SkipDeduplication) {
     $ScrubStart = $dedupSchedule.WeeklyStart
 }
 
-# Display summary and ask for confirmation
-Write-Host "`n"
-Write-Host "===============================================================================" -ForegroundColor Cyan
-Write-Host "                        DEV DRIVE CREATION PLAN" -ForegroundColor Cyan
-Write-Host "===============================================================================" -ForegroundColor Cyan
-Write-Host "" -ForegroundColor Cyan
-
-# Unified action list with all details
-if ($mode -eq "ShrinkDrive") {
-    Write-Host "* Shrink Drive $DriveLetter ($driveLabel) by $ShrinkGB GB to free up space" -ForegroundColor White
+# Gathered, not decided: a key exists only where its branch asked the question.
+$planAnswers = @{
+    Mode                = $mode
+    SizeGB              = $SizeGB
+    DevDriveLabel       = $DevDriveLabel
+    SkipBitLocker       = $SkipBitLocker
+    WritePolicy         = $WritePolicy
+    SkipDeduplication   = $SkipDeduplication
+}
+if (-not $SkipBitLocker) { $planAnswers.BitLockerNotes = $bitLockerPlan.Notes }
+if (-not $SkipDeduplication) {
+    $planAnswers.DedupMode = $DedupMode
+    $planAnswers.CompressionFormat = $CompressionFormat
+    $planAnswers.CompressionLevel = $CompressionLevel
+    $planAnswers.DedupStartTime = $DedupStartTime
+    $planAnswers.DedupDailyDaysLabel = $DedupDailyDaysLabel
+    $planAnswers.ScrubDays = $ScrubDays
+    $planAnswers.ScrubStart = $ScrubStart
+    $planAnswers.ScrubWeeksInterval = $ScrubWeeksInterval
+    $planAnswers.DedupWeeklyJob = $DedupCapability.UsesBlockDedup
 }
 if ($mode -eq "Vhdx") {
-    Write-Host "* Create a $SizeGB GB $VhdxDiskType virtual hard disk at $VhdxPath" -ForegroundColor White
-    if ($VhdxDiskType -eq 'Fixed') {
-        Write-Host "  (a fixed size disk claims all of its space up front, which takes a while)" -ForegroundColor Gray
-    }
-    # Said here because the physical modes refuse an uninitialized disk instead.
-    Write-Host "* Initialize the new virtual disk with a $DiskPartitionStyle partition table" -ForegroundColor White
-    Write-Host "  (it will be brand new and empty; this script never initializes a physical disk)" -ForegroundColor Gray
-    Write-Host "* Format the attached virtual disk as a Dev Drive using ReFS" -ForegroundColor White
-    if ($VhdxAutoAttach) {
-        Write-Host "* Register the virtual disk to be mounted on every Windows startup" -ForegroundColor White
-    } else {
-        Write-Host "* Skip automatic mounting; the Dev Drive mount point is gone after every restart until mounted by hand" -ForegroundColor White
-    }
+    $planAnswers.VhdxPath = $VhdxPath
+    $planAnswers.VhdxDiskType = $VhdxDiskType
+    $planAnswers.VhdxAutoAttach = $VhdxAutoAttach
+    $planAnswers.PartitionStyle = $DiskPartitionStyle
 } else {
-    Write-Host "* Create $SizeGB GB Dev Drive on Disk $DiskNumber ($selectedDiskName) using ReFS" -ForegroundColor White
-    if ($mode -eq "ShrinkDrive") {
-        if ($null -eq $ShrinkAdjoiningGB) {
-            # Windows would not say how much sits behind the drive, so the size above is a floor.
-            Write-Host "  About this much, and likely more: the drive also takes any unallocated space already" -ForegroundColor Yellow
-            Write-Host "  behind ${DriveLetter}:, which could not be measured beforehand. Its real size is reported once it exists." -ForegroundColor Yellow
-        }
-        else {
-            foreach ($note in (Format-ShrinkSizeNote -DriveLetter $DriveLetter -ShrinkGB $ShrinkGB `
-                        -DevDriveGB $SizeGB)) {
-                Write-Host "  $note" -ForegroundColor Yellow
-            }
-        }
-    }
+    $planAnswers.DiskNumber = $DiskNumber
+    $planAnswers.DiskName = $selectedDiskName
+}
+if ($mode -eq "ShrinkDrive") {
+    $planAnswers.DriveLetter = $DriveLetter
+    $planAnswers.DriveLabel = $driveLabel
+    $planAnswers.ShrinkGB = $ShrinkGB
+    $planAnswers.ShrinkAdjoiningGB = $ShrinkAdjoiningGB
 }
 
-Write-Host "* Name the Dev Drive $DevDriveLabel" -ForegroundColor White
-
-if (-not $SkipBitLocker) {
-    Write-Host "* Enable BitLocker encryption for the Dev Drive" -ForegroundColor White
-    foreach ($note in $bitLockerPlan.Notes) {
-        Write-Host "  - $note" -ForegroundColor Gray
-    }
-} else {
-    Write-Host "* Skip BitLocker encryption" -ForegroundColor White
-    # Said here, before anything exists, rather than left for the write check to discover afterwards.
-    foreach ($line in (Resolve-WriteAccessPolicyAdvice -Policy $WritePolicy -Skipping)) {
-        Write-Host "  - $line" -ForegroundColor Yellow
-    }
+Write-Host "`n"
+foreach ($planLine in (Format-CreationPlan -Answers $planAnswers)) {
+    Write-Host $planLine.Text -ForegroundColor $planLine.Colour
 }
-
-if (-not $SkipDeduplication) {
-    Write-Host "* Enable ReFS $(Format-DedupModeChoice -Mode $DedupMode -Format $CompressionFormat -Level $CompressionLevel)" -ForegroundColor White
-    foreach ($line in (Format-DedupScheduleSummary -DailyTime $DedupStartTime -DailyDaysLabel $DedupDailyDaysLabel `
-                -WeeklyDay $ScrubDays -WeeklyStart $ScrubStart -WeeksInterval $ScrubWeeksInterval `
-                -WeeklyJob:$DedupCapability.UsesBlockDedup)) {
-        Write-Host "* $($line.Trim())" -ForegroundColor White
-    }
-} else {
-    Write-Host "* Skip deduplication and compression setup" -ForegroundColor White
-}
-
-Write-Host "* Mark Dev Drive as trusted for Windows Defender performance" -ForegroundColor White
-Write-Host "* Run initial optimization job to prepare the drive" -ForegroundColor White
-
-Write-Host "" -ForegroundColor Cyan
-Write-Host "===============================================================================" -ForegroundColor Cyan
 
 $confirmation = Read-Host "Are you ready to proceed with Dev Drive creation? (yes/no)"
 if ($confirmation -notmatch "^(yes|y)$") {
