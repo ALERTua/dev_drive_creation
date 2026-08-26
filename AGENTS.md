@@ -69,6 +69,13 @@ Two consequences:
   Take the GUID from `Get-Volume`, never from `Get-Partition`: a partition on an MBR disk has no GUID
   of its own, while its volume does. Never identify a task by its display name, its trigger times, or
   a before-and-after listing of the folder. That folder keeps the tasks of volumes that no longer exist.
+- **Two storage facts the documentation does not state, both measured.** `Get-PartitionSupportedSize`
+  reports `SizeMax` as the partition's size **plus the contiguous unallocated run right behind it**, so
+  a shrink target taken from it gives up less than was asked, or nothing. And
+  `New-Partition -UseMaximumSize` creates the largest partition on the **whole disk**, not one in the
+  space just freed, so a shrink can leave that space unused. Place such a partition with an explicit
+  `-Offset` and `-Size` — and align the offset up to a whole megabyte first: any other offset is
+  refused outright, and `Resize-Partition` aligns to the cluster, landing a few hundred bytes off.
 - **English in the repository**, in code, comments, documentation and commit messages.
 
 ## Line endings
