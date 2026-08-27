@@ -1227,6 +1227,26 @@ Describe 'Resolve-VhdxPathInput' {
     }
 }
 
+Describe 'Request-VhdxPath' {
+    BeforeAll {
+        Mock Write-Host { }
+        Mock Read-Host { 'D:\DevDrive.vhdx' }
+        Mock Test-Path { $true } -ParameterFilter { $LiteralPath -eq 'D:\' }
+        Mock Test-Path { $false } -ParameterFilter { $LiteralPath -eq 'D:\DevDrive.vhdx' }
+        Mock Get-Volume { [PSCustomObject]@{ DriveType = 'Fixed' } }
+    }
+
+    It 'takes a path whose folder exists on a fixed drive' {
+        Request-VhdxPath | Should -Be 'D:\DevDrive.vhdx'
+    }
+
+    It 'shows what a path looks like where one is typed, not three lines above it' {
+        # The example above the prompt is still on screen, and still was not what got typed.
+        Request-VhdxPath | Out-Null
+        Should -Invoke Read-Host -ParameterFilter { $Prompt -match '\(E\.g\. D:\\DevDrive\.vhdx\)' }
+    }
+}
+
 Describe 'Format-CreationPlan' {
     # The screen that asks for consent; nothing below it could be tested until it became a function.
     It 'names in the <Mode> plan only what that mode does' -TestCases @(
