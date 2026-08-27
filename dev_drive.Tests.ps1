@@ -37,34 +37,17 @@ BeforeAll {
 
     $script:ScriptText = Get-Content -Path $script:ScriptPath -Raw
 
-    function Get-ScriptConstant {
-        <# The value the body assigns to one top-level constant, so no test carries a copy of it.
-           Pattern is the capture for the value; a constant that has moved or gone throws here. #>
-        param([Parameter(Mandatory)][string]$Name, [Parameter(Mandatory)][string]$Pattern)
+    # Lifted functions do not bring the body's constants; the write-access advice defaults to this
+    # one. Read out of the script so the two cannot drift, which a second literal here would allow.
+    $policyPath = [regex]::Match($script:ScriptText, "(?m)^\`$FixedDriveWritePolicyPath\s*=\s*'([^']+)'")
+    if (-not $policyPath.Success) { throw 'cannot find $FixedDriveWritePolicyPath in dev_drive.ps1' }
+    $script:FixedDriveWritePolicyPath = $policyPath.Groups[1].Value
 
-        $found = [regex]::Match($script:ScriptText, "(?m)^\`$$Name\s*=\s*$Pattern")
-        if (-not $found.Success) { throw "cannot find `$$Name in dev_drive.ps1" }
-        return $found.Groups[1].Value
-    }
-
-    # Lifted functions do not bring the body's constants, and a literal here would let the two drift.
-    $script:FixedDriveWritePolicyPath = Get-ScriptConstant -Name 'FixedDriveWritePolicyPath' -Pattern "'([^']+)'"
-    $script:PasswordFloor = [int](Get-ScriptConstant -Name 'PasswordMinLength' -Pattern '(\d+)')
-    $script:PasswordCeiling = [int](Get-ScriptConstant -Name 'PasswordMaxLength' -Pattern '(\d+)')
-
-    function Get-ScriptFunction {
-        <# One named function of dev_drive.ps1 as a syntax-tree node, so a test can ask about the
-           text of that function alone. A whole-file match prints the whole file when it fails. #>
-        param([Parameter(Mandatory)][string]$Name)
-
-        $found = @($script:Ast.FindAll({
-                    param($node)
-                    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
-                    $node.Name -eq $Name
-                }, $false))
-        if ($found.Count -ne 1) { throw "dev_drive.ps1 defines $($found.Count) functions named $Name" }
-        return $found[0]
-    }
+    # The password policy reads two branches, and the second of them is the constant above.
+    $passwordPolicyPath = [regex]::Match($script:ScriptText,
+        "(?m)^\`$FixedDrivePasswordPolicyPaths = @\(\s*'([^']+)'")
+    if (-not $passwordPolicyPath.Success) { throw 'cannot find $FixedDrivePasswordPolicyPaths in dev_drive.ps1' }
+    $script:FixedDrivePasswordPolicyPaths = @($passwordPolicyPath.Groups[1].Value, $script:FixedDriveWritePolicyPath)
 
     function New-PlanAnswerSet {
         <# A complete, valid answer table for one mode, so a test can change the single field it is
@@ -154,129 +137,103 @@ Describe 'The script itself' {
         [int]$line.Matches[0].Groups[1].Value | Should -Be 50
     }
 
-    It 'declares each password length bound exactly once, at <Name>' -TestCases @(
-        @{ Name = 'the floor'; Variable = 'PasswordMinLength'; Value = 8 }
-        # BitLocker refuses past 256 with 0x803100AA, so the ceiling is its number, not a choice.
-        @{ Name = 'the ceiling'; Variable = 'PasswordMaxLength'; Value = 256 }
-    ) {
-        $line = Select-String -Path $script:ScriptPath -Pattern "^\`$$Variable\s*=\s*(\d+)"
-        @($line).Count | Should -Be 1
-        [int]$line.Matches[0].Groups[1].Value | Should -Be $Value
+    It 'never turns the password into a plain string, in any part of the file' {
+        # Measured: BitLocker judges the password, so nothing here needs to read it. Counted rather
+        # than matched, so a failure names the count instead of printing the whole file.
+        foreach ($conversion in 'SecureStringToBSTR', 'PtrToStringBSTR', 'PtrToStringAuto', 'ZeroFreeBSTR') {
+            @(Select-String -Path $script:ScriptPath -Pattern $conversion).Count |
+                Should -Be 0 -Because "$conversion would make a copy of the password"
+        }
     }
 
-    It 'writes the password prompt with the bounds interpolated, never with numbers of its own' {
-        $reader = Get-ScriptFunction -Name 'Request-StrongPassword'
-        # Positive, not a negative against today's wording: a reworded prompt carrying a fresh digit
-        # would slip past "does not say 8", and so would a parameter default.
-        $reader.Extent.Text | Should -Match '\$MinimumLength-\$MaximumLength printable ASCII chars'
-        $reader.Extent.Text | Should -Not -Match '\$M(in|ax)imumLength\s*=\s*\d'
-    }
-
-    It 'has one password caller, and it passes the constants rather than numbers' {
-        # The tree the file-level BeforeAll already parsed, rather than a fourth parse of the file.
-        $ast = $script:Ast
-        $calls = @($ast.FindAll({
+    It 'asks for the password without stating a rule of its own' {
+        # Every rule the prompt used to list was this script's, and four of the five were untrue of
+        # BitLocker. What it will and will not take is now said by BitLocker, when it refuses.
+        $prompts = @($script:Ast.FindAll({
                     param($node)
                     $node -is [System.Management.Automation.Language.CommandAst] -and
-                    $node.GetCommandName() -eq 'Request-StrongPassword'
+                    $node.GetCommandName() -eq 'Read-Host' -and
+                    $node.Extent.Text -match '-AsSecureString'
                 }, $true))
-        $calls.Count | Should -Be 1
-        # The arguments themselves, so a second caller under any variable name cannot pass a literal.
-        $passed = @{}
-        for ($i = 1; $i -lt $calls[0].CommandElements.Count - 1; $i++) {
-            $element = $calls[0].CommandElements[$i]
-            if ($element -is [System.Management.Automation.Language.CommandParameterAst]) {
-                $passed[$element.ParameterName] = $calls[0].CommandElements[$i + 1]
-            }
-        }
-        foreach ($pair in @{ MinimumLength = 'PasswordMinLength'; MaximumLength = 'PasswordMaxLength' }.GetEnumerator()) {
-            $passed[$pair.Key] | Should -BeOfType [System.Management.Automation.Language.VariableExpressionAst]
-            $passed[$pair.Key].VariablePath.UserPath | Should -Be $pair.Value
-        }
+        $prompts.Count | Should -Be 1
+        $prompts[0].Extent.Text | Should -Not -Match '\d'
+        $prompts[0].Extent.Text | Should -Not -Match 'complex|uppercase|lowercase|digit|special|ASCII'
     }
 
-    It 'frees the unmanaged password copy in a finally, so a throw cannot leave it behind' {
-        # A ZeroFreeBSTR call sitting after the checks instead of in a finally leaks the plaintext
-        # on every path that throws in between, which is exactly the defect this replaced.
-        # The tree the file-level BeforeAll already parsed, rather than a fourth parse of the file.
-        $ast = $script:Ast
-        $tries = @($ast.FindAll({
+    It 'prints what Windows will demand of the password before asking for one' {
+        # The loop, not the mention: replacing it with anything that merely names PasswordNotes left
+        # a text-offset check passing while nothing reached the screen.
+        $loop = @($script:Ast.FindAll({
                     param($node)
-                    $node -is [System.Management.Automation.Language.TryStatementAst] -and
-                    $node.Finally -and
-                    $node.Finally.Extent.Text -match 'ZeroFreeBSTR'
-                }, $true))
-        $tries.Count | Should -Be 1
-        # The conversion must sit in the guarded body, not before the try where nothing frees it.
-        $tries[0].Body.Extent.Text | Should -Match '::PtrToStringBSTR\('
-        # And the pointer must be taken outside it: a throw from that call with it inside would hand
-        # the finally the previous pass's pointer, freeing it twice.
-        $tries[0].Body.Extent.Text | Should -Not -Match '::SecureStringToBSTR\('
-        # The managed copy is released in the same place, so neither survives the loop.
-        $tries[0].Finally.Extent.Text | Should -Match '\$plain\s*=\s*\$null'
-        # The call form, and only within the function: the Auto variant reads to the first null
-        # instead of taking the BSTR length prefix, and a whole-file match would print the file.
-        $reader = Get-ScriptFunction -Name 'Request-StrongPassword'
-        $reader.Extent.Text | Should -Not -Match '::PtrToStringAuto\('
-        # The rule function tests none of its patterns with an operator: -match and -notmatch are
-        # case-insensitive, which is the original defect, and they copy what matched into $Matches -
-        # for the ASCII pattern that copy is the whole password.
-        $rule = Get-ScriptFunction -Name 'Resolve-UnmetPasswordRequirement'
-        # One per pattern rule: printable ASCII, uppercase, lowercase, digit, special.
-        @([regex]::Matches($rule.Extent.Text, '\[regex\]::IsMatch\(')).Count | Should -Be 5
-        # The operators by node, not by text: the comment above them names the ones being avoided.
-        @($rule.FindAll({
-                    param($node)
-                    $node -is [System.Management.Automation.Language.BinaryExpressionAst] -and
-                    $node.Operator.ToString() -match '^(I|C)not?match$'
-                }, $true)).Count | Should -Be 0
-    }
-
-    It 'disposes the refused attempt inside the loop, after the accepted one has left' {
-        # By position in the loop body, not by text offset: an IndexOf that finds nothing answers
-        # -1, and -1 is less than any real offset, so a reworded return would pass this silently.
-        $loop = @((Get-ScriptFunction -Name 'Request-StrongPassword').FindAll({
-                    param($node) $node -is [System.Management.Automation.Language.WhileStatementAst]
+                    $node -is [System.Management.Automation.Language.ForEachStatementAst] -and
+                    $node.Condition.Extent.Text -match '\$bitLockerPlan\.PasswordNotes'
                 }, $true))
         $loop.Count | Should -Be 1
-        $statements = @($loop[0].Body.Statements)
-        $disposeAt = [array]::FindIndex($statements, [Predicate[object]] { $args[0].Extent.Text -match '\$secure\.Dispose\(\)' })
-        $returnAt = [array]::FindIndex($statements, [Predicate[object]] { $args[0].Extent.Text -match 'return \$secure' })
-        $disposeAt | Should -BeGreaterThan 0
-        $returnAt | Should -BeGreaterThan 0
-        $disposeAt | Should -BeGreaterThan $returnAt
+        $loop[0].Body.Extent.Text | Should -Match 'Write-Host'
+        $promptAt = $script:ScriptText.IndexOf("Read-Host 'Password' -AsSecureString")
+        $promptAt | Should -BeGreaterThan $loop[0].Extent.EndOffset
     }
 
-    It 'disposes the attempt BitLocker refused before the retry asks for another' {
-        # The prompt loop is not the whole story: the BitLocker loop comes back to the same line and
-        # would otherwise leave one SecureString per attempt alive for the rest of the run.
-        $calls = @($script:Ast.FindAll({
+    It 'lets the BitLocker loop run for as long as somebody keeps answering it' {
+        $loop = @($script:Ast.FindAll({
                     param($node)
-                    $node -is [System.Management.Automation.Language.CommandAst] -and
-                    $node.GetCommandName() -eq 'Request-StrongPassword'
+                    $node -is [System.Management.Automation.Language.WhileStatementAst] -and
+                    $node.Condition.Extent.Text -match '\$bitLockerSuccess'
                 }, $true))
-        $calls.Count | Should -Be 1
-        $before = $script:ScriptText.Substring(0, $calls[0].Extent.StartOffset)
-        $before.LastIndexOf('$SecurePassword.Dispose()') |
-            Should -BeGreaterThan $before.LastIndexOf('$SecurePassword = $null')
+        $loop.Count | Should -Be 1
+        $loop[0].Condition.Extent.Text | Should -Not -Match 'retryCount|maxRetries|\d'
+        @(Select-String -Path $script:ScriptPath -Pattern '\$maxRetries').Count | Should -Be 0
     }
 
-    It 'wraps the requirement check so an empty answer cannot throw under strict mode' {
-        # Measured: return @() arrives as $null and return @('one') as a bare string, so .Count on
-        # the bare result throws here. The @() around the call is what makes the count safe.
-        # The tree the file-level BeforeAll already parsed, rather than a fourth parse of the file.
-        $ast = $script:Ast
-        $calls = @($ast.FindAll({
+    It 'calls a failure a password one only on a pass that actually asked for a password' {
+        # The whole safety of an unbounded loop rests on this. The prompt is gated on the volume not
+        # already carrying a password protector, while the plan's own flag is true for the entire
+        # run - so classifying by the plan would send a pass that prompts for nothing round again,
+        # forever, at full speed. The flag has to be set where the Read-Host is.
+        $prompt = @($script:Ast.FindAll({
                     param($node)
                     $node -is [System.Management.Automation.Language.CommandAst] -and
-                    $node.GetCommandName() -eq 'Resolve-UnmetPasswordRequirement'
+                    $node.GetCommandName() -eq 'Read-Host' -and $node.Extent.Text -match '-AsSecureString'
                 }, $true))
-        $calls.Count | Should -Be 1
-        # The exact chain, not any ancestor: a call nested inside some other array expression
-        # somewhere up the tree is not the wrap that makes this .Count safe.
-        $calls[0].Parent | Should -BeOfType [System.Management.Automation.Language.PipelineAst]
-        $calls[0].Parent.Parent | Should -BeOfType [System.Management.Automation.Language.StatementBlockAst]
-        $calls[0].Parent.Parent.Parent | Should -BeOfType [System.Management.Automation.Language.ArrayExpressionAst]
+        $prompt.Count | Should -Be 1
+
+        $verdicts = @($script:Ast.FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.CommandAst] -and
+                    $node.GetCommandName() -eq 'Resolve-BitLockerFailure'
+                }, $true))
+        $verdicts.Count | Should -Be 1
+        $flag = ([regex]::Match($verdicts[0].Extent.Text, '-PasswordAsked:\$(\w+)')).Groups[1].Value
+        $flag | Should -Not -BeNullOrEmpty
+        $flag | Should -Not -Be 'passwordAsked'
+
+        # Set true immediately after the prompt, and false again at the top of every pass.
+        $assignments = @($script:Ast.FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+                    $node.Left.Extent.Text -eq "`$$flag"
+                }, $true))
+        @($assignments | Where-Object { $_.Right.Extent.Text -eq '$false' }).Count | Should -Be 1
+        @($assignments | Where-Object { $_.Right.Extent.Text -eq '$true' }).Count | Should -Be 1
+        $setTrue = @($assignments | Where-Object { $_.Right.Extent.Text -eq '$true' })[0]
+        $setTrue.Extent.StartOffset | Should -BeGreaterThan $prompt[0].Extent.EndOffset
+    }
+
+    It 'hands the plan what this machine asks of a password, rather than leaving it to guess' {
+        $content = Get-Content -Path $script:ScriptPath -Raw
+        $readAt = $content.IndexOf('$passwordPolicy = Get-FixedDrivePasswordPolicy')
+        $readAt | Should -BeGreaterThan 0
+        $content | Should -Match '-PolicyMinimumLength \(\[int\]\$passwordPolicy\.MinimumLength\)'
+        $content | Should -Match '-PolicyComplexity \$passwordPolicy\.Complexity'
+        # And before the plan uses it. The call, not the name: the function is defined earlier in
+        # the file, so a text search for it finds the definition and answers nothing useful.
+        $call = @($script:Ast.FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.CommandAst] -and
+                    $node.GetCommandName() -eq 'Resolve-BitLockerSetupPlan'
+                }, $true))
+        $call.Count | Should -Be 1
+        $call[0].Extent.StartOffset | Should -BeGreaterThan $readAt
     }
 
     It 'declares the shrink head-room exactly once' {
@@ -827,6 +784,8 @@ Describe 'The script itself' {
     It 'keeps the policy registry path in one place rather than beside every use of it' {
         $content = Get-Content -Path $script:ScriptPath -Raw
         ([regex]::Matches($content, '(?m)^\$FixedDriveWritePolicyPath\s*=')).Count | Should -Be 1
+        # Still once, although two things read that key now: the password policy list is built from
+        # this constant rather than spelling the path out a second time.
         ([regex]::Matches($content, 'CurrentControlSet\\Policies\\Microsoft\\FVE')).Count | Should -Be 1
         ([regex]::Matches($content, '\$PolicyPath = \$script:FixedDriveWritePolicyPath')).Count | Should -Be 2
     }
@@ -867,7 +826,9 @@ Describe 'The script itself' {
         # password prompt, which may legitimately discuss complexity, does not trip it.
         $throws = @(Select-String -Path $script:ScriptPath -Pattern '^\s*throw "' | ForEach-Object { $_.Line })
         @($throws | Where-Object { $_ -match 'complexity' }) | Should -BeNullOrEmpty
-        @($throws | Where-Object { $_ -match 'did not accept the password' }).Count | Should -Be 1
+        @($throws | Where-Object { $_ -match 'refused the password' }).Count | Should -Be 1
+        # And it no longer blames a count: the loop has no limit to reach.
+        @($throws | Where-Object { $_ -match 'attempts' }) | Should -BeNullOrEmpty
     }
 
     It 'never works out free space by summing the partitions it likes the look of' {
@@ -2441,6 +2402,126 @@ Describe 'Request-BitLockerChoice' {
     }
 }
 
+
+Describe 'Get-FixedDrivePasswordPolicy' {
+    BeforeAll {
+        # Mocked rather than written to a real hive: nothing here needs the registry to exist, and a
+        # test that writes keys leaves something behind when it fails. Both paths come out of the
+        # script, so neither this file nor the other one carries a second copy of them.
+        $script:PolicyPaths = $script:FixedDrivePasswordPolicyPaths
+
+    }
+
+    It 'found both branch paths in the script' {
+        # If either read above answered nothing, every test below would be mocking a path the script
+        # does not use, and would pass while the real one went unread.
+        $script:PolicyPaths[0] | Should -Match '^HKLM:\\'
+        $script:PolicyPaths[1] | Should -Match '^HKLM:\\'
+        $script:PolicyPaths[0] | Should -Not -Be $script:PolicyPaths[1]
+    }
+
+    It 'answers not-set where neither key exists, which is the ordinary machine' {
+        Mock Test-Path { $false }
+        $policy = Get-FixedDrivePasswordPolicy -Paths $script:PolicyPaths
+        $policy.MinimumLength | Should -BeNullOrEmpty
+        $policy.Complexity | Should -Be 'NotSet'
+    }
+
+    It 'answers not-set where the key exists but carries none of the three values' {
+        Mock Test-Path { $true }
+        Mock Get-ItemProperty { [PSCustomObject]@{ SomethingElse = 1 } }
+        (Get-FixedDrivePasswordPolicy -Paths $script:PolicyPaths).Complexity | Should -Be 'NotSet'
+    }
+
+    It 'reads the minimum length once the policy carrying it is on' {
+        Mock Test-Path { $true }
+        Mock Get-ItemProperty { [PSCustomObject]@{ FDVPassphrase = 1; FDVPassphraseLength = 15 } }
+        $policy = Get-FixedDrivePasswordPolicy -Paths $script:PolicyPaths
+        $policy.MinimumLength | Should -Be 15
+        # The policy is on but says nothing about complexity, which is not the same as forbidding it.
+        $policy.Complexity | Should -Be 'NotSet'
+    }
+
+    It 'reads complexity <Value> as <Expected>' -TestCases @(
+        @{ Value = 0; Expected = 'Allowed' }
+        @{ Value = 1; Expected = 'Required' }
+        @{ Value = 2; Expected = 'NotChecked' }
+        # VolumeEncryption.admx offers three; anything else is not a value this can name.
+        @{ Value = 7; Expected = 'Unknown' }
+    ) {
+        Mock Test-Path { $true }
+        Mock Get-ItemProperty { [PSCustomObject]@{ FDVPassphrase = 1; FDVPassphraseComplexity = $Value } }.GetNewClosure()
+        (Get-FixedDrivePasswordPolicy -Paths $script:PolicyPaths).Complexity | Should -Be $Expected
+    }
+
+    It 'refuses to report a figure that sits under a policy which is <Name>' -TestCases @(
+        @{ Name = 'switched off'; Values = @{ FDVPassphrase = 0; FDVPassphraseLength = 15 } }
+        @{ Name = 'not there at all'; Values = @{ FDVPassphraseLength = 15 } }
+        @{ Name = 'off while forbidding complexity'; Values = @{ FDVPassphrase = 0; FDVPassphraseComplexity = 2 } }
+    ) {
+        # Group policy writes the three together, so a figure without its switch was not written by
+        # group policy. Reporting it as the machine's rule would state something nothing enforces.
+        Mock Test-Path { $true }
+        Mock Get-ItemProperty { [PSCustomObject]$Values }.GetNewClosure()
+        $policy = Get-FixedDrivePasswordPolicy -Paths $script:PolicyPaths
+        $policy.Complexity | Should -Be 'Unknown'
+        $policy.MinimumLength | Should -BeNullOrEmpty
+    }
+
+    It 'takes the value from whichever key carries it, when only the second does' {
+        # Which of the two branches BitLocker reads has not been seen, so both are looked at. Two
+        # filters rather than one body deciding: a body that answered wrongly would pass silently.
+        Mock Test-Path { $false } -ParameterFilter { $Path -eq $script:PolicyPaths[0] }
+        Mock Test-Path { $true } -ParameterFilter { $Path -eq $script:PolicyPaths[1] }
+        Mock Get-ItemProperty { [PSCustomObject]@{ FDVPassphrase = 1; FDVPassphraseLength = 12 } }
+        (Get-FixedDrivePasswordPolicy -Paths $script:PolicyPaths).MinimumLength | Should -Be 12
+        Should -Invoke Test-Path -ParameterFilter { $Path -eq $script:PolicyPaths[0] }
+        Should -Invoke Get-ItemProperty
+    }
+
+    It 'answers unknown when the two branches disagree about the same value' {
+        # Nobody knows which one BitLocker honours, so a disagreement is not an answer to pick from.
+        Mock Test-Path { $true }
+        Mock Get-ItemProperty { [PSCustomObject]@{ FDVPassphrase = 1; FDVPassphraseLength = 15 } } `
+            -ParameterFilter { $Path -eq $script:PolicyPaths[0] }
+        Mock Get-ItemProperty { [PSCustomObject]@{ FDVPassphrase = 1; FDVPassphraseLength = 20 } } `
+            -ParameterFilter { $Path -eq $script:PolicyPaths[1] }
+        (Get-FixedDrivePasswordPolicy -Paths $script:PolicyPaths).Complexity | Should -Be 'Unknown'
+    }
+
+    It 'answers unknown for a value of a type it cannot read, not not-set, for <Name>' -TestCases @(
+        # The one that matters: a string of digits casts to a number without complaining, so only
+        # the type check stands between a REG_SZ policy and a figure nobody verified.
+        @{ Name = 'a string that looks like a number'; Value = '15' }
+        @{ Name = 'a string that does not'; Value = 'fifteen' }
+        @{ Name = 'binary data'; Value = [byte[]]@(1, 2) }
+        @{ Name = 'a multi-string, which arrives as an array'; Value = [string[]]@('15') }
+    ) {
+        # A wrong type is an answer this cannot read. Calling it "nothing is set" would tell the user
+        # the machine asks for nothing, which is the one wrong thing to say about a policy.
+        Mock Test-Path { $true }
+        Mock Get-ItemProperty { [PSCustomObject]@{ FDVPassphrase = 1; FDVPassphraseLength = $Value } }.GetNewClosure()
+        $policy = Get-FixedDrivePasswordPolicy -Paths $script:PolicyPaths
+        $policy.Complexity | Should -Be 'Unknown'
+        $policy.MinimumLength | Should -BeNullOrEmpty
+    }
+
+    It 'answers unknown when the read itself throws' {
+        Mock Test-Path { $true }
+        Mock Get-ItemProperty { throw 'access denied' }
+        (Get-FixedDrivePasswordPolicy -Paths $script:PolicyPaths).Complexity | Should -Be 'Unknown'
+    }
+
+    It 'reads both branches by default, without being told which' {
+        # The default is what the run uses; every other test here passes the paths explicitly.
+        Mock Test-Path { $false }
+        Get-FixedDrivePasswordPolicy | Out-Null
+        foreach ($path in $script:PolicyPaths) {
+            Should -Invoke Test-Path -ParameterFilter { $Path -eq $path }
+        }
+    }
+}
+
 Describe 'Get-FixedDriveWritePolicy' {
     BeforeAll {
         $script:TestKeyRoot = 'HKCU:\Software\DevDriveTests'
@@ -2638,6 +2719,69 @@ Describe 'Resolve-BitLockerSetupPlan' {
         (Resolve-BitLockerSetupPlan -VhdxMode:$true).Notes -join "`n" | Should -Match 'password will be asked for'
     }
 
+    It 'names what Windows itself refuses where no policy says otherwise, for <Name>' -TestCases @(
+        @{ Name = 'a domain machine'; Domain = $true }
+        @{ Name = 'a machine with no domain'; Domain = $false }
+    ) {
+        # Both numbers are measured, not read: BitLocker refused 7 characters with 0x80310080 and
+        # 257 with 0x803100AA on an unmanaged machine, and accepted 8 and 256.
+        $notes = (Resolve-BitLockerSetupPlan -VhdxMode:$true -DomainJoined:$Domain).PasswordNotes -join "`n"
+        $notes | Should -Match 'at least 8 characters'
+        $notes | Should -Match 'at most 256'
+        # The floor moves with policy and the ceiling does not, so only one of them is hedged.
+        $notes | Should -Match 'Group policy can ask for more'
+    }
+
+    It 'names the length this machine asks for, rather than the one Windows falls back to' {
+        $notes = (Resolve-BitLockerSetupPlan -VhdxMode:$true -PolicyMinimumLength 15).PasswordNotes -join "`n"
+        $notes | Should -Match 'at least 15 characters'
+        $notes | Should -Not -Match 'at least 8'
+        # The ceiling is not policy's to move, so it is still stated flatly.
+        $notes | Should -Match 'at most 256'
+    }
+
+    It 'never promises a floor below the one BitLocker keeps anyway, for <Value>' -TestCases @(
+        @{ Value = 4 }
+        @{ Value = 1 }
+    ) {
+        # The policy editor holds this value to 8..99; the registry holds it to nothing at all, and
+        # a run that promised "at least 4" would be refused by Windows quoting eight back at it.
+        $notes = (Resolve-BitLockerSetupPlan -VhdxMode:$true -PolicyMinimumLength $Value).PasswordNotes -join "`n"
+        $notes | Should -Match 'at least 8 characters'
+        $notes | Should -Not -Match "at least $Value characters|at least [1-7] "
+    }
+
+    It 'says the policy could not be read rather than claiming it asks for nothing' {
+        $notes = (Resolve-BitLockerSetupPlan -VhdxMode:$true -PolicyComplexity 'Unknown').PasswordNotes -join "`n"
+        $notes | Should -Match 'could not be read'
+    }
+
+    It 'tells the truth about complexity for <Name>' -TestCases @(
+        @{ Name = 'policy requiring it, with no domain'; Domain = $false; Complexity = 'Required'; Expected = 'requires it' }
+        @{ Name = 'policy requiring it on a domain machine'; Domain = $true; Complexity = 'Required'; Expected = 'requires it' }
+        @{ Name = 'a domain machine with nothing set'; Domain = $true; Complexity = 'NotSet'; Expected = 'may also require' }
+        @{ Name = 'a domain machine where policy allows but does not require'; Domain = $true; Complexity = 'Allowed'; Expected = 'may also require' }
+        @{ Name = 'a domain machine where policy turns the check off'; Domain = $true; Complexity = 'NotChecked'; Expected = $null }
+        @{ Name = 'no domain and nothing set'; Domain = $false; Complexity = 'NotSet'; Expected = $null }
+    ) {
+        # "Required" is a fact about this machine and outranks the guess; "do not allow" means the
+        # check does not happen at all, so saying a controller might want it would be a lie.
+        $notes = (Resolve-BitLockerSetupPlan -VhdxMode:$true -DomainJoined:$Domain `
+                -PolicyComplexity $Complexity).PasswordNotes -join "`n"
+        if ($Expected) { $notes | Should -Match $Expected } else { $notes | Should -Not -Match 'complexity' }
+    }
+
+    It 'says nothing about a password where none is asked for, whatever the policy' {
+        @((Resolve-BitLockerSetupPlan -VhdxMode:$false -DomainJoined:$true `
+                    -PolicyMinimumLength 15 -PolicyComplexity 'Required').PasswordNotes).Count | Should -Be 0
+    }
+
+    It 'keeps the password note out of the plan summary, which is printed before the drive exists' {
+        # It belongs at the prompt: the plan is confirmed long before anything asks for a password.
+        $plan = Resolve-BitLockerSetupPlan -VhdxMode:$true -DomainJoined:$true
+        $plan.Notes -join "`n" | Should -Not -Match 'complexity'
+    }
+
     It 'says no password is coming for a partition' {
         (Resolve-BitLockerSetupPlan -VhdxMode:$false).Notes -join "`n" | Should -Match 'No BitLocker password'
     }
@@ -2699,12 +2843,12 @@ Describe 'Resolve-BitLockerFailure' {
            Message = 'Das Kennwort darf 256 Zeichen nicht ueberschreiten. (0x803100AA)' }
     ) {
         # Matched by code: the sentence around each is localized.
-        (Resolve-BitLockerFailure -Message $Message -RetryCount 1 -MaxRetries 10 -PasswordAsked).Kind |
+        (Resolve-BitLockerFailure -Message $Message -RetryCount 1 -PasswordAsked).Kind |
             Should -Be 'Password'
     }
 
     It 'matches the code whatever case it is written in' {
-        (Resolve-BitLockerFailure -Message 'refused (0x803100a4)' -RetryCount 1 -MaxRetries 10 -PasswordAsked).Kind |
+        (Resolve-BitLockerFailure -Message 'refused (0x803100a4)' -RetryCount 1 -PasswordAsked).Kind |
             Should -Be 'Password'
     }
 
@@ -2712,13 +2856,13 @@ Describe 'Resolve-BitLockerFailure' {
         # .NET puts the code in the message today, in both editions. That is one formatting choice
         # away from being absent, and the exception carries the number regardless.
         $verdict = Resolve-BitLockerFailure -Message 'Kennwort abgelehnt.' -HResult -2144272255 `
-            -RetryCount 1 -MaxRetries 10 -PasswordAsked
+            -RetryCount 1 -PasswordAsked
         $verdict.Kind | Should -Be 'Password'
     }
 
     It 'takes a policy refusal from the number too' {
         $verdict = Resolve-BitLockerFailure -Message 'Abgelehnt.' -HResult -2144272290 `
-            -RetryCount 1 -MaxRetries 10 -PasswordAsked
+            -RetryCount 1 -PasswordAsked
         $verdict.Kind | Should -Be 'Other'
         $verdict.CanRetry | Should -BeFalse
     }
@@ -2726,7 +2870,7 @@ Describe 'Resolve-BitLockerFailure' {
     It 'reads no code out of an unset number' {
         # 0 is "nothing was passed", not a code, and must not collide with anything.
         (Resolve-BitLockerFailure -Message 'Etwas ging schief.' -HResult 0 `
-                -RetryCount 1 -MaxRetries 10 -PasswordAsked).Kind | Should -Be 'Other'
+                -RetryCount 1 -PasswordAsked).Kind | Should -Be 'Other'
     }
 
     It 'no longer decides by English words: <Description>' -TestCases @(
@@ -2736,7 +2880,7 @@ Describe 'Resolve-BitLockerFailure' {
     ) {
         # These carry no code, so there is nothing to retry on. The old matcher took them, which is
         # why it worked in English and nowhere else; re-adding it "for safety" would fail here.
-        (Resolve-BitLockerFailure -Message $Message -RetryCount 1 -MaxRetries 10 -PasswordAsked).Kind |
+        (Resolve-BitLockerFailure -Message $Message -RetryCount 1 -PasswordAsked).Kind |
             Should -Be 'Other'
     }
 
@@ -2748,7 +2892,7 @@ Describe 'Resolve-BitLockerFailure' {
     ) {
         # Both mention a password and both are refusals a retype cannot change, so they belong with
         # the policy refusals and must never be offered a retry.
-        $verdict = Resolve-BitLockerFailure -Message $Message -RetryCount 1 -MaxRetries 10 -PasswordAsked
+        $verdict = Resolve-BitLockerFailure -Message $Message -RetryCount 1 -PasswordAsked
         $verdict.Kind | Should -Be 'Other'
         $verdict.CanRetry | Should -BeFalse
         ($verdict.Lines -join "`n") | Should -Match 'same refusal'
@@ -2757,14 +2901,14 @@ Describe 'Resolve-BitLockerFailure' {
     It 'does not call a FIPS refusal a group policy one' {
         # FIPS is a different machine setting with a different remedy, and the quoted Windows text
         # above already says which of the two refused. Naming one sends people to the wrong place.
-        ((Resolve-BitLockerFailure -Message 'FIPS. (0x8031006C)' -RetryCount 1 -MaxRetries 10).Lines -join "`n") |
+        ((Resolve-BitLockerFailure -Message 'FIPS. (0x8031006C)' -RetryCount 1).Lines -join "`n") |
             Should -Not -Match 'Group policy'
     }
 
     It 'never blames the password on a run that never asks for one' {
         # In partition mode nothing is prompted, so a password retry would repeat the same call
-        # ten times with nobody to change anything.
-        $verdict = Resolve-BitLockerFailure -RetryCount 1 -MaxRetries 10 `
+        # with nobody to change anything - and with no ceiling, it would never stop.
+        $verdict = Resolve-BitLockerFailure -RetryCount 1 `
             -Message 'Your password does not meet the complexity requirements. (0x80310081)'
         $verdict.Kind | Should -Be 'Other'
     }
@@ -2772,36 +2916,36 @@ Describe 'Resolve-BitLockerFailure' {
     It 'says what Windows said rather than guessing which of the four refusals it was' {
         # Three of the four are not about complexity at all, so naming complexity would be wrong.
         $lines = (Resolve-BitLockerFailure -Message 'Nur druckbare ASCII-Zeichen. (0x803100A4)' `
-                -RetryCount 1 -MaxRetries 10 -PasswordAsked).Lines -join "`n"
+                -RetryCount 1 -PasswordAsked).Lines -join "`n"
         $lines | Should -Match 'Nur druckbare ASCII-Zeichen'
         $lines | Should -Not -Match 'complexity'
     }
 
-    It 'counts the attempts left before giving up' {
-        $verdict = Resolve-BitLockerFailure -Message 'refused (0x80310081)' -RetryCount 3 -MaxRetries 10 -PasswordAsked
-        $verdict.Exhausted | Should -BeFalse
+    It 'numbers the attempt without ever naming a last one, at <Count>' -TestCases @(
+        @{ Count = 3 }
+        @{ Count = 10 }
+        @{ Count = 500 }
+    ) {
+        # A refused password is retried for as long as somebody keeps typing. The count is there to
+        # be read, not to be reached: no attempt is the final one and nothing counts down to it.
+        $verdict = Resolve-BitLockerFailure -Message 'refused (0x80310081)' -RetryCount $Count -PasswordAsked
         $verdict.CanRetry | Should -BeTrue
-        ($verdict.Lines -join "`n") | Should -Match 'Attempt 3 of 10'
-    }
-
-    It 'gives up once the attempts are used up' {
-        $verdict = Resolve-BitLockerFailure -Message 'refused (0x80310081)' -RetryCount 10 -MaxRetries 10 -PasswordAsked
-        $verdict.Exhausted | Should -BeTrue
-        $verdict.CanRetry | Should -BeFalse
-        ($verdict.Lines -join "`n") | Should -Match 'Maximum retry attempts reached'
+        $lines = $verdict.Lines -join "`n"
+        $lines | Should -Match "Attempt $Count\."
+        $lines | Should -Not -Match 'of \d|last|final|remaining|Maximum'
     }
 
     It 'says what the drive is on the one password path that ends the run' {
         # The run throws right after this, so it is the last thing the user reads. Every other
         # failure path names the drive's state; this one used to stay silent about it.
-        $lines = (Resolve-BitLockerFailure -Message 'refused (0x80310081)' -RetryCount 10 -MaxRetries 10 `
-                -PasswordAsked -VolumeState 'Clear').Lines -join "`n"
+        $lines = (Resolve-BitLockerFailure -Message 'refused (0x80310081)' -RetryCount 10 `
+                -Unretryable -PasswordAsked -VolumeState 'Clear').Lines -join "`n"
         $lines | Should -Match 'works without BitLocker'
     }
 
     It 'does not clutter a retryable password refusal with the drive state' {
-        # There are nine attempts left; nothing has ended, so nothing needs summarising.
-        $lines = (Resolve-BitLockerFailure -Message 'refused (0x80310081)' -RetryCount 1 -MaxRetries 10 `
+        # Nothing has ended, so nothing needs summarising.
+        $lines = (Resolve-BitLockerFailure -Message 'refused (0x80310081)' -RetryCount 1 `
                 -PasswordAsked -VolumeState 'Clear').Lines -join "`n"
         $lines | Should -Not -Match 'works without BitLocker'
     }
@@ -2809,98 +2953,89 @@ Describe 'Resolve-BitLockerFailure' {
     It 'treats anything else as a failure the user has to decide about' {
         # 0x80090034 says nothing about a password, so it must not be sorted as one.
         $verdict = Resolve-BitLockerFailure -Message 'Encryption failed. (0x80090034)' `
-            -RetryCount 1 -MaxRetries 10 -PasswordAsked
+            -RetryCount 1 -PasswordAsked
         $verdict.Kind | Should -Be 'Other'
-        $verdict.Exhausted | Should -BeFalse
         $verdict.CanRetry | Should -BeTrue
     }
 
-    It 'counts the attempts for a failure that is not about a password either' {
-        $verdict = Resolve-BitLockerFailure -Message 'Encryption failed. (0x80090034)' -RetryCount 10 -MaxRetries 10
+    It 'keeps offering a retry for a failure that is not about a password, however many there were' {
+        # The user is asked what to do after each of these, so the count changes nothing here either.
+        $verdict = Resolve-BitLockerFailure -Message 'Encryption failed. (0x80090034)' -RetryCount 500
         $verdict.Kind | Should -Be 'Other'
-        $verdict.Exhausted | Should -BeTrue
-        $verdict.CanRetry | Should -BeFalse
+        $verdict.CanRetry | Should -BeTrue
     }
 
     It 'refuses a retry that would only repeat itself' {
         $verdict = Resolve-BitLockerFailure -Message 'carries 2 BitLocker recovery keys' `
-            -RetryCount 1 -MaxRetries 10 -Unretryable
-        $verdict.Exhausted | Should -BeFalse
+            -RetryCount 1 -Unretryable
         $verdict.CanRetry | Should -BeFalse
     }
 
     It 'refuses a password retry too once the error cannot change' {
-        $verdict = Resolve-BitLockerFailure -Message 'refused (0x80310081)' -RetryCount 1 -MaxRetries 10 `
+        $verdict = Resolve-BitLockerFailure -Message 'refused (0x80310081)' -RetryCount 1 `
             -Unretryable -PasswordAsked
         $verdict.Kind | Should -Be 'Password'
         $verdict.CanRetry | Should -BeFalse
-        ($verdict.Lines -join "`n") | Should -Not -Match 'Attempt 1 of 10'
+        ($verdict.Lines -join "`n") | Should -Not -Match 'Attempt'
     }
 
     It 'repeats what Windows said and says the drive works without BitLocker while it is unencrypted' {
         $lines = (Resolve-BitLockerFailure -Message 'Encryption failed. (0x80090034)' `
-            -RetryCount 1 -MaxRetries 10 -VolumeState 'Clear').Lines -join "`n"
+            -RetryCount 1 -VolumeState 'Clear').Lines -join "`n"
         $lines | Should -Match '0x80090034'
         $lines | Should -Match 'works without BitLocker'
     }
 
     It 'does not claim the drive works without BitLocker once encryption has started' {
         $lines = (Resolve-BitLockerFailure -Message 'Encryption failed. (0x80090034)' `
-            -RetryCount 1 -MaxRetries 10 -VolumeState 'Encrypted').Lines -join "`n"
+            -RetryCount 1 -VolumeState 'Encrypted').Lines -join "`n"
         $lines | Should -Match 'already started encrypting'
         $lines | Should -Not -Match 'works without BitLocker'
     }
 
     It 'says the state could not be read rather than calling the volume unencrypted' {
         $lines = (Resolve-BitLockerFailure -Message 'Encryption failed. (0x80090034)' `
-            -RetryCount 1 -MaxRetries 10 -VolumeState 'Unknown').Lines -join "`n"
+            -RetryCount 1 -VolumeState 'Unknown').Lines -join "`n"
         $lines | Should -Match 'could not be read'
         $lines | Should -Match 'Get-BitLockerVolume'
         $lines | Should -Not -Match 'works without BitLocker'
     }
 
     It 'assumes nothing about the volume when no state is passed' {
-        $lines = (Resolve-BitLockerFailure -Message 'Encryption failed.' -RetryCount 1 -MaxRetries 10).Lines -join "`n"
+        $lines = (Resolve-BitLockerFailure -Message 'Encryption failed.' -RetryCount 1).Lines -join "`n"
         $lines | Should -Match 'could not be read'
     }
 
     It 'does not throw on an empty message' {
-        { Resolve-BitLockerFailure -Message '' -RetryCount 1 -MaxRetries 10 } | Should -Not -Throw
-        (Resolve-BitLockerFailure -Message '' -RetryCount 1 -MaxRetries 10).Kind | Should -Be 'Other'
+        { Resolve-BitLockerFailure -Message '' -RetryCount 1 } | Should -Not -Throw
+        (Resolve-BitLockerFailure -Message '' -RetryCount 1).Kind | Should -Be 'Other'
     }
 
     It 'refuses a retry when group policy is what said no' {
         # 0x8031005E is "group policy will not allow this", and a second attempt meets it again.
         $verdict = Resolve-BitLockerFailure -Message 'Die Gruppenrichtlinien lassen das nicht zu. (0x8031005E)' `
-            -RetryCount 1 -MaxRetries 10
+            -RetryCount 1
         $verdict.Kind | Should -Be 'Other'
-        $verdict.Exhausted | Should -BeFalse
         $verdict.CanRetry | Should -BeFalse
         ($verdict.Lines -join "`n") | Should -Match 'same refusal'
     }
 
     It 'recognises the policy refusal by its code, not by an English sentence' {
         # BitLocker takes its messages from a resource, so the words around the code are localized.
-        (Resolve-BitLockerFailure -Message 'anything at all (0x8031005e)' -RetryCount 1 -MaxRetries 10).CanRetry |
+        (Resolve-BitLockerFailure -Message 'anything at all (0x8031005e)' -RetryCount 1).CanRetry |
             Should -BeFalse
     }
 
     It 'sorts a policy refusal as one even on a run that asks for a password' {
         # A message carrying both codes is a refusal policy will repeat, not a password to retype.
         $verdict = Resolve-BitLockerFailure -Message 'refused (0x8031005E) (0x80310081)' `
-            -RetryCount 1 -MaxRetries 10 -PasswordAsked
+            -RetryCount 1 -PasswordAsked
         $verdict.Kind | Should -Be 'Other'
         $verdict.CanRetry | Should -BeFalse
     }
 
-    It 'still counts the attempts when policy refused on the last one' {
-        $verdict = Resolve-BitLockerFailure -Message 'refused (0x8031005E)' -RetryCount 10 -MaxRetries 10
-        $verdict.Exhausted | Should -BeTrue
-        $verdict.CanRetry | Should -BeFalse
-    }
-
     It 'still allows a retry for a failure policy had nothing to do with' {
-        $verdict = Resolve-BitLockerFailure -Message 'Encryption failed. (0x80090034)' -RetryCount 1 -MaxRetries 10
+        $verdict = Resolve-BitLockerFailure -Message 'Encryption failed. (0x80090034)' -RetryCount 1
         $verdict.CanRetry | Should -BeTrue
         ($verdict.Lines -join "`n") | Should -Not -Match 'same refusal'
     }
@@ -4633,137 +4768,5 @@ Describe 'Get-VolumeWriteState' {
         $reason = (Get-VolumeWriteState -MountPoint (Join-Path $TestDrive 'no-such-folder')).Reason
         $reason | Should -Not -BeNullOrEmpty
         $reason | Should -Not -Match 'Exception calling'
-    }
-}
-
-Describe 'Resolve-UnmetPasswordRequirement' {
-    BeforeAll {
-        # The floor and ceiling are read out of the script in the file-level BeforeAll, so the
-        # fixtures that are about length are built from them rather than from numbers of their own.
-        $script:AtFloor = 'Ab1!' + ('c' * [math]::Max(0, $script:PasswordFloor - 4))
-        $script:BelowFloor = $script:AtFloor.Substring(0, $script:AtFloor.Length - 1)
-        $script:FloorMessage = "at least $script:PasswordFloor characters"
-        $script:CeilingMessage = "at most $script:PasswordCeiling characters"
-
-        function Get-Unmet {
-            <# The call every test makes, so the two length arguments are not repeated in each. It
-               unrolls like any function, so a caller wanting .Count wraps it in @() as the script
-               does - the array a return statement carries out of a function is not one. #>
-            param([Parameter(Mandatory)][AllowEmptyString()][string]$Plain)
-
-            return @(Resolve-UnmetPasswordRequirement -Plain $Plain `
-                    -MinimumLength $script:PasswordFloor -MaximumLength $script:PasswordCeiling)
-        }
-    }
-
-    It 'answers nothing for a password that meets every rule' {
-        @(Get-Unmet -Plain $script:AtFloor).Count | Should -Be 0
-    }
-
-    It 'names the length requirement one character below the floor, and not at it' {
-        Get-Unmet -Plain $script:BelowFloor | Should -Contain $script:FloorMessage
-        Get-Unmet -Plain $script:AtFloor | Should -Not -Contain $script:FloorMessage
-    }
-
-    It 'names the ceiling one character above it, and not at it' {
-        # BitLocker answers 0x803100AA past its ceiling, so a longer password is refused here first.
-        $atCeiling = 'Ab1!' + ('c' * ($script:PasswordCeiling - 4))
-        Get-Unmet -Plain $atCeiling | Should -Not -Contain $script:CeilingMessage
-        Get-Unmet -Plain ($atCeiling + 'c') | Should -Contain $script:CeilingMessage
-    }
-
-    It 'refuses an all-lowercase password for want of an uppercase letter' {
-        # -notmatch would accept this: it is case-insensitive, so [A-Z] matches a lowercase letter.
-        Get-Unmet -Plain 'abcdefg1!' | Should -Contain 'at least one uppercase letter'
-    }
-
-    It 'refuses an all-uppercase password for want of a lowercase letter' {
-        Get-Unmet -Plain 'ABCDEFG1!' | Should -Contain 'at least one lowercase letter'
-    }
-
-    It 'names the digit requirement when there is no digit' {
-        Get-Unmet -Plain 'Abcdefgh!' | Should -Contain 'at least one digit'
-    }
-
-    It 'names the special-character requirement when every character is alphanumeric' {
-        Get-Unmet -Plain 'Abcdefg12' | Should -Contain 'at least one special character'
-    }
-
-    It 'does not accept a space as the special character' {
-        Get-Unmet -Plain 'Abcdefg1 ' | Should -Contain 'at least one special character'
-    }
-
-    It 'refuses a password of nothing but spaces on all four class rules and no other' {
-        # Named in the issue as untested. Spaces are printable ASCII and reach the floor, so this is
-        # the one input where every class rule fires while the length and ASCII rules pass.
-        $unmet = @(Get-Unmet -Plain (' ' * $script:PasswordFloor))
-        $unmet.Count | Should -Be 4
-        $unmet | Should -Not -Contain $script:FloorMessage
-        $unmet | Should -Not -Contain 'printable ASCII characters only'
-    }
-
-    It 'accepts a space inside an otherwise valid password' {
-        # Space is printable ASCII, so only the special-character rule refuses to count it.
-        @(Get-Unmet -Plain 'Ab 1!cde').Count | Should -Be 0
-    }
-
-    It 'refuses a password Windows would refuse as non-ASCII, for <Name>' -TestCases @(
-        @{ Name = 'a Cyrillic capital'; Code = 0x0416 }
-        @{ Name = 'an Arabic-Indic digit'; Code = 0x0665 }
-        @{ Name = 'an accented Latin letter'; Code = 0x00E9 }
-    ) {
-        # Built from code points so this file stays ASCII. Each of these satisfied the old negated
-        # class or \d and was then refused by BitLocker as non-printable ASCII (0x803100A4).
-        $unmet = @(Get-Unmet -Plain ('Abcdefg1!' + [char]$Code))
-        $unmet.Count | Should -Be 1
-        $unmet | Should -Contain 'printable ASCII characters only'
-    }
-
-    It 'refuses a control character, which is ASCII but not printable' {
-        Get-Unmet -Plain ('Abcdefg1!' + [char]9) | Should -Contain 'printable ASCII characters only'
-    }
-
-    It 'does not count a non-ASCII digit as the digit' {
-        # \d is Unicode in .NET, so it would take an Arabic-Indic five and call the rule met while
-        # BitLocker refuses the password outright. The class is [0-9] for that reason.
-        $unmet = @(Get-Unmet -Plain ('Abcdefg!' + [char]0x0665))
-        $unmet | Should -Contain 'at least one digit'
-        $unmet | Should -Contain 'printable ASCII characters only'
-    }
-
-    It 'counts only ASCII punctuation as the special character' {
-        # The old class counted any non-Latin letter; this one is the printable ASCII range less
-        # space and alphanumerics, so a Cyrillic capital no longer stands in for punctuation.
-        $unmet = @(Get-Unmet -Plain ('Abcdefg1' + [char]0x0416))
-        $unmet | Should -Contain 'at least one special character'
-    }
-
-    It 'names every unmet requirement at once rather than the first' {
-        @(Get-Unmet -Plain '').Count | Should -Be 5
-    }
-
-    It 'answers in the order the prompt lists the requirements' {
-        Get-Unmet -Plain '' | Should -Be @(
-            $script:FloorMessage
-            'at least one uppercase letter'
-            'at least one lowercase letter'
-            'at least one digit'
-            'at least one special character'
-        )
-    }
-
-    It 'takes the lengths from its arguments rather than from literals, <Name>' -TestCases @(
-        @{ Name = 'inside both'; Floor = 4; Ceiling = 64; Plain = 'Ab1!'; Met = $true }
-        @{ Name = 'under a raised floor'; Floor = 12; Ceiling = 64; Plain = 'Abcdefg1!'; Met = $false
-            Message = 'at least 12 characters' }
-        @{ Name = 'over a lowered ceiling'; Floor = 4; Ceiling = 8; Plain = 'Abcdefg1!'; Met = $false
-            Message = 'at most 8 characters' }
-    ) {
-        $unmet = @(Resolve-UnmetPasswordRequirement -Plain $Plain -MinimumLength $Floor -MaximumLength $Ceiling)
-        if ($Met) {
-            $unmet.Count | Should -Be 0
-        } else {
-            $unmet | Should -Contain $Message
-        }
     }
 }

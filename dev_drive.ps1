@@ -430,25 +430,78 @@ function Get-BitLockerAutoUnlockState {
     }
 }
 
+function Get-PolicyDwordValue {
+    <# One numeric policy value. Answers the number, $null where the key or the value is absent, and
+       'Unreadable' where the read failed or the value is of a type this cannot make sense of. #>
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Name)
+
+    try {
+        if (-not (Test-Path -Path $Path -ErrorAction Stop)) { return $null }
+        $key = Get-ItemProperty -Path $Path -ErrorAction Stop
+        if ($null -eq $key.PSObject.Properties[$Name]) { return $null }
+
+        # A value of another type is an answer this cannot read, not an answer of "not set".
+        $value = $key.$Name
+        if ($value -isnot [int] -and $value -isnot [long]) { return 'Unreadable' }
+        return [int]$value
+    }
+    catch {
+        return 'Unreadable'
+    }
+}
+
+function Get-FixedDrivePasswordPolicy {
+    <# What group policy demands of a fixed-drive BitLocker password; names from VolumeEncryption.admx.
+       NotSet means nothing is configured; Unknown that the read failed, the two branches disagree,
+       or a figure exists under a policy that is off - a run must never report Unknown as nothing. #>
+    param([string[]]$Paths = $script:FixedDrivePasswordPolicyPaths)
+
+    $unknown = [PSCustomObject]@{ MinimumLength = $null; Complexity = 'Unknown' }
+    $values = @{}
+    foreach ($name in 'FDVPassphrase', 'FDVPassphraseLength', 'FDVPassphraseComplexity') {
+        $found = $null
+        foreach ($path in $Paths) {
+            $read = Get-PolicyDwordValue -Path $path -Name $name
+            if ($read -eq 'Unreadable') { return $unknown }
+            if ($null -eq $read) { continue }
+            # Which branch BitLocker honours has not been established, so two that disagree are not
+            # an answer: saying nothing beats picking one of them and calling it the policy.
+            if ($null -ne $found -and $found -ne $read) { return $unknown }
+            $found = $read
+        }
+        $values[$name] = $found
+    }
+
+    # The two figures are elements of one policy and mean nothing while it is off. Figures present
+    # under a policy that is not on is not a state group policy produces, so it is not read as one.
+    if ($values['FDVPassphrase'] -ne 1) {
+        if ($null -ne $values['FDVPassphraseLength'] -or $null -ne $values['FDVPassphraseComplexity']) {
+            return $unknown
+        }
+        return [PSCustomObject]@{ MinimumLength = $null; Complexity = 'NotSet' }
+    }
+
+    $complexity = 'NotSet'
+    if ($null -ne $values['FDVPassphraseComplexity']) {
+        $complexity = switch ($values['FDVPassphraseComplexity']) {
+            0 { 'Allowed' }
+            1 { 'Required' }
+            2 { 'NotChecked' }
+            default { 'Unknown' }
+        }
+    }
+    return [PSCustomObject]@{ MinimumLength = $values['FDVPassphraseLength']; Complexity = $complexity }
+}
+
 function Get-FixedDriveWritePolicy {
     <# Reads FDVDenyWriteAccess where it takes effect, whatever channel delivered it. Absent means
        not set; Unknown means the read did not succeed, or answered something unreadable. #>
     param([string]$Path = $script:FixedDriveWritePolicyPath)
 
-    try {
-        if (-not (Test-Path -Path $Path -ErrorAction Stop)) { return 'Allow' }
-        $key = Get-ItemProperty -Path $Path -ErrorAction Stop
-        if ($null -eq $key.PSObject.Properties['FDVDenyWriteAccess']) { return 'Allow' }
-
-        # A value of another type is an answer this cannot read, not an answer of "not set".
-        $value = $key.FDVDenyWriteAccess
-        if ($value -isnot [int] -and $value -isnot [long]) { return 'Unknown' }
-        if ($value -eq 1) { return 'Deny' }
-        return 'Allow'
-    }
-    catch {
-        return 'Unknown'
-    }
+    $value = Get-PolicyDwordValue -Path $Path -Name 'FDVDenyWriteAccess'
+    if ($value -eq 'Unreadable') { return 'Unknown' }
+    if ($value -eq 1) { return 'Deny' }
+    return 'Allow'
 }
 
 function Resolve-WriteAccessPolicyAdvice {
@@ -487,7 +540,15 @@ function Resolve-BitLockerSetupPlan {
         [switch]$EntraJoined,
         [switch]$VhdxMode,
         [switch]$OsDriveProtected,
-        [ValidateSet('Deny', 'Allow', 'Unknown')][string]$WritePolicy = 'Allow'
+        [ValidateSet('Deny', 'Allow', 'Unknown')][string]$WritePolicy = 'Allow',
+        [int]$PolicyMinimumLength = 0,
+        [ValidateSet('Required', 'Allowed', 'NotChecked', 'NotSet', 'Unknown')]
+        [string]$PolicyComplexity = 'NotSet',
+        # BitLocker's own bounds for a fixed data drive, measured on an unmanaged machine: it refused
+        # 7 characters and 257, and took 8 and 256. Parameters, because a lifted function cannot see
+        # the body's constants, and these two numbers must exist in one place all the same.
+        [int]$PasswordFloor = 8,
+        [int]$PasswordCeiling = 256
     )
 
     $notes = @()
@@ -513,6 +574,27 @@ function Resolve-BitLockerSetupPlan {
         $notes += "The drive is still encrypted and still protected by its recovery key."
     }
 
+    # Said at the prompt, never enforced here: policy can raise the floor, nothing moves the ceiling,
+    # and complexity is checked only by a domain controller. The floor is clamped because the
+    # registry takes any number while BitLocker still refuses anything under its own.
+    $passwordNotes = @()
+    if ($VhdxMode) {
+        $floor = [math]::Max($PasswordFloor, $PolicyMinimumLength)
+        if ($PolicyComplexity -eq 'Unknown') {
+            $passwordNotes += "Windows takes at least $floor characters and at most $PasswordCeiling. This machine's policy could not be read, so it may ask for more."
+        } elseif ($floor -gt $PasswordFloor) {
+            $passwordNotes += "Group policy on this machine asks for at least $floor characters. Windows takes at most $PasswordCeiling."
+        } else {
+            $passwordNotes += "Windows takes at least $floor characters and at most $PasswordCeiling. Group policy can ask for more than $PasswordFloor."
+        }
+
+        if ($PolicyComplexity -eq 'Required') {
+            $passwordNotes += "Group policy requires it to meet the domain's complexity rules. Only a domain controller can check that, so where none can be reached the password is taken as typed."
+        } elseif ($PolicyComplexity -ne 'NotChecked' -and $DomainJoined) {
+            $passwordNotes += "A domain controller may also require it to meet the domain's complexity rules. Windows says so if it refuses one."
+        }
+    }
+
     # Kept as their own list so the run can repeat exactly these lines where the backup is skipped.
     $aadNotes = @()
     if ($EntraJoined) {
@@ -536,6 +618,7 @@ function Resolve-BitLockerSetupPlan {
         UseAadBackup          = [bool]$EntraJoined
         UseAutoUnlock         = [bool]$OsDriveProtected
         AadNotes              = $aadNotes
+        PasswordNotes         = $passwordNotes
         Notes                 = $notes
     }
 }
@@ -636,20 +719,18 @@ function Resolve-BitLockerFailure {
     <#
         Sorts a BitLocker error into the one kind the loop can retry on its own - a password the
         volume refused - and everything else, where the user has to choose what happens next.
-        CanRetry is false once the attempts are used up or the error cannot change on a retry.
+        CanRetry is false only when the error cannot change on a retry; nothing here counts attempts.
     #>
     param(
         [AllowEmptyString()][string]$Message,
         [Parameter(Mandatory)][int]$RetryCount,
-        [Parameter(Mandatory)][int]$MaxRetries,
         [ValidateSet('Encrypted', 'Clear', 'Unknown')][string]$VolumeState = 'Unknown',
         [int]$HResult = 0,
         [switch]$Unretryable,
         [switch]$PasswordAsked
     )
 
-    $exhausted = $RetryCount -ge $MaxRetries
-    $canRetry = -not $exhausted -and -not $Unretryable
+    $canRetry = -not $Unretryable
 
     # The number, not only the rendering of it: .NET puts the code in the message text too, but that
     # is one formatting choice away from being absent, and the exception carries it either way.
@@ -674,13 +755,13 @@ function Resolve-BitLockerFailure {
         # Quoted, not diagnosed: three of those four refusals are about something else.
         $lines = @("BitLocker did not accept that password. Windows reported: $Message")
         if ($canRetry) {
-            $lines += "Please try a different password. Attempt $RetryCount of $MaxRetries."
+            $lines += "Attempt $RetryCount. Please try a different password."
         } else {
             # The run ends here, so it must say what the drive is, as every other failure path does.
-            $lines += "Maximum retry attempts reached. BitLocker setup failed."
+            $lines += "This refusal will not change on a retry, so BitLocker setup stops here."
             $lines += Format-DevDriveStateAfterFailure -VolumeState $VolumeState -RunEnding
         }
-        return [PSCustomObject]@{ Kind = 'Password'; Exhausted = $exhausted; CanRetry = $canRetry; Lines = $lines }
+        return [PSCustomObject]@{ Kind = 'Password'; CanRetry = $canRetry; Lines = $lines }
     }
 
     $lines = @("BitLocker setup did not finish. Windows reported: $Message")
@@ -691,7 +772,7 @@ function Resolve-BitLockerFailure {
     }
     $lines += Format-DevDriveStateAfterFailure -VolumeState $VolumeState
 
-    return [PSCustomObject]@{ Kind = 'Other'; Exhausted = $exhausted; CanRetry = $canRetry; Lines = $lines }
+    return [PSCustomObject]@{ Kind = 'Other'; CanRetry = $canRetry; Lines = $lines }
 }
 
 function Resolve-BitLockerAdProtectorNeed {
@@ -1920,71 +2001,6 @@ function Request-DevDriveSizeGB {
     }
 }
 
-function Resolve-UnmetPasswordRequirement {
-    <# Answers the requirements this password does not meet, in the order the prompt lists them, and
-       nothing when it meets them all. The ceiling and the ASCII rule are BitLocker's own refusals;
-       the floor and the four classes are this script's, and are stricter than its default policy. #>
-    param(
-        [Parameter(Mandatory)][AllowEmptyString()][string]$Plain,
-        [Parameter(Mandatory)][int]$MinimumLength,
-        [Parameter(Mandatory)][int]$MaximumLength
-    )
-
-    # IsMatch throughout, never -match or -notmatch: those are case-insensitive, which is how [A-Z]
-    # came to accept a lowercase letter, and they leave what they matched in $Matches - for the ASCII
-    # pattern that is the whole password. Classes are spelled out in ASCII because \d and a negated
-    # class both reach past it, and BitLocker refuses anything outside printable ASCII (0x803100A4).
-    $unmet = @()
-    if ($Plain.Length -lt $MinimumLength) { $unmet += "at least $MinimumLength characters" }
-    if ($Plain.Length -gt $MaximumLength) { $unmet += "at most $MaximumLength characters" }
-    if (-not [regex]::IsMatch($Plain, '\A[\x20-\x7E]*\z')) { $unmet += "printable ASCII characters only" }
-    if (-not [regex]::IsMatch($Plain, '[A-Z]')) { $unmet += "at least one uppercase letter" }
-    if (-not [regex]::IsMatch($Plain, '[a-z]')) { $unmet += "at least one lowercase letter" }
-    if (-not [regex]::IsMatch($Plain, '[0-9]')) { $unmet += "at least one digit" }
-    # Printable ASCII less space and alphanumerics.
-    if (-not [regex]::IsMatch($Plain, '[\x21-\x2F\x3A-\x40\x5B-\x60\x7B-\x7E]')) { $unmet += "at least one special character" }
-    return $unmet
-}
-
-function Request-StrongPassword {
-    <# Prompts until the password meets every requirement, then answers it as a SecureString. The
-       pointer is freed in a finally: a throw in between would leave the plaintext in unmanaged
-       memory for the life of the process. #>
-    param(
-        [Parameter(Mandatory)][int]$MinimumLength,
-        [Parameter(Mandatory)][int]$MaximumLength
-    )
-
-    while ($true) {
-        $secure = Read-Host "Enter password ($MinimumLength-$MaximumLength printable ASCII chars, incl. upper, lower, digit, special)" -AsSecureString
-        # Outside the try: inside it, a throw from this call would hand the finally a stale pointer.
-        $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
-        try {
-            # PtrToStringBSTR takes the length from the BSTR prefix; the Auto form stops at a null.
-            $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
-            # @(): an empty array arrives from a function as $null, and .Count on it throws here.
-            $unmet = @(Resolve-UnmetPasswordRequirement -Plain $plain `
-                    -MinimumLength $MinimumLength -MaximumLength $MaximumLength)
-        }
-        finally {
-            # Erases the unmanaged copy. $plain is a .NET string, so it can only be released.
-            [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
-            $plain = $null
-        }
-
-        if ($unmet.Count -eq 0) {
-            return $secure
-        }
-
-        # The refused attempt is encrypted rather than plaintext, but nothing needs it after this.
-        $secure.Dispose()
-        Write-Host "Password does not meet the following requirement(s):" -ForegroundColor Red
-        foreach ($requirement in $unmet) {
-            Write-Host " - $requirement" -ForegroundColor Yellow
-        }
-    }
-}
-
 function Get-DiskPartitionStyleName {
     <# The partition style Windows reports for a disk, or an empty string when it reports none. #>
     param([Parameter(Mandatory)]$Disk)
@@ -2436,18 +2452,19 @@ $SupportedPartitionStyles = @('GPT', 'MBR')
 # was empty on the machine that reported this, so the effective path is the one to read.
 $FixedDriveWritePolicyPath = 'HKLM:\SYSTEM\CurrentControlSet\Policies\Microsoft\FVE'
 
+# Both branches, because which one BitLocker reads has not been seen: the admx names the first, the
+# second is the constant above, where write access was found taking effect.
+$FixedDrivePasswordPolicyPaths = @(
+    'HKLM:\SOFTWARE\Policies\Microsoft\FVE'
+    $FixedDriveWritePolicyPath
+)
+
 # The name offered on the Enter key.
 $DevDriveDefaultLabel = "DevDrive"
 
 # This script's own cap, at the long-standing NTFS label length: Microsoft documents none for
 # Format-Volume -NewFileSystemLabel, so there is nothing to cite and nothing to read off a volume.
 $DevDriveLabelMaxLength = 32
-
-# This script's own floor for the BitLocker password; Windows applies its own policy afterwards.
-$PasswordMinLength = 8
-
-# BitLocker's own ceiling, from the refusal it answers past it: 0x803100AA, "over 256 characters".
-$PasswordMaxLength = 256
 
 # Head-room kept on the volume hosting a fixed size .vhdx, so it is never filled to the last byte.
 $VhdxHostSpareBytes = 1GB
@@ -2722,8 +2739,11 @@ if ($enableBitLocker) {
         $osDriveProtected = $false
     }
 
+    # Read before the plan: it only decides what the password prompt will say.
+    $passwordPolicy = Get-FixedDrivePasswordPolicy
     $bitLockerPlan = Resolve-BitLockerSetupPlan -DomainJoined:$isDomainJoined -EntraJoined:$isEntraJoined `
-        -VhdxMode:($mode -eq "Vhdx") -OsDriveProtected:$osDriveProtected -WritePolicy $WritePolicy
+        -VhdxMode:($mode -eq "Vhdx") -OsDriveProtected:$osDriveProtected -WritePolicy $WritePolicy `
+        -PolicyMinimumLength ([int]$passwordPolicy.MinimumLength) -PolicyComplexity $passwordPolicy.Complexity
 }
 
 # Ask about deduplication
@@ -2975,14 +2995,18 @@ try {
         $bitLockerSuccess = $false
         $bitLockerAbandoned = $false
         $SecurePassword = $null
-        $retryCount = 0
-        $maxRetries = 10
+        # Counted only to number the attempts on screen; nothing here stops after so many.
+        $passwordAttempt = 0
         $keyBannerRule = "=" * 64
         $keyAcknowledgement = "YES"
 
-        while (-not $bitLockerSuccess -and -not $bitLockerAbandoned -and $retryCount -lt $maxRetries) {
+        while (-not $bitLockerSuccess -and -not $bitLockerAbandoned) {
             # A rejection that a second read of the same volume would repeat is not worth retrying.
             $unretryable = $false
+            # Per pass, not per run: the prompt below is skipped once the volume already carries a
+            # password protector, and a loop with no ceiling must never call a failure retryable
+            # when nothing on the path back asks a person for anything.
+            $askedThisPass = $false
             try {
                 Write-Host "Reading the current BitLocker protectors of $devLetterColon" -ForegroundColor Green
                 $bitlocker_volume = Get-BitLockerVolume -MountPoint $devLetterColon -ErrorAction Stop
@@ -2993,11 +3017,16 @@ try {
                 }
 
                 if ($bitLockerPlan.UsePasswordProtector -and $protectorPlan.TypesToAdd -contains 'Password') {
-                    Write-Host "Enter BitLocker password for the new volume. It must be a complex one." -ForegroundColor Yellow
+                    Write-Host "Enter a BitLocker password for the new volume." -ForegroundColor Yellow
+                    foreach ($note in $bitLockerPlan.PasswordNotes) {
+                        Write-Host $note -ForegroundColor Gray
+                    }
                     # The retry loop comes back here, so the attempt BitLocker refused goes first.
                     if ($SecurePassword) { $SecurePassword.Dispose() }
-                    $SecurePassword = Request-StrongPassword -MinimumLength $PasswordMinLength `
-                        -MaximumLength $PasswordMaxLength
+                    # Straight from Read-Host to BitLocker: no plaintext copy, and BitLocker alone judges it.
+                    $SecurePassword = Read-Host 'Password' -AsSecureString
+                    $askedThisPass = $true
+                    $passwordAttempt++
                     Write-Host "Adding BitLockerKeyProtector PasswordProtector" -ForegroundColor Green
                     Add-BitLockerKeyProtector -MountPoint $devLetterColon -PasswordProtector -Password $SecurePassword -ErrorAction Stop
                 }
@@ -3100,12 +3129,10 @@ try {
             }
             catch {
                 $failure = $_
-                $retryCount++
                 $failureState = (Get-BitLockerProtectionState -MountPoint $devLetterColon).Label
-                $passwordAsked = $bitLockerPlan.UsePasswordProtector
-                $verdict = Resolve-BitLockerFailure -Message $failure.Exception.Message -RetryCount $retryCount `
-                    -MaxRetries $maxRetries -VolumeState $failureState -HResult $failure.Exception.HResult `
-                    -Unretryable:$unretryable -PasswordAsked:$passwordAsked
+                $verdict = Resolve-BitLockerFailure -Message $failure.Exception.Message -RetryCount $passwordAttempt `
+                    -VolumeState $failureState -HResult $failure.Exception.HResult `
+                    -Unretryable:$unretryable -PasswordAsked:$askedThisPass
                 foreach ($line in $verdict.Lines) {
                     Write-Host $line -ForegroundColor Red
                 }
@@ -3113,7 +3140,10 @@ try {
                 if ($verdict.Kind -eq 'Password' -and $verdict.CanRetry) {
                     Write-Host ""
                 } elseif ($verdict.Kind -eq 'Password' -and -not $verdict.CanRetry) {
-                    throw "BitLocker did not accept the password after $retryCount attempts."
+                    # Defensive: nothing in this file currently sets Unretryable on a message that
+                    # also carries a password code, so this is unreachable. Kept because dropping it
+                    # would make the branch above assume no password refusal can ever be final.
+                    throw "BitLocker refused the password for a reason a retry cannot change."
                 } else {
                     # The drive already exists, so this must not end the run unless the user says so.
                     $canRetry = $verdict.CanRetry
@@ -3127,7 +3157,7 @@ try {
             }
         }
 
-        # Reached whether the user chose to carry on or the attempts ran out; the drive exists either way.
+        # Reached when the user chose to carry on; the drive exists either way.
         if (-not $bitLockerSuccess) {
             $abandonedState = (Get-BitLockerProtectionState -MountPoint $devLetterColon).Label
             foreach ($line in (Resolve-BitLockerAbandonedAdvice -MountPoint $devLetterColon -VolumeState $abandonedState)) {
