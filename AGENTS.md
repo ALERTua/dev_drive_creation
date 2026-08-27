@@ -49,7 +49,7 @@ Two consequences:
 - **Comments**: about one line. Docstrings one to three. A comment states the constraint, not the
   obvious.
 - **Never report success from an exit code alone.** Read the state back and report what it says: the
-  BitLocker recovery key is read off the volume, the trusted designation with `fsutil devdrv query`,
+  BitLocker recovery key is read off the volume, the trusted designation off the volume's own flags,
   writability by writing a file, the deduplication settings with `Get-ReFSDedupSchedule`.
 - **Never print a value the user did not choose.** A default assigned before a question is asked
   ends up displayed as a setting somebody made. Leave it unset.
@@ -63,6 +63,11 @@ Two consequences:
   resource, so an English phrase cannot be matched on a localized Windows: report what it said
   rather than judging it. Values from .NET are safe — enum member names are compiled identifiers —
   but rendering any value to text uses the machine's regional settings.
+- **The Dev Drive designation is the exception, because it is not text.** `FSCTL_QUERY_PERSISTENT_VOLUME_STATE`
+  answers `PERSISTENT_VOLUME_STATE_DEV_VOLUME` and `PERSISTENT_VOLUME_STATE_TRUSTED_VOLUME`, which
+  follow `fsutil devdrv trust` and `untrust` exactly and read the same in every language. `fsutil`
+  output is read only where that call itself fails. Its exit code is worthless: `fsutil devdrv query`
+  exits 0 for a trusted volume, an untrusted one and plain NTFS alike.
 - **A ReFS deduplication task is named after its volume.** `Set-ReFSDedupSchedule` registers it under
   `\Microsoft\Windows\ReFsDedupSvc\` as the volume's `UniqueId` GUID, braced and upper case; the scrub
   task adds `-Scrub`. Measured on three volumes across separate disks, one of them on an MBR disk.
