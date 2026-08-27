@@ -747,6 +747,17 @@ Describe 'The script itself' {
         $formatAt | Should -BeGreaterThan $planAt
     }
 
+    It 'tells the name question which mode the run is in, rather than deciding for it' {
+        # The extra line belongs to virtual disk mode, and the body is the only thing that knows.
+        $call = @($script:Ast.FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.CommandAst] -and
+                    $node.GetCommandName() -eq 'Request-DevDriveLabel'
+                }, $true))
+        $call.Count | Should -Be 1
+        $call[0].Extent.Text | Should -Match '-VhdxMode:\(\$mode -eq "Vhdx"\)'
+    }
+
     It 'reads the name back off the volume instead of reporting the one it sent' {
         $content = Get-Content -Path $script:ScriptPath -Raw
         $formatAt = $content.IndexOf('Format-Volume -DriveLetter $devLetter')
@@ -1832,6 +1843,30 @@ Describe 'Request-DevDriveLabel' {
         Request-DevDriveLabel -Default 'DevDrive' -MaxLength 32 | Should -Be 'DevDrive'
     }
 
+    It 'shows what a name looks like, rather than only describing one' {
+        # The question already said what the name is for, and was still answered with a file name.
+        Mock Read-Host { '' }
+        Request-DevDriveLabel -Default 'DevDrive' -MaxLength 32 | Out-Null
+        Should -Invoke Write-Host -ParameterFilter { $Object -match 'like "Projects \(D:\)"' }
+    }
+
+    It 'quotes the name the Enter key gives, so it does not run into the sentence' {
+        Mock Read-Host { '' }
+        Request-DevDriveLabel -Default 'Projects' -MaxLength 32 | Out-Null
+        Should -Invoke Read-Host -ParameterFilter { $Prompt -match 'press Enter for "Projects"' }
+    }
+
+    It 'says the name is not the file name only where a file was named, in <Mode>' -TestCases @(
+        @{ Mode = 'virtual disk mode'; Vhdx = $true; Expected = 1 }
+        @{ Mode = 'the other modes'; Vhdx = $false; Expected = 0 }
+    ) {
+        # In the other two modes no .vhdx exists in the run at all, so mentioning one invents it.
+        Mock Read-Host { '' }
+        Request-DevDriveLabel -Default 'DevDrive' -MaxLength 32 -VhdxMode:$Vhdx | Out-Null
+        Should -Invoke Write-Host -Times $Expected -Exactly `
+            -ParameterFilter { $Object -match 'not the file name' }
+    }
+
     It 'keeps asking until the answer is one the file system can take' {
         $script:answers = @('Dev:Drive', ('a' * 40), "bad`0name", 'Projects')
         $script:index = 0
@@ -1883,7 +1918,7 @@ Describe 'Request-DevDriveLabel' {
     It 'offers the name on the Enter key in the prompt itself' {
         Mock Read-Host { param($Prompt) $script:asked = $Prompt; return '' }
         Request-DevDriveLabel -Default 'MyDrive' -MaxLength 32 | Out-Null
-        $script:asked | Should -Match 'press Enter for MyDrive'
+        $script:asked | Should -Match 'press Enter for "MyDrive"'
     }
 }
 

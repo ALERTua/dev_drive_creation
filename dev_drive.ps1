@@ -1863,13 +1863,19 @@ function Request-DevDriveLabel {
     <# The name the volume will carry. Enter keeps the one offered, as every other prompt here does. #>
     param(
         [Parameter(Mandatory)][string]$Default,
-        [int]$MaxLength = $script:DevDriveLabelMaxLength
+        [int]$MaxLength = $script:DevDriveLabelMaxLength,
+        [switch]$VhdxMode
     )
 
-    Write-Host "`nThe Dev Drive carries a name, which is what File Explorer shows beside its letter." -ForegroundColor Cyan
+    Write-Host "`nThe Dev Drive carries a name, which is what File Explorer shows beside its letter, like `"Projects (D:)`"." -ForegroundColor Cyan
+    if ($VhdxMode) {
+        # Only here: this question follows the one that asked for a file path, and was answered with
+        # it. In the other modes no .vhdx exists, so naming one would invent it.
+        Write-Host "This is not the file name; the `".vhdx`" keeps the name you gave it." -ForegroundColor Cyan
+    }
 
     while ($true) {
-        $answer = Read-Host "Enter a name for the Dev Drive, or press Enter for $Default"
+        $answer = Read-Host "Enter a name for the Dev Drive, or press Enter for `"$Default`""
         $verdict = Resolve-DevDriveLabelInput -Answer $answer -Default $Default -MaxLength $MaxLength
 
         if ($verdict.Rejection -eq 'TooLong') {
@@ -2699,7 +2705,8 @@ if ($mode -eq "FreeSpace") {
 }
 
 # Asked here rather than in each mode: the name is the same question whatever created the volume.
-$DevDriveLabel = Request-DevDriveLabel -Default $DevDriveDefaultLabel -MaxLength $DevDriveLabelMaxLength
+$DevDriveLabel = Request-DevDriveLabel -Default $DevDriveDefaultLabel -MaxLength $DevDriveLabelMaxLength `
+    -VhdxMode:($mode -eq "Vhdx")
 
 # Read before the question, not after: on a machine with this setting the answer is not a preference.
 $WritePolicy = Get-FixedDriveWritePolicy
