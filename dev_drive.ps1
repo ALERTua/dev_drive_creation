@@ -134,6 +134,133 @@ namespace DevDriveInterop
 '@
 }
 
+function Initialize-VolumeStateInterop {
+    <#
+        FSCTL_QUERY_PERSISTENT_VOLUME_STATE, the one reading of the Dev Drive designation that is not
+        localized text. Control code, structure and flags come from winioctl.h.
+    #>
+    if (([System.Management.Automation.PSTypeName]'DevDriveInterop.PersistentVolume').Type) {
+        return
+    }
+
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+
+namespace DevDriveInterop
+{
+    [StructLayout(LayoutKind.Sequential)]
+    public struct FILE_FS_PERSISTENT_VOLUME_INFORMATION
+    {
+        public UInt32 VolumeFlags;
+        public UInt32 FlagMask;
+        public UInt32 Version;
+        public UInt32 Reserved;
+    }
+
+    public static class PersistentVolume
+    {
+        // CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 143, METHOD_BUFFERED, FILE_ANY_ACCESS). 142 is the write.
+        public const UInt32 FSCTL_QUERY_PERSISTENT_VOLUME_STATE = 0x0009023C;
+        public const UInt32 PERSISTENT_VOLUME_STATE_DEV_VOLUME = 0x00002000;
+        public const UInt32 PERSISTENT_VOLUME_STATE_TRUSTED_VOLUME = 0x00004000;
+
+        private const UInt32 FILE_SHARE_READ_WRITE = 0x00000003;
+        private const UInt32 OPEN_EXISTING = 3;
+        private const UInt32 FILE_FLAG_BACKUP_SEMANTICS = 0x02000000;
+        private const Int32 ERROR_GEN_FAILURE = 31;
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern SafeFileHandle CreateFileW(string Path, UInt32 Access, UInt32 Share,
+            IntPtr Security, UInt32 Disposition, UInt32 Flags, IntPtr Template);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool DeviceIoControl(SafeFileHandle Handle, UInt32 Code,
+            ref FILE_FS_PERSISTENT_VOLUME_INFORMATION Input, UInt32 InputSize,
+            ref FILE_FS_PERSISTENT_VOLUME_INFORMATION Output, UInt32 OutputSize,
+            out UInt32 Returned, IntPtr Overlapped);
+
+        // True with the volume's flags in Flags, false with the Win32 error in Error.
+        public static bool TryQuery(string RootPath, out UInt32 Flags, out Int32 Error)
+        {
+            Flags = 0;
+            Error = 0;
+            // The root directory, opened for no access: the raw device refuses this control code.
+            using (SafeFileHandle handle = CreateFileW(RootPath, 0, FILE_SHARE_READ_WRITE,
+                       IntPtr.Zero, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, IntPtr.Zero))
+            {
+                if (handle.IsInvalid)
+                {
+                    Error = LastError();
+                    return false;
+                }
+
+                FILE_FS_PERSISTENT_VOLUME_INFORMATION data = new FILE_FS_PERSISTENT_VOLUME_INFORMATION();
+                // Every bit: a file system refuses a mask naming flags it does not know.
+                data.FlagMask = 0xFFFFFFFF;
+                data.Version = 1;
+                UInt32 size = (UInt32)Marshal.SizeOf(typeof(FILE_FS_PERSISTENT_VOLUME_INFORMATION));
+                UInt32 returned;
+                if (!DeviceIoControl(handle, FSCTL_QUERY_PERSISTENT_VOLUME_STATE,
+                        ref data, size, ref data, size, out returned, IntPtr.Zero))
+                {
+                    Error = LastError();
+                    return false;
+                }
+
+                // A short answer leaves VolumeFlags at what went in, which would read as no flags.
+                if (returned < size)
+                {
+                    Error = ERROR_GEN_FAILURE;
+                    return false;
+                }
+
+                Flags = data.VolumeFlags;
+                return true;
+            }
+        }
+
+        // A failure that left no last error still has to read as a failure.
+        private static Int32 LastError()
+        {
+            Int32 code = Marshal.GetLastWin32Error();
+            return code != 0 ? code : ERROR_GEN_FAILURE;
+        }
+    }
+}
+'@
+}
+
+function Get-VolumeDevDriveState {
+    <#
+        Whether a volume is a Dev Drive and whether it is trusted, read as flags rather than as
+        localized text. Queried is false where the volume could not be asked, and Reason says why.
+    #>
+    param([Parameter(Mandatory)][string]$DriveLetter)
+
+    $flags = [uint32]0
+    $win32Error = 0
+    try {
+        Initialize-VolumeStateInterop
+        $answered = [DevDriveInterop.PersistentVolume]::TryQuery("\\?\${DriveLetter}:\", [ref]$flags, [ref]$win32Error)
+    }
+    catch {
+        return [PSCustomObject]@{ Queried = $false; IsDevDrive = $null; IsTrusted = $null; Reason = $_.Exception.Message }
+    }
+
+    if (-not $answered) {
+        return [PSCustomObject]@{ Queried = $false; IsDevDrive = $null; IsTrusted = $null; Reason = (Get-Win32ErrorText -Code $win32Error) }
+    }
+
+    return [PSCustomObject]@{
+        Queried    = $true
+        IsDevDrive = ($flags -band [DevDriveInterop.PersistentVolume]::PERSISTENT_VOLUME_STATE_DEV_VOLUME) -ne 0
+        IsTrusted  = ($flags -band [DevDriveInterop.PersistentVolume]::PERSISTENT_VOLUME_STATE_TRUSTED_VOLUME) -ne 0
+        Reason     = ''
+    }
+}
+
 function Get-VhdxStorageType {
     $storageType = New-Object DevDriveInterop.VIRTUAL_STORAGE_TYPE
     $storageType.DeviceId = [DevDriveInterop.VirtDisk]::VIRTUAL_STORAGE_TYPE_DEVICE_VHDX
@@ -866,47 +993,59 @@ function Resolve-BitLockerAutoUnlockReport {
 
 function Resolve-DevDriveTrustReport {
     <#
-        What to say after marking a volume trusted. Only fsutil's own words answer whether it is:
-        measured, the exit code is 0 for every real volume, the persistent volume flags read back
-        as zero, and no CIM property carries it. Those words are localized, so an answer this
-        script cannot read is shown, never judged.
+        What to say after marking a volume trusted. The volume's own flags answer it in any language;
+        fsutil's localized text is read only where those flags could not be.
     #>
     param(
         [Parameter(Mandatory)][string]$MountPoint,
         [Parameter(Mandatory)][int]$TrustExitCode,
-        [AllowNull()][AllowEmptyString()][string]$QueryOutput
+        [AllowNull()][AllowEmptyString()][string]$QueryOutput,
+        [AllowNull()][PSObject]$DevDriveState
     )
 
-    if ($TrustExitCode -eq 0 -and $QueryOutput -match '(?im)^\s*This is a trusted developer volume') {
+    if ($null -ne $DevDriveState -and $DevDriveState.Queried) {
+        # The Dev Drive bit is asked first: without it the trusted bit describes nothing this run made.
+        if (-not $DevDriveState.IsDevDrive) {
+            return [PSCustomObject]@{
+                Outcome = 'NotDevDrive'
+                Lines   = @(
+                    "$MountPoint does not carry the Dev Drive designation, although it was formatted as one.",
+                    "Nothing that depends on that designation applies, Defender performance mode included.")
+            }
+        }
+
+        if ($DevDriveState.IsTrusted) {
+            return [PSCustomObject]@{
+                Outcome = 'Trusted'
+                Lines   = @("Dev Drive $MountPoint carries the trusted designation, which is the signal for Microsoft Defender to run in performance mode.")
+            }
+        }
+
         return [PSCustomObject]@{
-            Outcome = 'Trusted'
-            Lines   = @("Dev Drive $MountPoint reports itself trusted, which is the signal for Microsoft Defender to run in performance mode.")
+            Outcome = 'Untrusted'
+            Lines   = @(
+                "$MountPoint is a Dev Drive, but the volume does not carry the trusted designation.",
+                "It still works; anti-virus filters stay attached to it.",
+                "Retry by hand with: fsutil devdrv trust /f $MountPoint")
         }
     }
 
+    # Reached only where the volume refused the question, so nothing below is a verdict.
     $said = @($QueryOutput -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-
-    if ($TrustExitCode -eq 0) {
-        # This is what a successful run looks like on a Windows that is not in English, so it must
-        # not read as a fault. Nothing else on the machine can be asked instead - see the notes on
-        # the English phrase above.
-        $lines = @("Marked $MountPoint as trusted. Reading it back only works in English, and this machine answers in its own language, so the run cannot confirm it here.")
-        $lines += "fsutil devdrv query $MountPoint said:"
-        $lines += if ($said.Count -gt 0) { $said | ForEach-Object { "  $($_.Trim())" } } else { "  (nothing)" }
-        $lines += "If that says the volume is a trusted developer volume, everything is as it should be."
-        return [PSCustomObject]@{ Outcome = 'Unconfirmed'; Lines = $lines }
+    $reason = if ($null -ne $DevDriveState -and $DevDriveState.Reason) { ": $($DevDriveState.Reason)" } else { '.' }
+    $lines = @("Could not read the Dev Drive designation off $MountPoint$reason")
+    if ($TrustExitCode -ne 0) {
+        $lines += "fsutil devdrv trust returned exit code $TrustExitCode, which says nothing about the designation either."
     }
-
-    $lines = @("Could not mark $MountPoint as trusted (fsutil exited with code $TrustExitCode).")
     if ($said.Count -gt 0) {
         $lines += "fsutil devdrv query $MountPoint said:"
         $lines += $said | ForEach-Object { "  $($_.Trim())" }
+        $lines += "That answer is in this machine's language, so judge it yourself: this run cannot."
     } else {
-        $lines += "fsutil devdrv query $MountPoint said nothing."
+        $lines += "fsutil devdrv query $MountPoint said nothing either."
     }
-    $lines += "The Dev Drive will still work, but without the Defender performance mode trust enables."
     $lines += "Retry by hand with: fsutil devdrv trust /f $MountPoint"
-    return [PSCustomObject]@{ Outcome = 'Failed'; Lines = $lines }
+    return [PSCustomObject]@{ Outcome = 'Unconfirmed'; Lines = $lines }
 }
 
 function Test-RecoveryKeyAcknowledged {
@@ -2970,14 +3109,20 @@ try {
     Write-Host "Marking Dev Drive $devLetterColon as trusted for Defender performance" -ForegroundColor Green
     # /f: the designation lands through a dismount, which fsutil skips on a volume in use.
     fsutil devdrv trust /f "$devLetterColon" | Out-Null
-    # fsutil does not throw, so take its exit code before the query overwrites $LASTEXITCODE.
+    # fsutil does not throw, so take its exit code before anything else overwrites $LASTEXITCODE.
     $trustExitCode = $LASTEXITCODE
-    # Cast each record to a string first: on Windows PowerShell a redirected stderr line is an
-    # ErrorRecord, and Out-String would render it as a whole error display instead of its text.
-    $trustQuery = (fsutil devdrv query "$devLetterColon" 2>&1 | ForEach-Object { "$_" } | Out-String)
-    $trustReport = Resolve-DevDriveTrustReport -MountPoint $devLetterColon -TrustExitCode $trustExitCode -QueryOutput $trustQuery
-    # Grey, not yellow, for an answer that could not be read: on a localized Windows that is every run.
-    $trustColour = switch ($trustReport.Outcome) { 'Trusted' { 'Green' } 'Unconfirmed' { 'Gray' } default { 'Yellow' } }
+    # The volume's own flags, which read the same in every language.
+    $devDriveState = Get-VolumeDevDriveState -DriveLetter $devLetter
+    $trustQuery = ''
+    if (-not $devDriveState.Queried) {
+        # Cast each record to a string first: on Windows PowerShell a redirected stderr line is an
+        # ErrorRecord, and Out-String would render it as a whole error display instead of its text.
+        $trustQuery = (fsutil devdrv query "$devLetterColon" 2>&1 | ForEach-Object { "$_" } | Out-String)
+    }
+    $trustReport = Resolve-DevDriveTrustReport -MountPoint $devLetterColon -TrustExitCode $trustExitCode `
+        -QueryOutput $trustQuery -DevDriveState $devDriveState
+    # Grey, not yellow, for an answer that could not be read at all.
+    $trustColour = switch ($trustReport.Outcome) { 'Trusted' { 'Green' } 'Unconfirmed' { 'Gray' } 'NotDevDrive' { 'Red' } default { 'Yellow' } }
     foreach ($line in $trustReport.Lines) {
         Write-Host $line -ForegroundColor $trustColour
     }
@@ -3338,7 +3483,11 @@ try {
         Write-Host "Skipping deduplication as requested." -ForegroundColor Yellow
     }
 
-    Write-Host "All done. Dev Drive $devLetterColon ready." -ForegroundColor Green
+    if ($trustReport.Outcome -eq 'NotDevDrive') {
+        Write-Host "Done, but $devLetterColon does not carry the Dev Drive designation. See above." -ForegroundColor Red
+    } else {
+        Write-Host "All done. Dev Drive $devLetterColon ready." -ForegroundColor Green
+    }
     if (-not $VhdxAtBootGranted -and $VhdxMountAdvice) {
         Write-Host ""
         foreach ($line in $VhdxMountAdvice) {

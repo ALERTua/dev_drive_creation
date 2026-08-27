@@ -109,7 +109,7 @@ Are you ready to proceed with Dev Drive creation? (yes/no):
 
 The plan says what will happen on *this* machine, not what usually happens: the BitLocker lines name what this machine can actually carry, and the schedule lines name the times you settled on.
 
-After the drive exists, every setting is read back off the volume and reported - the trusted designation with `fsutil devdrv query`, the name and the deduplication settings from the volume itself - rather than assumed from commands that did not complain. The run ends by triggering a first optimization job and tells you to let it finish; it can take a while, and closing the window early leaves the drive unoptimized.
+After the drive exists, every setting is read back off the volume and reported - the trusted designation off the volume's own flags, the name and the deduplication settings from the volume itself - rather than assumed from commands that did not complain. The run ends by triggering a first optimization job and tells you to let it finish; it can take a while, and closing the window early leaves the drive unoptimized.
 
 ## Caveats
 

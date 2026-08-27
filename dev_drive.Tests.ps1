@@ -364,14 +364,40 @@ Describe 'The script itself' {
         $content | Should -Match '(?ms)fsutil devdrv trust /f "\$devLetterColon" \| Out-Null(?:\s*\r?\n\s*#[^\r\n]*)*\s*\r?\n\s*\$trustExitCode = \$LASTEXITCODE'
     }
 
-    It 'asks the volume for its trust state as well as reading the exit code' {
+    It 'reads the volume flags after marking it trusted, never before' {
         $content = Get-Content -Path $script:ScriptPath -Raw
-        $codeAt = $content.IndexOf('$trustExitCode = $LASTEXITCODE')
-        $queryAt = $content.IndexOf('$trustQuery = (fsutil devdrv query')
+        $trustAt = $content.IndexOf('fsutil devdrv trust /f "$devLetterColon"')
+        $stateAt = $content.IndexOf('$devDriveState = Get-VolumeDevDriveState')
         $reportAt = $content.IndexOf('$trustReport = Resolve-DevDriveTrustReport')
-        $codeAt | Should -BeGreaterThan 0
-        $queryAt | Should -BeGreaterThan $codeAt
-        $reportAt | Should -BeGreaterThan $queryAt
+        $trustAt | Should -BeGreaterThan 0
+        $stateAt | Should -BeGreaterThan $trustAt
+        $reportAt | Should -BeGreaterThan $stateAt
+    }
+
+    It 'hands the report the volume flags, not only what fsutil printed' {
+        $call = @($script:Ast.FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.CommandAst] -and
+                    $node.GetCommandName() -eq 'Resolve-DevDriveTrustReport'
+                }, $true))
+        $call.Count | Should -Be 1
+        $call[0].Extent.Text | Should -Match '-DevDriveState \$devDriveState'
+    }
+
+    It 'asks fsutil for text only where the flags could not be read' {
+        $guards = @($script:Ast.FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.IfStatementAst] -and
+                    $node.Clauses[0].Item1.Extent.Text -match '-not \$devDriveState\.Queried'
+                }, $true))
+        $guards.Count | Should -Be 1
+        $guards[0].Clauses[0].Item2.Extent.Text | Should -Match 'fsutil devdrv query'
+    }
+
+    It 'does not call the run done on a volume that is not a Dev Drive' {
+        # Two halves of one message disagreeing is the defect this whole path exists to avoid.
+        $content = Get-Content -Path $script:ScriptPath -Raw
+        $content | Should -Match "(?ms)if \(\`$trustReport\.Outcome -eq 'NotDevDrive'\) \{.{0,300}?All done\. Dev Drive"
     }
 
     It 'asks the volume what it stored after the daily schedule and before the weekly one' {
@@ -394,7 +420,7 @@ Describe 'The script itself' {
 
     It 'colours the trust lines by the outcome, so only a real failure is printed as one' {
         $content = Get-Content -Path $script:ScriptPath -Raw
-        $content | Should -Match "switch \(\`$trustReport\.Outcome\) \{ 'Trusted' \{ 'Green' \} 'Unconfirmed' \{ 'Gray' \} default \{ 'Yellow' \} \}"
+        $content | Should -Match "switch \(\`$trustReport\.Outcome\) \{ 'Trusted' \{ 'Green' \} 'Unconfirmed' \{ 'Gray' \} 'NotDevDrive' \{ 'Red' \} default \{ 'Yellow' \} \}"
         $content | Should -Match '(?ms)foreach \(\$line in \$trustReport\.Lines\) \{\s*\r?\n\s*Write-Host \$line -ForegroundColor \$trustColour'
     }
 
@@ -3521,6 +3547,32 @@ Describe 'Resolve-BitLockerAutoUnlockReport' {
     }
 }
 
+Describe 'Get-VolumeDevDriveState' {
+    It 'takes the control code and the two flags from winioctl.h, not from a sweep' {
+        # A sweep once settled on 141, which answers and returns zeros.
+        Initialize-VolumeStateInterop
+        [DevDriveInterop.PersistentVolume]::FSCTL_QUERY_PERSISTENT_VOLUME_STATE | Should -Be 0x0009023C
+        [DevDriveInterop.PersistentVolume]::PERSISTENT_VOLUME_STATE_DEV_VOLUME | Should -Be 0x00002000
+        [DevDriveInterop.PersistentVolume]::PERSISTENT_VOLUME_STATE_TRUSTED_VOLUME | Should -Be 0x00004000
+    }
+
+    It 'reads a real volume and answers that the system drive is not a Dev Drive' {
+        # Windows cannot boot from a Dev Drive, so this holds on every machine the suite runs on.
+        $state = Get-VolumeDevDriveState -DriveLetter 'C'
+        $state.Queried | Should -BeTrue
+        $state.IsDevDrive | Should -BeFalse
+        $state.IsTrusted | Should -BeFalse
+        $state.Reason | Should -BeNullOrEmpty
+    }
+
+    It 'answers rather than throws for a volume it cannot open, and says why' {
+        $state = Get-VolumeDevDriveState -DriveLetter '1'
+        $state.Queried | Should -BeFalse
+        $state.IsDevDrive | Should -BeNullOrEmpty
+        $state.Reason | Should -Match '\(error \d+\)'
+    }
+}
+
 Describe 'Resolve-DevDriveTrustReport' {
     BeforeAll {
         $script:TrustedOutput = @'
@@ -3531,72 +3583,111 @@ Developer volumes are protected by antivirus filter.
 Filters currently attached to this developer volume:
     WdFilter
 '@
+        $script:GermanOutput = 'Dies ist ein vertrauenswuerdiges Entwicklervolume.'
+        $script:Unread = [PSCustomObject]@{ Queried = $false; IsDevDrive = $null; IsTrusted = $null
+            Reason = 'Access is denied (error 5)'
+        }
     }
 
-    It 'confirms trust only when the volume itself says it is trusted' {
-        $report = Resolve-DevDriveTrustReport -MountPoint 'X:' -TrustExitCode 0 -QueryOutput $script:TrustedOutput
+    It 'confirms trust from the volume flags, in one line' {
+        $report = Resolve-DevDriveTrustReport -MountPoint 'X:' -TrustExitCode 0 -QueryOutput '' `
+            -DevDriveState ([PSCustomObject]@{ Queried = $true; IsDevDrive = $true; IsTrusted = $true; Reason = '' })
         $report.Outcome | Should -Be 'Trusted'
-        ($report.Lines -join "`n") | Should -Match 'X: reports itself trusted'
+        $report.Lines.Count | Should -Be 1
+        ($report.Lines -join "`n") | Should -Match 'X: carries the trusted designation'
     }
 
-    It 'says nothing beyond the one line when the volume is trusted' {
-        (Resolve-DevDriveTrustReport -MountPoint 'X:' -TrustExitCode 0 -QueryOutput $script:TrustedOutput).Lines.Count |
-            Should -Be 1
+    It 'confirms trust on a machine whose fsutil answers in another language' {
+        # The whole point of reading flags: this run used to end with "cannot confirm it here".
+        $report = Resolve-DevDriveTrustReport -MountPoint 'X:' -TrustExitCode 0 -QueryOutput $script:GermanOutput `
+            -DevDriveState ([PSCustomObject]@{ Queried = $true; IsDevDrive = $true; IsTrusted = $true; Reason = '' })
+        $report.Outcome | Should -Be 'Trusted'
     }
 
-    It 'calls it a failure only when the command itself failed, whatever the query says' {
-        $report = Resolve-DevDriveTrustReport -MountPoint 'X:' -TrustExitCode 1 -QueryOutput $script:TrustedOutput
-        $report.Outcome | Should -Be 'Failed'
+    It 'believes the flags over a non-zero exit code' {
+        # The defect this replaces: exit code 1 was called a failure while the volume said otherwise.
+        $report = Resolve-DevDriveTrustReport -MountPoint 'X:' -TrustExitCode 1 -QueryOutput $script:TrustedOutput `
+            -DevDriveState ([PSCustomObject]@{ Queried = $true; IsDevDrive = $true; IsTrusted = $true; Reason = '' })
+        $report.Outcome | Should -Be 'Trusted'
         $lines = $report.Lines -join "`n"
-        $lines | Should -Match 'exited with code 1'
-        $lines | Should -Match 'will still work'
+        $lines | Should -Not -Match 'Could not'
+        $lines | Should -Not -Match 'exit code'
+        $lines | Should -Not -Match 'Retry'
+    }
+
+    It 'says a Dev Drive without the designation is untrusted, and how to retry' {
+        $report = Resolve-DevDriveTrustReport -MountPoint 'X:' -TrustExitCode 0 -QueryOutput '' `
+            -DevDriveState ([PSCustomObject]@{ Queried = $true; IsDevDrive = $true; IsTrusted = $false; Reason = '' })
+        $report.Outcome | Should -Be 'Untrusted'
+        $lines = $report.Lines -join "`n"
+        $lines | Should -Match 'is a Dev Drive, but'
         $lines | Should -Match 'Retry by hand with: fsutil devdrv trust /f X:'
     }
 
-    It 'reports an answer it cannot read as unconfirmed, not as a failure' -TestCases @(
-        @{ Answer = 'Dies ist ein vertrauenswuerdiges Entwicklervolume.' }
-        @{ Answer = 'This is not a developer volume.' }
-        @{ Answer = 'This is not a trusted developer volume.' }
+    It 'claims nothing about the scanner beyond the bit it read' {
+        # The bit says the designation is absent, not what any particular anti-virus then does.
+        $lines = (Resolve-DevDriveTrustReport -MountPoint 'X:' -TrustExitCode 0 -QueryOutput '' `
+                -DevDriveState ([PSCustomObject]@{ Queried = $true; IsDevDrive = $true; IsTrusted = $false; Reason = '' })).Lines -join "`n"
+        $lines | Should -Not -Match 'Defender'
+    }
+
+    It 'says plainly when the volume is not a Dev Drive at all, whatever the trusted bit says' -TestCases @(
+        @{ Case = 'no trusted bit either'; Trusted = $false }
+        @{ Case = 'a trusted bit without it'; Trusted = $true }
     ) {
-        $report = Resolve-DevDriveTrustReport -MountPoint 'X:' -TrustExitCode 0 -QueryOutput $Answer
+        # Nothing before this change could ask that question, so a failed format went unreported.
+        $report = Resolve-DevDriveTrustReport -MountPoint 'X:' -TrustExitCode 0 -QueryOutput '' `
+            -DevDriveState ([PSCustomObject]@{ Queried = $true; IsDevDrive = $false; IsTrusted = $Trusted; Reason = '' })
+        $report.Outcome | Should -Be 'NotDevDrive'
+        ($report.Lines -join "`n") | Should -Match 'does not carry the Dev Drive designation'
+    }
+
+    It 'falls back to what fsutil said when the flags could not be read, given <Case>' -TestCases @(
+        @{ Case = 'no state at all'; Unread = $false }
+        @{ Case = 'a state that failed to read'; Unread = $true }
+    ) {
+        $state = if ($Unread) { $script:Unread } else { $null }
+        $report = Resolve-DevDriveTrustReport -MountPoint 'X:' -TrustExitCode 0 -QueryOutput $script:GermanOutput `
+            -DevDriveState $state
         $report.Outcome | Should -Be 'Unconfirmed'
         $lines = $report.Lines -join "`n"
-        $lines | Should -Match 'only works in English'
-        $lines | Should -Match 'everything is as it should be'
+        $lines | Should -Match 'Could not read the Dev Drive designation off X:'
+        $lines | Should -Match ([regex]::Escape($script:GermanOutput))
     }
 
-    It 'raises no alarm on a run where only the language stopped it reading the answer' {
-        # This is what every successful run looks like on a Windows that is not in English, so it
-        # must not read as a fault, and must not ask for anything to be done.
-        $lines = (Resolve-DevDriveTrustReport -MountPoint 'X:' -TrustExitCode 0 -QueryOutput 'Dies ist ein vertrauenswuerdiges Entwicklervolume.').Lines -join "`n"
-        $lines | Should -Not -Match 'could not mark'
-        $lines | Should -Not -Match 'will still work'
-        $lines | Should -Not -Match 'Retry by hand'
-        $lines | Should -Not -Match 'It should say'
+    It 'gives what Windows said about the failed read, not only a number' {
+        $lines = (Resolve-DevDriveTrustReport -MountPoint 'X:' -TrustExitCode 0 -QueryOutput 'anything' `
+                -DevDriveState $script:Unread).Lines -join "`n"
+        $lines | Should -Match 'Access is denied \(error 5\)'
     }
 
-    It 'quotes what the query actually said, so the user judges it themselves' -TestCases @(
-        @{ Code = 0 }
-        @{ Code = 1 }
-    ) {
-        $lines = (Resolve-DevDriveTrustReport -MountPoint 'X:' -TrustExitCode $Code -QueryOutput 'This is not a developer volume.').Lines -join "`n"
-        $lines | Should -Match 'This is not a developer volume\.'
+    It 'reports a non-zero exit code without turning it into a verdict' {
+        $lines = (Resolve-DevDriveTrustReport -MountPoint 'X:' -TrustExitCode 1 -QueryOutput 'anything' `
+                -DevDriveState $script:Unread).Lines -join "`n"
+        $lines | Should -Match 'exit code 1'
+        $lines | Should -Match 'says nothing about the designation'
+        $lines | Should -Not -Match 'Could not mark'
     }
 
-    It 'says so plainly when the query answered nothing at all' -TestCases @(
-        @{ Code = 0; Expected = '\(nothing\)' }
-        @{ Code = 1; Expected = 'said nothing' }
-    ) {
-        $lines = (Resolve-DevDriveTrustReport -MountPoint 'X:' -TrustExitCode $Code -QueryOutput '').Lines -join "`n"
-        $lines | Should -Match $Expected
+    It 'leaves a next step on the path where nothing could be established' {
+        $lines = (Resolve-DevDriveTrustReport -MountPoint 'X:' -TrustExitCode 0 -QueryOutput 'anything' `
+                -DevDriveState $script:Unread).Lines -join "`n"
+        $lines | Should -Match 'Retry by hand with: fsutil devdrv trust /f X:'
+    }
+
+    It 'does not invite the reader to judge an answer that was never given' {
+        $lines = (Resolve-DevDriveTrustReport -MountPoint 'X:' -TrustExitCode 0 -QueryOutput '' `
+                -DevDriveState $script:Unread).Lines -join "`n"
+        $lines | Should -Match 'said nothing either'
+        $lines | Should -Not -Match 'judge it yourself'
     }
 
     It 'returns plain lines rather than an object to unwrap' {
-        (Resolve-DevDriveTrustReport -MountPoint 'X:' -TrustExitCode 0 -QueryOutput $script:TrustedOutput).Lines |
+        (Resolve-DevDriveTrustReport -MountPoint 'X:' -TrustExitCode 0 -QueryOutput '' `
+                -DevDriveState ([PSCustomObject]@{ Queried = $true; IsDevDrive = $true; IsTrusted = $true; Reason = '' })).Lines |
             Should -BeOfType [string]
     }
 }
-
 Describe 'Test-RecoveryKeyAcknowledged' {
     It 'accepts <Description>' -TestCases @(
         @{ Description = 'the word itself'; Answer = 'YES' }
