@@ -2186,7 +2186,7 @@ function Request-VhdxPath {
     Write-Host ""
 
     while ($true) {
-        $verdict = Resolve-VhdxPathInput -Answer (Read-Host "Path of the .vhdx file").Trim('"', ' ')
+        $verdict = Resolve-VhdxPathInput -Answer (Read-Host "Path of the .vhdx file (E.g. D:\DevDrive.vhdx)").Trim('"', ' ')
 
         if ($verdict.Rejection -eq 'Empty') {
             Write-Host "Path cannot be empty." -ForegroundColor Red
