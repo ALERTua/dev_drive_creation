@@ -22,7 +22,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Parse dev_drive.ps1 syntax
         shell: pwsh
